@@ -1,0 +1,33 @@
+log_path: logs/
+env: dev
+region: us-east-1
+etl_btch_id: daws_hrdatadl_btch
+vault_endpoint: https://chamber-qa.clouddqt.capitalone.com
+aws:
+  acc_id: 516544738036
+  aws_proxy:
+  aws_no_proxy:
+  tmp_dir: hr/appl/tmp
+  s3_bucket: cof-dev-bahranalyticsdatadelivery-hrdw-ue1
+snowflake:
+  s3_bucket: cof-snow-dev-hrdw-stg
+  sf_user: DSNOW_HRDW_BTCH
+  sf_URL: cptlone-sfdev.snowflakecomputing.com
+  sf_warehouse: HRDW_L_WH
+  sf_database: HRDW_DB
+  sf_role: SNOW_DSNOW_HRDW_BTCH_ROLE
+  proxy_host: aws-proxy-dev.cloud.capitalone.com
+  proxy_port: 8099
+  btch_id: dsnow_hrdw_btch
+  ld_dir: pdp/snowflake/ld
+  uld_dir: pdp/snowflake/uld
+workday:
+  raw:
+    file_dir: hr/appl/workday/raw
+  cln:
+    file_dir: hr/appl/workday/cln
+  lr:
+    file_dir: hr/appl/workday/lr
+  reject_dir: hr/appl/workday/rej
+  error_dir: hr/appl/workday/error
+  sor_id: 326

@@ -1,0 +1,11 @@
+[tool.black]
+line-length = 80
+include = '\.py$'
+target_version = ['py37', 'py38', 'py39', 'py310', 'py311']
+
+[tool.isort]
+line-length = 80
+profile = 'black'
+
+[tool.coverage.run]
+omit = ["*/tests/*", "*/test/*"]

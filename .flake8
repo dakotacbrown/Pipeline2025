@@ -1,0 +1,27 @@
+[flake8]
+
+# Basic flake8 configuratiopn
+
+# Google recommends a maximum of 80 characters for line length
+max-line-length = 80
+
+# B: Basic style recommendations
+# B950: Line too long (Flake8-Bugbear)
+# C: Coding Style
+# E: Errors
+# F: Formatting Issues
+# W: Warnings
+select = B,B950,C,E,F,W
+
+# E203: Whitespace before ',', ';', or ':'
+# E501: Line too long
+# E704: Multiple statements on one line
+extend-ignore = E203,E501,E704
+
+exclude = venv, __pycache__, .git
+
+# Plugins
+plugins = flake8-docstrings
+
+# Docstring Settings
+docstring-convention = google

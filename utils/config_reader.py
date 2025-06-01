@@ -1,4 +1,5 @@
 import sys
+import traceback
 from logging import Logger
 from pathlib import Path
 
@@ -37,11 +38,13 @@ class ConfigReader:
                 return self
             except Exception as e:
                 self.log.error(
-                    "Issue loading file '%s': %s" % (self.configs_path, e)
+                    f"Issue loading file '{self.configs_path}': {e}\nStack Trace: {traceback.format_exc()}"
                 )
                 sys.exit(1)
         except FileNotFoundError as e:
-            self.log.error("Issue loading file: %s" % (e))
+            self.log.error(
+                f"Issue loading file: {e}\nStack Trace: {traceback.format_exc()}"
+            )
             sys.exit(1)
 
     def _check_path_exists(self) -> None:
@@ -51,5 +54,5 @@ class ConfigReader:
         """
         if not self.configs_path.exists():
             raise FileNotFoundError(
-                "The file '%s' does not exist." % (self.configs_path)
+                f"The file '{self.configs_path}' does not exist."
             )

@@ -21,12 +21,12 @@ def test_load_configurations(log: Logger):
 def test_invalid_configurations_wrong_path(log: Logger):
     configs_path = Path("tests/config/test_wrong_file.yml")
     with pytest.raises(SystemExit) as failed:
-        configs = ConfigReader(log, configs_path).load_configurations()  # noqa
+        ConfigReader(log, configs_path).load_configurations()
     assert failed.type == SystemExit, "The method should exit due to the error"
 
 
 def test_invalid_configurations_error_file(log: Logger):
     configs_path = Path("tests/config/")
     with pytest.raises(SystemExit) as failed:
-        configs = ConfigReader(log, configs_path).load_configurations()  # noqa
+        ConfigReader(log, configs_path).load_configurations()
     assert failed.type == SystemExit, "The method should exit due to the error"

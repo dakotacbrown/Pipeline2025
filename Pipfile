@@ -16,6 +16,7 @@ pytest = "*"
 pytest-cov = "*"
 coverage = "*"
 pre-commit = "*"
+pandas = "*"
 
 [dev-packages]
 

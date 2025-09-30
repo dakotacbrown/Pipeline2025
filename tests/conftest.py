@@ -2,7 +2,7 @@ from logging import Logger
 
 import pytest
 
-from logger.basic_logger import setup_logger
+from utils.basic_logger import setup_logger
 
 
 @pytest.fixture(scope="session", autouse=True)

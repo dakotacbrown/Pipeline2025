@@ -98,32 +98,3 @@ def test_retrieve_report_data_failure(mock_get, log: Logger):
         )
 
     assert e.type == SystemExit
-
-
-def test_normalize_data_success():
-    df = pd.DataFrame(
-        [
-            ["001", "Org A", "003"],
-            ["002", "Org B", "-"],
-            ["003", "Org C", "null"],
-        ]
-    )
-
-    new_columns = ["account_id", "account_name", "parent_account_id"]
-    normalized = hf.normalize_data(df, new_columns)
-
-    assert normalized.shape == (3, 3)
-    assert normalized["parent_account_id"].iloc[1] == "000000000000000"
-    assert normalized["parent_account_id"].iloc[2] == "000000000000000"
-    assert pd.isna(normalized["account_name"].iloc[1]) is False
-
-
-def test_normalize_data_column_mismatch():
-    df = pd.DataFrame([[1, 2], [3, 4]])
-
-    new_columns = ["col1", "col2", "col3"]  # too many
-
-    with pytest.raises(ValueError) as e:
-        hf.normalize_data(df, new_columns)
-
-    assert "Number of new column names must match" in str(e.value)

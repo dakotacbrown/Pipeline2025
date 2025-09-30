@@ -1,12 +1,10 @@
+import os
 import sys
 import traceback
-from io import StringIO
 from logging import Logger
 from pathlib import Path
-from typing import List
+from typing import Any, Dict
 
-import numpy as np
-import pandas as pd
 import requests
 
 from utils.config_reader import ConfigReader
@@ -55,54 +53,22 @@ def retrieve_oauth_token(
         )
         sys.exit(1)
 
+    def expand_env_vars(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively replace ${ENV_VAR} with os.environ values in strings."""
 
-def retrieve_report_data(
-    log: Logger,
-    data_endpoint: str,
-    query: str,
-    headers: dict,
-) -> pd.DataFrame:
-    log.info("Attempting to retrieve data.")
+        def repl(x):
+            if isinstance(x, str):
+                out = x
+                while "${" in out and "}" in out:
+                    start = out.index("${")
+                    end = out.index("}", start)
+                    var = out[start + 2 : end]
+                    out = out[:start] + os.getenv(var, "") + out[end + 1 :]
+                return out
+            if isinstance(x, dict):
+                return {k: repl(v) for k, v in x.items()}
+            if isinstance(x, list):
+                return [repl(v) for v in x]
+            return x
 
-    try:
-        full_url = f"{data_endpoint}{query}"
-        response = requests.get(
-            full_url,
-            headers=headers,
-            verify=False,
-        )
-        response.raise_for_status()
-
-        csv_string = response.content.decode("utf-8")
-        dataframe = pd.read_csv(StringIO(csv_string))
-
-        log.info("Successfully retrieved data.")
-        return dataframe
-
-    except Exception as e:
-        log.error(
-            f"An error occurred while retrieving data: {e}\nStack Trace: {traceback.format_exc()}"
-        )
-        sys.exit(1)
-
-
-def normalize_data(
-    dataframe: pd.DataFrame, new_column_names: List[str]
-) -> pd.DataFrame:
-    # 1. Rename columns
-    if len(new_column_names) != len(dataframe.columns):
-        raise ValueError(
-            "Number of new column names must match number of DataFrame columns."
-        )
-    dataframe.columns = new_column_names
-
-    # 2. Replace "-" and "null" strings with np.nan
-    dataframe.replace(["-", "null"], np.nan, inplace=True)
-
-    # 3. Replace nulls in 'parent_account_id' with default fallback
-    if "parent_account_id" in dataframe.columns:
-        dataframe["parent_account_id"] = dataframe["parent_account_id"].fillna(
-            "000000000000000"
-        )
-
-    return dataframe
+        return repl(cfg)

@@ -1,6 +1,6 @@
 import logging
 
-from logger.basic_logger import setup_logger
+from utils.basic_logger import setup_logger
 
 
 def test_setup_logger():

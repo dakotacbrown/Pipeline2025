@@ -1,0 +1,59 @@
+envs:
+  dev:
+    base_url: "https://api.vendor-a.com/"
+  qa:
+    base_url: "https://finance.example.com/api/"
+  prod:
+    base_url:
+apis:
+  # JSON API with cursor pagination, date-window backfill, and optional link expansion
+  request_defaults:               # passed to requests.get(**kwargs)
+    headers:
+      Authorization: "Bearer ${VENDOR_A_TOKEN}"  # pulled from env at runtime
+      Accept: "application/json"
+    timeout: 60
+    verify: true
+  path: "services/data/v61.0/query"
+  retries:                      # session-level retry config (mounted adapter)
+    total: 4
+    backoff_factor: 0.5
+    status_forcelist: [429, 500, 502, 503, 504]
+    allowed_methods: ["GET"]
+  pagination:
+    mode: "salesforce"
+    done_path: "done"
+    next_url_path: "nextRecordsUrl"   # relative path returned by Salesforce
+    clear_params_on_next: true        # drop ?q=... after first call
+    max_pages: 20000
+  link_expansion:                 # follow URLs found in each row (optional)
+    enabled: true
+    url_fields: ["detail_url", "links.self"]  # dot paths to URL fields
+    json_record_path: null        # if expanded payloads need a different record_path
+    per_request_delay: 0.0
+  
+  marketing_reports:
+    parse:                          # how to convert response -> DataFrame
+      type: "json"                  # "json" | "csv"
+      json_record_path: "records"  # dot path to list of rows
+      json_drop_keys_any_depth: ["attributes"]
+    params:
+      format: "json"              # example static param
+    backfill:                       # date window slicing; combines with pagination
+      enabled: true
+      strategy: "soql_window"
+      date_field: "LastModifiedDate"      # or SystemModstamp
+      date_format: "%Y-%m-%dT%H:%M:%SZ"
+      window_days: 7
+      per_request_delay: 0.0
+      soql_template: |
+        SELECT Id, Name, LastModifiedDate
+        FROM Account
+        WHERE {date_field} >= {start}
+          AND {date_field} <  {end}
+        ORDER BY {date_field} ASC
+  finance_exports:
+    path: "reports/daily"
+    parse:
+      type: "csv"
+    backfill:
+      enabled: false

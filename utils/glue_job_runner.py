@@ -10,18 +10,16 @@ def setup_path(bundle_glob: str = "ingestor_bundle*.zip") -> None:
     """
     Find the bundle zip that Glue staged locally and add it to sys.path.
 
-    Mirrors the 'photo' style: rglob the current working directory for *.zip
-    matching bundle_glob. If multiple matches exist, prefer the copy under
-    '/extra-py-files/' (Glue staging), else pick the first. Then add BOTH:
-      - <zip>/
-      - <zip>/<zip_name_without_.zip>/Python
-    to sys.path so either layout works.
+    Matches the 'photo-style' logic:
+      1) rglob the working dir for <bundle_glob>
+      2) If multiple, prefer the one under '/extra-py-files/'
+      3) Add BOTH:
+         - <zip>/
+         - <zip>/<zip_name_without_.zip>/Python
     """
-    # --- this is the same rglob style you showed in the screenshot ---
     files = list(Path.cwd().rglob(bundle_glob))
 
     if len(files) == 0:
-        # nothing to add; imports might still work if script & wrapper are co-located
         print(json.dumps({"bundle_glob": bundle_glob, "matches": 0}))
         return
 
@@ -37,7 +35,7 @@ def setup_path(bundle_glob: str = "ingestor_bundle*.zip") -> None:
     base_path = f"{chosen}/"
     python_path = f"{chosen}/{zip_file_without_zip}/Python"
 
-    # Add to sys.path (zip import + optional /Python layout)
+    # Add both to sys.path so either layout works
     sys.path.insert(0, base_path)
     sys.path.insert(0, python_path)
 
@@ -55,18 +53,34 @@ def setup_path(bundle_glob: str = "ingestor_bundle*.zip") -> None:
 
 def parse_args():
     p = argparse.ArgumentParser(description="Glue runner for ApiIngestor")
-    # core inputs to wrapper
+    # wrapper inputs
     p.add_argument("--yaml_path", required=True, help="Path to YAML (e.g., res:config/ingestor.yml)")
     p.add_argument("--table", required=True, help="Table name under apis.* in YAML")
     p.add_argument("--env", dest="env_name", required=True, help="Env key under envs.* in YAML")
+
+    # >>> NEW: explicit run mode (optional). If omitted, wrapper will infer.
+    p.add_argument(
+        "--run_mode",
+        choices=["once", "backfill"],
+        default=None,
+        help="Execution mode. If omitted, wrapper infers from backfill args.",
+    )
+
     p.add_argument("--backfill_start", default=None, help="YYYY-MM-DD (optional)")
     p.add_argument("--backfill_end", default=None, help="YYYY-MM-DD (optional)")
     p.add_argument("--log_level", default=os.getenv("LOG_LEVEL", "INFO"))
+
     # allow passing extra env as JSON if needed
     p.add_argument("--extra_env", default=None, help='JSON dict of env overrides, e.g. {"VENDOR_A_TOKEN":"xyz"}')
-    # >>> NEW: accept bundle glob as a **job param** (with uppercase alias)
-    p.add_argument("--bundle_glob", "--BUNDLE_GLOB", dest="bundle_glob", default=None,
-                   help='Glob for the job zip, default "ingestor_bundle*.zip"')
+
+    # job parameter (or env) for the bundle glob
+    p.add_argument(
+        "--bundle_glob",
+        "--BUNDLE_GLOB",
+        dest="bundle_glob",
+        default=None,
+        help='Glob for the job zip (default "ingestor_bundle*.zip")',
+    )
     return p.parse_args()
 
 
@@ -80,7 +94,7 @@ def main() -> int:
     log = logging.getLogger("glue_runner")
     log.info("Starting Glue runner.")
 
-    # Apply optional env overrides first (so wrapper sees them)
+    # Optional env overrides
     if args.extra_env:
         try:
             mapping = json.loads(args.extra_env)
@@ -90,11 +104,11 @@ def main() -> int:
         except Exception:
             log.exception("Failed to parse --extra_env JSON; continuing without overrides.")
 
-    # Decide bundle_glob: CLI > ENV > default
+    # Ensure the bundle is on sys.path before importing wrapper
     bundle_glob = args.bundle_glob or os.getenv("BUNDLE_GLOB") or "ingestor_bundle*.zip"
     setup_path(bundle_glob=bundle_glob)
 
-    # Now that sys.path includes the bundle, import and run the wrapper
+    # import after sys.path is primed
     try:
         from ingestor_wrapper import run_ingestor
     except Exception:
@@ -106,6 +120,7 @@ def main() -> int:
             yaml_path=args.yaml_path,
             table=args.table,
             env_name=args.env_name,
+            run_mode=args.run_mode,                 # <<< pass run_mode
             backfill_start=args.backfill_start,
             backfill_end=args.backfill_end,
             logger=log,

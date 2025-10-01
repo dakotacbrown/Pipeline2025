@@ -1,112 +1,95 @@
-"""
-Glue-friendly runner script (works locally too).
-
-Reads configuration from environment variables, optionally extends sys.path
-(using literal paths and/or glob patterns), then calls the ingestor wrapper and
-prints the resulting metadata dict as JSON.
-
-Environment variables consumed:
-  - TABLE_NAME        (required)
-  - ENV_NAME          (required)
-  - YAML_PATH         (optional; local path, s3://..., or package resource like "ingestor_wrapper:ingestor.yml")
-  - BACKFILL          (optional: true/false; default false)
-  - START_DATE        (required if BACKFILL=true; format YYYY-MM-DD)
-  - END_DATE          (required if BACKFILL=true; format YYYY-MM-DD)
-  - LOG_LEVEL         (optional; default INFO)
-
-  - ZIP_PY_PATHS      (optional; colon-separated entries that may be literal paths
-                       OR glob patterns, e.g. "/tmp/libs/*.zip:/tmp/site/*.whl")
-  - ZIP_PY_GLOB       (optional; colon-separated glob patterns ONLY, e.g. "/tmp/*/site-packages/*.zip")
-"""
-
-import json
+# run_step.py
 import os
 import sys
-import glob
-from typing import Any, Dict, List
+import json
+from pathlib import Path
+
+# In the current working directory, find a list of files that match
+# the following pattern "ingestor_bundle..." with a ".zip"
+files = list(Path.cwd().rglob("ingestor_bundle*.zip"))
 
 
-def _extend_sys_path_from_env() -> None:
+def setup_path():
     """
-    Extend sys.path using:
-      1) ZIP_PY_PATHS: colon-separated entries that can be literal paths or globs
-      2) ZIP_PY_GLOB : colon-separated glob-only patterns
-      3) Fallback: scan a few common /tmp patterns if nothing added
+    Set this up as a function so we can test it.
+
+    This function checks for a zip file used by glue and adds it to the sys.path list.
     """
-    added: List[str] = []
+    # In the current working directory, find a list of files that match
+    # the following pattern "ingestor_bundle..." with a ".zip"
+    files = list(Path.cwd().rglob("ingestor_bundle*.zip"))
 
-    def _add(p: str):
-        if p and p not in sys.path:
-            sys.path.insert(0, p)
-            added.append(p)
+    if len(files) > 1:
+        raise ValueError(
+            f"More than one ingestor_bundle zip found: {files}"
+        )
+    elif len(files) == 1:
+        zip_file_with_zip = files[0].name
+        # Remove the ".zip" extension
+        zip_file_without_zip = zip_file_with_zip.split(".zip")[0]
+        # Create two strings with that name
+        base_path = f"{zip_file_with_zip}/{zip_file_without_zip}/"
+        python_path = f"{zip_file_with_zip}/{zip_file_without_zip}/Python"
 
-    # 1) ZIP_PY_PATHS: expand each entry with glob; if no match, treat as literal
-    raw_paths = os.environ.get("ZIP_PY_PATHS", "")
-    for entry in [e.strip() for e in raw_paths.split(":") if e.strip()]:
-        matches = glob.glob(entry)
-        if matches:
-            for m in matches:
-                _add(m)
-        else:
-            # treat as literal path
-            _add(entry)
+        # Add those two paths to the sys.path list
+        sys.path.insert(0, base_path)
+        sys.path.insert(0, python_path)
 
-    # 2) ZIP_PY_GLOB: glob-only
-    raw_globs = os.environ.get("ZIP_PY_GLOB", "")
-    for pattern in [g.strip() for g in raw_globs.split(":") if g.strip()]:
-        for m in glob.glob(pattern):
-            _add(m)
+        base_path = f"{zip_file_with_zip}/"
+        python_path = f"{zip_file_with_zip}/Python"
 
-    # 3) Fallback if nothing was added: scan common Glue temp patterns
-    if not added:
-        for pattern in ("/tmp/*.zip", "/tmp/*.whl", "/tmp/*/*.zip", "/tmp/*/*.whl"):
-            for m in glob.glob(pattern):
-                _add(m)
-
-    # Optional visibility
-    if added:
-        print(f"[runner] Added to sys.path: {added}", file=sys.stderr)
+        # Add those two paths to the sys.path list
+        sys.path.insert(0, base_path)
+        sys.path.insert(0, python_path)
+    else:
+        # We don't test for 0 files because it would error out
+        # when running tests.
+        pass
 
 
-def _read_env_bool(name: str, default: bool = False) -> bool:
+# Call the function we just created (this mirrors the screenshot exactly)
+setup_path()
+
+# Import after sys.path was extended so it can be found inside the ZIP
+from ingestor_wrapper import run_ingestor  # noqa: E402
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name, "").strip().lower()
     if not raw:
         return default
-    return raw in ("1", "true", "yes", "y")
+    return raw in ("1", "true", "yes", "y", "on")
 
 
-def main() -> int:
-    _extend_sys_path_from_env()
-
-    # Import the wrapper from the ZIP (should succeed when the bundle/zip is on sys.path)
-    from ingestor_wrapper import run_ingestor  # noqa: WPS433
-
-    # Required
+def main_with_args() -> None:
+    """
+    Read env vars and invoke the ingestor wrapper. Prints the metadata JSON.
+    Env vars:
+      TABLE_NAME (required)
+      ENV_NAME (required)
+      YAML_PATH (optional, path inside the ZIP; wrapper can default if missing)
+      BACKFILL (optional: true/false)
+      START_DATE (required iff BACKFILL=true, YYYY-MM-DD)
+      END_DATE   (required iff BACKFILL=true, YYYY-MM-DD)
+      LOG_LEVEL  (optional; default INFO)
+    """
     table = os.environ.get("TABLE_NAME")
     env = os.environ.get("ENV_NAME")
-
-    if not table or not env:
-        print(
-            "ERROR: TABLE_NAME and ENV_NAME must be set as environment variables.",
-            file=sys.stderr,
-        )
-        return 2
-
-    # Optional / conditional
-    yaml_path = os.environ.get("YAML_PATH")  # can be omitted to auto-discover inside the package
-    backfill = _read_env_bool("BACKFILL", default=False)
+    yaml_path = os.environ.get("YAML_PATH")
+    backfill = _env_bool("BACKFILL", default=False)
     start = os.environ.get("START_DATE")
     end = os.environ.get("END_DATE")
     log_level = os.environ.get("LOG_LEVEL", "INFO")
 
-    if backfill and (not start or not end):
-        print(
-            "ERROR: BACKFILL=true but START_DATE or END_DATE is missing (YYYY-MM-DD).",
-            file=sys.stderr,
-        )
-        return 3
+    if not table or not env:
+        print("ERROR: TABLE_NAME and ENV_NAME must be set.", file=sys.stderr)
+        sys.exit(2)
 
-    meta: Dict[str, Any] = run_ingestor(
+    if backfill and (not start or not end):
+        print("ERROR: BACKFILL=true requires START_DATE and END_DATE.", file=sys.stderr)
+        sys.exit(3)
+
+    meta = run_ingestor(
         yaml_path=yaml_path,
         table=table,
         env=env,
@@ -115,10 +98,12 @@ def main() -> int:
         end=end,
         log_level=log_level,
     )
-
     print(json.dumps(meta, separators=(",", ":"), sort_keys=True))
-    return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+def main() -> None:
+    main_with_args()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

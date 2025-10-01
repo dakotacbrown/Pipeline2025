@@ -1,138 +1,103 @@
-import sys
-import os
-import json
+# run_step.py
 import argparse
+import importlib
+import json
 import logging
+import os
+import sys
 from pathlib import Path
 
 
-def setup_path(bundle_glob: str = "ingestor_bundle*.zip") -> None:
+# -------- zip path setup (Python path removed) --------
+def setup_path(bundle_glob: str) -> None:
     """
-    Find the bundle zip that Glue staged locally and add it to sys.path.
-
-    Matches the 'photo-style' logic:
-      1) rglob the working dir for <bundle_glob>
-      2) If multiple, prefer the one under '/extra-py-files/'
-      3) Add BOTH:
-         - <zip>/
-         - <zip>/<zip_name_without_.zip>/Python
+    Look in the current working directory for a zip matching bundle_glob
+    (e.g., 'ingestor_bundle*.zip'), and add only:
+        <zip>/
     """
     files = list(Path.cwd().rglob(bundle_glob))
 
-    if len(files) == 0:
-        print(json.dumps({"bundle_glob": bundle_glob, "matches": 0}))
-        return
+    if len(files) > 1:
+        raise ValueError(f"More than one {bundle_glob} zip found: {files}")
+    elif len(files) == 1:
+        zip_file_with_zip = files[0].name
+        base_path = f"{zip_file_with_zip}/"
 
-    if len(files) == 1:
-        chosen = files[0]
+        sys.path.insert(0, base_path)
     else:
-        preferred = [p for p in files if "extra-py-files" in str(p)]
-        chosen = preferred[0] if preferred else files[0]
-
-    zip_file_with_zip = chosen.name
-    zip_file_without_zip = zip_file_with_zip.split(".zip")[0]
-
-    base_path = f"{chosen}/"
-    python_path = f"{chosen}/{zip_file_without_zip}/Python"
-
-    # Add both to sys.path so either layout works
-    sys.path.insert(0, base_path)
-    sys.path.insert(0, python_path)
-
-    print(
-        json.dumps(
-            {
-                "bundle_glob": bundle_glob,
-                "chosen_bundle": str(chosen),
-                "added_sys_path": [base_path, python_path],
-                "all_matches": [str(p) for p in files],
-            }
-        )
-    )
+        # zero files: no-op
+        pass
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Glue runner for ApiIngestor")
-    # wrapper inputs
-    p.add_argument("--yaml_path", required=True, help="Path to YAML (e.g., res:config/ingestor.yml)")
-    p.add_argument("--table", required=True, help="Table name under apis.* in YAML")
-    p.add_argument("--env", dest="env_name", required=True, help="Env key under envs.* in YAML")
+def _parse_args():
+    parser = argparse.ArgumentParser()
 
-    # >>> NEW: explicit run mode (optional). If omitted, wrapper will infer.
-    p.add_argument(
-        "--run_mode",
-        choices=["once", "backfill"],
-        default=None,
-        help="Execution mode. If omitted, wrapper infers from backfill args.",
-    )
+    parser.add_argument("-y", "--yaml_path", required=True, help="Path to YAML inside the zip or local FS, e.g. 'config/ingestor.yml'")
+    parser.add_argument("--table", required=True, help="Table key under 'apis' in YAML")
+    parser.add_argument("--env", dest="env_name", required=True, help="Env key under 'envs' in YAML (e.g., dev, qa, prod)")
+    parser.add_argument("--run_mode", choices=["once", "backfill"], default="once")
+    parser.add_argument("--backfill_start", help="YYYY-MM-DD (when run_mode=backfill)")
+    parser.add_argument("--backfill_end", help="YYYY-MM-DD (when run_mode=backfill)")
+    parser.add_argument("--log_level", default="INFO")
+    parser.add_argument("--bundle_glob", default="ingestor_bundle*.zip", help="Glob for the job zip in CWD")
+    parser.add_argument("--extra_env", action="append", default=[], help="Repeatable KEY=VALUE entries to export to os.environ")
 
-    p.add_argument("--backfill_start", default=None, help="YYYY-MM-DD (optional)")
-    p.add_argument("--backfill_end", default=None, help="YYYY-MM-DD (optional)")
-    p.add_argument("--log_level", default=os.getenv("LOG_LEVEL", "INFO"))
-
-    # allow passing extra env as JSON if needed
-    p.add_argument("--extra_env", default=None, help='JSON dict of env overrides, e.g. {"VENDOR_A_TOKEN":"xyz"}')
-
-    # job parameter (or env) for the bundle glob
-    p.add_argument(
-        "--bundle_glob",
-        "--BUNDLE_GLOB",
-        dest="bundle_glob",
-        default=None,
-        help='Glob for the job zip (default "ingestor_bundle*.zip")',
-    )
-    return p.parse_args()
+    # tolerate Glue's extra flags
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f"[runner] Ignoring {len(unknown)} unknown args from Glue: {unknown[:8]}{' ...' if len(unknown)>8 else ''}")
+    return args
 
 
 def main() -> int:
-    args = parse_args()
+    args = _parse_args()
 
     logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
     )
     log = logging.getLogger("glue_runner")
-    log.info("Starting Glue runner.")
 
-    # Optional env overrides
-    if args.extra_env:
-        try:
-            mapping = json.loads(args.extra_env)
-            for k, v in mapping.items():
-                os.environ[str(k)] = str(v)
-            log.info("Applied extra_env overrides: %s", list(mapping.keys()))
-        except Exception:
-            log.exception("Failed to parse --extra_env JSON; continuing without overrides.")
+    # Make the zip content importable (ZIP root only)
+    setup_path(args.bundle_glob)
 
-    # Ensure the bundle is on sys.path before importing wrapper
-    bundle_glob = args.bundle_glob or os.getenv("BUNDLE_GLOB") or "ingestor_bundle*.zip"
-    setup_path(bundle_glob=bundle_glob)
+    # Apply any extra env vars (KEY=VALUE)
+    for kv in args.extra_env:
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            os.environ[k] = v
+            log.info("Set env %s", k)
+        else:
+            log.warning("Skipping malformed --extra_env %r (expected KEY=VALUE)", kv)
 
-    # import after sys.path is primed
+    # Import the wrapper after sys.path is patched
     try:
-        from ingestor_wrapper import run_ingestor
-    except Exception:
-        log.exception("Failed to import 'ingestor_wrapper'. sys.path may not include the bundle.")
+        wrapper = importlib.import_module("ingestor_wrapper")
+    except Exception as e:
+        log.error("Could not import 'ingestor_wrapper' after sys.path setup: %s", e)
         return 2
 
+    log.info(
+        "Starting wrapper: table=%s env=%s yaml_path=%s mode=%s",
+        args.table, args.env_name, args.yaml_path, args.run_mode
+    )
+
     try:
-        meta = run_ingestor(
-            yaml_path=args.yaml_path,
+        meta = wrapper.run_ingestor(
             table=args.table,
             env_name=args.env_name,
-            run_mode=args.run_mode,                 # <<< pass run_mode
-            backfill_start=args.backfill_start,
-            backfill_end=args.backfill_end,
-            logger=log,
-            log_level=args.log_level,
+            yaml_path=args.yaml_path,
+            run_mode=args.run_mode,
+            start=args.backfill_start,
+            end=args.backfill_end,
         )
-        print(json.dumps({"status": "ok", "stage": "run_ingestor", "meta": meta}, default=str))
+        print(json.dumps({"status": "ok", "meta": meta}))
         return 0
-    except Exception as e:
-        log.exception("Ingestor wrapper run failed.")
-        print(json.dumps({"status": "error", "stage": "run_ingestor", "error": str(e)}))
+    except Exception:
+        log.error("Ingestor wrapper run failed.", exc_info=True)
+        print(json.dumps({"status": "error", "stage": "run_ingestor"}))
         return 3
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     raise SystemExit(main())

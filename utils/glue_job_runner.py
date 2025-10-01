@@ -1,199 +1,118 @@
-"""
-Glue runner for ApiIngestor.
-
-- Does NOT read YAML. The ingestor wrapper handles YAML loading (from the ZIP).
-- Provides a place to hard-code environment variables (tokens, etc).
-- Calls the wrapper's `run_ingestor(...)` and prints the returned metadata.
-
-USAGE OPTION A (recommended): let Glue add your ZIP to sys.path
-----------------------------------------------------------------
-Create your Glue job and add:
-  --extra-py-files s3://your-bucket/path/ingestor_bundle.zip
-
-Then set USE_RUNTIME_ZIP_IMPORT = False (default) and set WRAPPER_IMPORT to
-match the module path inside the ZIP (e.g., "ingestor_wrapper.run_ingestor"
-or "utils.ingestor_wrapper.run_ingestor").
-
-USAGE OPTION B: add the ZIP to sys.path at runtime
---------------------------------------------------
-Set USE_RUNTIME_ZIP_IMPORT = True and S3_ZIP_URI below to your ZIP.
-The runner will download the ZIP to /tmp and import from it.
-"""
-
+import argparse
+import glob
 import json
 import logging
 import os
 import sys
-from datetime import date
-from typing import Dict, Optional
+from typing import Optional
 
-# ---------- Configurable block (edit to taste) ----------
+LOG = logging.getLogger("glue_runner")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
-# 0) Hard-coded environment variables (safe defaults). Override here as needed.
-#    These are injected into os.environ before running the ingestor.
-HARD_CODED_ENV: Dict[str, str] = {
-    # Example tokens/keys; replace with your own and/or leave blank for now.
-    # "VENDOR_A_TOKEN": "REPLACE_ME",
-    # "ANOTHER_API_KEY": "REPLACE_ME",
-}
+# ---------- Optional: add local ZIP to sys.path if --extra-py-files wasn't set ----------
 
-# 1) How to import the wrapper that lives in your ZIP:
-#    - If your ZIP contains "ingestor_wrapper.py" at its root:
-#        WRAPPER_IMPORT = "ingestor_wrapper.run_ingestor"
-#    - If it's "utils/ingestor_wrapper.py":
-#        WRAPPER_IMPORT = "utils.ingestor_wrapper.run_ingestor"
-WRAPPER_IMPORT = "ingestor_wrapper.run_ingestor"
-
-# 2) If you cannot pass --extra-py-files yet, enable this and point to your ZIP on S3.
-USE_RUNTIME_ZIP_IMPORT = False
-S3_ZIP_URI = "s3://your-bucket/libs/ingestor_bundle.zip"  # used only if USE_RUNTIME_ZIP_IMPORT=True
-
-# 3) What to run (hard-coded; you can wire job params later if you like).
-RUN_MODE = "once"  # "once" or "backfill"
-TABLE_NAME = "marketing_reports"
-ENV_NAME = "prod"
-
-# The wrapper will load YAML from inside the ZIP when yaml_path=None.
-YAML_PATH: Optional[str] = None
-
-# Backfill window (only used when RUN_MODE == "backfill")
-BACKFILL_START: Optional[date] = date(2025, 1, 1)
-BACKFILL_END: Optional[date] = date(2025, 1, 7)
-
-# ---------- End configurable block ----------
-
-
-def _add_zip_to_path(s3_uri: str) -> str:
+def _add_zip_to_syspath(zip_prefix: str = "ingestor_bundle", explicit_name: Optional[str] = None) -> None:
     """
-    Downloads a ZIP from S3 to /tmp and adds it to sys.path so we can import from it.
-    Used only when USE_RUNTIME_ZIP_IMPORT = True.
+    If the ingestor ZIP isn't already on sys.path, try to find it locally
+    (CWD or /tmp) and add it. Useful when the job wasn't configured with
+    --extra-py-files.
+
+    We add the ZIP root; if a 'Python' dir exists inside, we add that too.
     """
-    if not s3_uri or not s3_uri.startswith("s3://"):
-        raise ValueError(
-            "S3_ZIP_URI must be an s3:// URI when USE_RUNTIME_ZIP_IMPORT=True"
-        )
+    candidates = []
+    if explicit_name:
+        for base in (os.getcwd(), "/tmp"):
+            p = os.path.join(base, explicit_name)
+            if os.path.exists(p):
+                candidates.append(p)
+    else:
+        for base in (os.getcwd(), "/tmp"):
+            candidates.extend(glob.glob(os.path.join(base, f"{zip_prefix}*.zip")))
 
-    import boto3  # Glue runtime includes boto3
+    if not candidates:
+        LOG.info("No local ingestor bundle found (prefix=%r, explicit=%r).", zip_prefix, explicit_name)
+        return
 
-    bucket, key = s3_uri[5:].split("/", 1)
-    local_zip = os.path.join("/tmp", os.path.basename(key))
-    if not os.path.exists(local_zip):
-        boto3.client("s3").download_file(bucket, key, local_zip)
-    if local_zip not in sys.path:
-        sys.path.insert(0, local_zip)
-    return local_zip
+    zip_path = candidates[0]
+    if zip_path not in sys.path:
+        sys.path.insert(0, zip_path)
+        LOG.info("Added ZIP to sys.path: %s", zip_path)
 
+    # Some bundles place code under ZIP/Python — add if present.
+    py_subdir = f"{zip_path}/Python"
+    if os.path.exists(py_subdir) and py_subdir not in sys.path:
+        sys.path.insert(0, py_subdir)
+        LOG.info("Added ZIP/Python to sys.path: %s", py_subdir)
 
-def _load_entrypoint(dotted: str):
-    """Import a dotted path like 'pkg.module.func' and return the function object."""
-    if "." not in dotted:
-        raise ValueError(
-            f"WRAPPER_IMPORT must be a dotted path like 'module.func', got: {dotted}"
-        )
-    module_name, func_name = dotted.rsplit(".", 1)
-    mod = __import__(module_name, fromlist=[func_name])
-    fn = getattr(mod, func_name, None)
-    if fn is None:
-        raise ImportError(
-            f"Function '{func_name}' not found in module '{module_name}'"
-        )
-    return fn
+# ---------- Hard-coded env overrides (edit these as needed) ----------
 
-
-def _configure_logging() -> logging.Logger:
-    logger = logging.getLogger("glue_runner")
-    if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        formatter = logging.Formatter(
-            fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-            datefmt="%Y-%m-%dT%H:%M:%SZ",
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    return logger
-
-
-def _apply_env(env_map: Dict[str, str]) -> None:
+def _apply_manual_env_overrides():
     """
-    Apply a map of environment variables to os.environ.
-    Does not overwrite existing values unless the value is not empty.
+    A single place to hard-code environment variables that ApiIngestor will read
+    via ${ENV_VAR} substitution in your YAML.
     """
-    for k, v in (env_map or {}).items():
-        if v is None:
-            continue
-        # Only set if missing; flip to os.environ[k] = v if you want to force overrides.
-        os.environ.setdefault(k, v)
+    overrides = {
+        # Example secrets/tokens / config:
+        # "VENDOR_A_TOKEN": "REPLACE_ME",
+        # "SFDC_TOKEN": "REPLACE_ME",
+        # "AWS_DEFAULT_REGION": "us-east-1",
+
+        # S3 output defaults (only if your YAML references them):
+        # "INGEST_S3_BUCKET": "your-bucket",
+        # "INGEST_S3_PREFIX": "ingestor/outputs/",
+    }
+
+    for k, v in overrides.items():
+        # setdefault -> won't clobber values already provided by the job config
+        os.environ.setdefault(k, str(v))
 
 
-def main() -> int:
-    logger = _configure_logging()
-    logger.info("Starting Glue runner.")
+# ---------- Main ----------
 
-    # Optionally make the ZIP importable at runtime.
-    if USE_RUNTIME_ZIP_IMPORT:
-        try:
-            local_zip = _add_zip_to_path(S3_ZIP_URI)
-            logger.info(f"Added ZIP to sys.path: {local_zip}")
-        except Exception as e:
-            logger.exception(
-                f"Failed to add ZIP to sys.path from {S3_ZIP_URI}: {e}"
-            )
-            return 2
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Glue runner for ApiIngestor")
+    parser.add_argument("--table", required=True, help="Table name in YAML (apis.<table>)")
+    parser.add_argument("--env", dest="env_name", required=True, help="Environment key in YAML (envs.<env>)")
+    # Optional hints if you’re NOT using --extra-py-files:
+    parser.add_argument("--bundle-prefix", default=os.getenv("INGESTOR_BUNDLE_PREFIX", "ingestor_bundle"),
+                        help="Local ZIP filename prefix to search when not using --extra-py-files")
+    parser.add_argument("--bundle-name", default=os.getenv("INGESTOR_BUNDLE_NAME"),
+                        help="Exact local ZIP filename to load (overrides prefix search)")
+    parser.add_argument("--dry-run", action="store_true", help="Parse args / set env / import wrapper, then exit")
 
-    # Load the wrapper entrypoint.
+    args = parser.parse_args(argv)
+
+    # Make sure our local bundle is importable if --extra-py-files wasn't set
     try:
-        run_ingestor = _load_entrypoint(WRAPPER_IMPORT)
-    except Exception as e:
-        logger.exception(
-            f"Failed to import wrapper entrypoint '{WRAPPER_IMPORT}': {e}"
-        )
-        return 3
+        from ingestor_wrapper import run_ingestor_from_env  # type: ignore
+        LOG.info("Imported wrapper from existing sys.path.")
+    except ModuleNotFoundError:
+        LOG.info("ingestor_wrapper not found on sys.path; attempting to locate local ZIP...")
+        _add_zip_to_syspath(args.bundle_prefix, args.bundle_name)
+        # Try again after modifying sys.path
+        from ingestor_wrapper import run_ingestor_from_env  # type: ignore
 
-    # Apply hard-coded env vars (tokens, etc.) before running.
-    _apply_env(HARD_CODED_ENV)
+    # Apply manual env overrides (won't overwrite pre-set env vars)
+    _apply_manual_env_overrides()
 
-    # Call the wrapper. The wrapper is responsible for:
-    #  - reading the YAML (from inside the ZIP if yaml_path=None)
-    #  - creating ApiIngestor
-    #  - executing once or backfill
-    #  - returning a metadata dict
-    try:
-        if RUN_MODE == "once":
-            meta = run_ingestor(
-                table_name=TABLE_NAME,
-                env_name=ENV_NAME,
-                yaml_path=YAML_PATH,  # None => wrapper loads from ZIP
-                backfill=None,  # not a backfill
-                extra_env=None,  # wrapper can also accept extra_env; hard-coded vars already applied
-                log_level="INFO",
-            )
-        elif RUN_MODE == "backfill":
-            if not (BACKFILL_START and BACKFILL_END):
-                raise ValueError(
-                    "BACKFILL_START and BACKFILL_END must be set for RUN_MODE='backfill'"
-                )
-            meta = run_ingestor(
-                table_name=TABLE_NAME,
-                env_name=ENV_NAME,
-                yaml_path=YAML_PATH,
-                backfill=(BACKFILL_START, BACKFILL_END),  # tuple[date, date]
-                extra_env=None,
-                log_level="INFO",
-            )
-        else:
-            raise ValueError(f"Unsupported RUN_MODE: {RUN_MODE}")
+    LOG.info("Starting ingestion: table=%s env=%s", args.table, args.env_name)
 
-        # Print JSON for convenient capture in Glue logs
-        logger.info("Ingestion complete. Metadata:")
-        print(
-            json.dumps(meta, default=str)
-        )  # default=str to serialize dates/timestamps
+    if args.dry_run:
+        LOG.info("Dry run complete. Exiting 0.")
         return 0
 
-    except Exception as e:
-        logger.exception(f"Ingestion failed: {e}")
-        return 1
+    # Delegate to the wrapper (which reads the YAML packaged in the ZIP)
+    meta = run_ingestor_from_env(table_name=args.table, env_name=args.env_name)
+
+    # Log JSON to make CloudWatch copy/paste friendly
+    LOG.info("Ingestion complete. Metadata:\n%s", json.dumps(meta, indent=2, default=str))
+    # Also print on stdout in case you capture output
+    print(json.dumps(meta, default=str))
+
+    return 0
 
 
 if __name__ == "__main__":

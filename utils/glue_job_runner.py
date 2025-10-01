@@ -1,109 +1,155 @@
 # run_step.py
-import os
-import sys
 import json
+import logging
+import sys
 from pathlib import Path
 
-# In the current working directory, find a list of files that match
-# the following pattern "ingestor_bundle..." with a ".zip"
-files = list(Path.cwd().rglob("ingestor_bundle*.zip"))
+LOG = logging.getLogger("glue_runner")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+)
 
+# ----------------------------------------------------------------------
+# Zip discovery & sys.path injection (mirrors the screenshot’s approach)
+# ----------------------------------------------------------------------
+# NOTE: Override the pattern with --zip_glob if you like (see argparse below).
+DEFAULT_ZIP_GLOB = "ingestor_bundle*.zip"
 
-def setup_path():
+def setup_path(zip_glob: str = DEFAULT_ZIP_GLOB) -> None:
     """
-    Set this up as a function so we can test it.
-
-    This function checks for a zip file used by glue and adds it to the sys.path list.
+    Find the single job zip in CWD and add the two typical paths to sys.path.
     """
-    # In the current working directory, find a list of files that match
-    # the following pattern "ingestor_bundle..." with a ".zip"
-    files = list(Path.cwd().rglob("ingestor_bundle*.zip"))
-
+    files = list(Path.cwd().rglob(zip_glob))
     if len(files) > 1:
-        raise ValueError(
-            f"More than one ingestor_bundle zip found: {files}"
-        )
+        raise ValueError(f"More than one job zip found via '{zip_glob}': {files}")
     elif len(files) == 1:
-        zip_file_with_zip = files[0].name
-        # Remove the ".zip" extension
-        zip_file_without_zip = zip_file_with_zip.split(".zip")[0]
-        # Create two strings with that name
-        base_path = f"{zip_file_with_zip}/{zip_file_without_zip}/"
-        python_path = f"{zip_file_with_zip}/{zip_file_without_zip}/Python"
+        zip_with_ext = files[0].name
+        zip_without_ext = zip_with_ext.split(".zip")[0]
 
-        # Add those two paths to the sys.path list
+        # First pair
+        base_path = f"{zip_with_ext}/{zip_without_ext}/"
         sys.path.insert(0, base_path)
-        sys.path.insert(0, python_path)
 
-        base_path = f"{zip_file_with_zip}/"
-        python_path = f"{zip_file_with_zip}/Python"
+        # Second pair
+        base_with_path = f"{zip_with_ext}/"
+        sys.path.insert(0, base_with_path)
 
-        # Add those two paths to the sys.path list
-        sys.path.insert(0, base_path)
-        sys.path.insert(0, python_path)
+        LOG.info("Added to sys.path: %s", sys.path[:4])
     else:
-        # We don't test for 0 files because it would error out
-        # when running tests.
-        pass
+        # No-op; your wrapper may still be co-located with this script
+        LOG.info("No zip found with pattern '%s' in CWD; continuing.", zip_glob)
 
+# Call the setup immediately so imports below can resolve
+# (We also parse args first to allow --zip_glob to customize the pattern.)
+# ----------------------------------------------------------------------
+def _build_arg_parser():
+    import argparse
 
-# Call the function we just created (this mirrors the screenshot exactly)
-setup_path()
-
-# Import after sys.path was extended so it can be found inside the ZIP
-from ingestor_wrapper import run_ingestor  # noqa: E402
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name, "").strip().lower()
-    if not raw:
-        return default
-    return raw in ("1", "true", "yes", "y", "on")
-
-
-def main_with_args() -> None:
-    """
-    Read env vars and invoke the ingestor wrapper. Prints the metadata JSON.
-    Env vars:
-      TABLE_NAME (required)
-      ENV_NAME (required)
-      YAML_PATH (optional, path inside the ZIP; wrapper can default if missing)
-      BACKFILL (optional: true/false)
-      START_DATE (required iff BACKFILL=true, YYYY-MM-DD)
-      END_DATE   (required iff BACKFILL=true, YYYY-MM-DD)
-      LOG_LEVEL  (optional; default INFO)
-    """
-    table = os.environ.get("TABLE_NAME")
-    env = os.environ.get("ENV_NAME")
-    yaml_path = os.environ.get("YAML_PATH")
-    backfill = _env_bool("BACKFILL", default=False)
-    start = os.environ.get("START_DATE")
-    end = os.environ.get("END_DATE")
-    log_level = os.environ.get("LOG_LEVEL", "INFO")
-
-    if not table or not env:
-        print("ERROR: TABLE_NAME and ENV_NAME must be set.", file=sys.stderr)
-        sys.exit(2)
-
-    if backfill and (not start or not end):
-        print("ERROR: BACKFILL=true requires START_DATE and END_DATE.", file=sys.stderr)
-        sys.exit(3)
-
-    meta = run_ingestor(
-        yaml_path=yaml_path,
-        table=table,
-        env=env,
-        backfill=backfill,
-        start=start,
-        end=end,
-        log_level=log_level,
+    p = argparse.ArgumentParser(
+        description="Glue runner for ApiIngestor wrapper (parses job parameters)."
     )
-    print(json.dumps(meta, separators=(",", ":"), sort_keys=True))
+    # Accept BOTH lowercase and uppercase flags (Glue UI often uses --UPPER)
+    p.add_argument("--table", "--TABLE", dest="table", required=True)
+    p.add_argument("--env", "--ENV", dest="env", required=True)
+    p.add_argument(
+        "--yaml_path", "--YAML_PATH",
+        dest="yaml_path",
+        default="config/ingestor.yml",
+        help="Path to the ingestor YAML *inside* the bundle (or a package resource path)."
+    )
+    p.add_argument(
+        "--run_mode", "--RUN_MODE",
+        dest="run_mode",
+        choices=["once", "backfill"],
+        default="once",
+        help="Run a one-off fetch or a backfill over a date range."
+    )
+    p.add_argument("--start", "--START", dest="start", default=None,
+                   help="Backfill start date (YYYY-MM-DD). Required for run_mode=backfill.")
+    p.add_argument("--end", "--END", dest="end", default=None,
+                   help="Backfill end date (YYYY-MM-DD). Required for run_mode=backfill.")
+    p.add_argument("--zip_glob", "--ZIP_GLOB", dest="zip_glob",
+                   default=DEFAULT_ZIP_GLOB,
+                   help=f"Zip filename glob to add to sys.path (default '{DEFAULT_ZIP_GLOB}').")
+    p.add_argument("--log_level", "--LOG_LEVEL", dest="log_level",
+                   default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    return p
 
+def _parse_args():
+    # Try Glue's resolver first (safe if library exists), else argparse.
+    try:
+        from awsglue.utils import getResolvedOptions  # type: ignore
+        # The keys here must be UPPERCASE for Glue
+        opts = getResolvedOptions(
+            sys.argv,
+            ["TABLE", "ENV", "YAML_PATH", "RUN_MODE", "START", "END", "ZIP_GLOB", "LOG_LEVEL"],
+        )
+        return {
+            "table": opts.get("TABLE"),
+            "env": opts.get("ENV"),
+            "yaml_path": opts.get("YAML_PATH", "config/ingestor.yml"),
+            "run_mode": (opts.get("RUN_MODE") or "once").lower(),
+            "start": opts.get("START"),
+            "end": opts.get("END"),
+            "zip_glob": opts.get("ZIP_GLOB", DEFAULT_ZIP_GLOB),
+            "log_level": opts.get("LOG_LEVEL", "INFO").upper(),
+        }
+    except Exception:
+        # Fallback to argparse (local runs, unit tests, etc.)
+        parser = _build_arg_parser()
+        ns, _ = parser.parse_known_args()
+        return {
+            "table": ns.table,
+            "env": ns.env,
+            "yaml_path": ns.yaml_path,
+            "run_mode": ns.run_mode.lower(),
+            "start": ns.start,
+            "end": ns.end,
+            "zip_glob": ns.zip_glob,
+            "log_level": ns.log_level.upper(),
+        }
 
-def main() -> None:
-    main_with_args()
+def main() -> int:
+    args = _parse_args()
 
+    # Now that we have --zip_glob, add the bundle to sys.path
+    setup_path(args["zip_glob"])
+
+    # Adjust log level after parsing
+    LOG.setLevel(getattr(logging, args["log_level"], logging.INFO))
+    LOG.info("Resolved args: %s", json.dumps({k: v for k, v in args.items() if k != 'zip_glob'}))
+
+    # Import AFTER sys.path is set so we can find the wrapper in the zip
+    try:
+        import ingestor_wrapper  # your wrapper module at the root of the zip
+    except Exception as e:
+        LOG.exception("Failed to import 'ingestor_wrapper' from zip/system path.")
+        print(json.dumps({"status": "error", "stage": "import_wrapper", "error": str(e)}))
+        return 2
+
+    # Run the ingestor via the wrapper
+    try:
+        meta = ingestor_wrapper.run_ingestor(
+            table=args["table"],
+            env_name=args["env"],
+            yaml_path=args["yaml_path"],
+            run_mode=args["run_mode"],
+            start=args["start"],
+            end=args["end"],
+        )
+        LOG.info("Ingestor finished: %s", json.dumps(meta))
+        print(json.dumps(meta))  # convenient for scraping
+        return 0
+    except SystemExit as se:
+        # keep Glue happy with a clean numeric exit
+        code = int(getattr(se, "code", 1) or 0)
+        LOG.error("Wrapper raised SystemExit(%s)", code)
+        return code
+    except Exception as e:
+        LOG.exception("Ingestor wrapper run failed.")
+        print(json.dumps({"status": "error", "stage": "run_ingestor", "error": str(e)}))
+        return 3
 
 if __name__ == "__main__":  # pragma: no cover
-    main()
+    raise SystemExit(main())

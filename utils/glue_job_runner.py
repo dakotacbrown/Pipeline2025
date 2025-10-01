@@ -1,117 +1,159 @@
+#!/usr/bin/env python3
+"""
+Glue entrypoint that:
+  1) parses Glue Job parameters (e.g., --mode, --table, --env, --start, --end, --yaml_path, --set),
+  2) exports them into OS environment variables (so ${...} placeholders in YAML work),
+  3) calls the ingestor wrapper to run once or backfill,
+  4) prints the returned metadata as JSON.
+
+Usage examples (Glue UI → Job parameters):
+  --mode        run_once
+  --table       orders_with_details
+  --env         prod
+  --yaml_path   ingestor.yml
+
+Backfill example:
+  --mode        backfill
+  --table       events_api
+  --env         qa
+  --start       2025-01-01
+  --end         2025-01-15
+
+Env injection (repeat --set to add many):
+  --set         OUT_BUCKET=my-bucket
+  --set         OUT_PREFIX=ingestor/exports
+  --set         VENDOR_A_TOKEN=eyJhbGciOi...<redacted>...
+"""
 import argparse
-import glob
 import json
 import logging
 import os
 import sys
-from typing import Optional
+from typing import Dict
 
-LOG = logging.getLogger("glue_runner")
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+# The wrapper is packaged in the same Python library ZIP on the Glue job
+from ingestor_wrapper import run_ingestor  # noqa: E402
 
-# ---------- Optional: add local ZIP to sys.path if --extra-py-files wasn't set ----------
 
-def _add_zip_to_syspath(zip_prefix: str = "ingestor_bundle", explicit_name: Optional[str] = None) -> None:
+def _parse_kv(s: str) -> Dict[str, str]:
     """
-    If the ingestor ZIP isn't already on sys.path, try to find it locally
-    (CWD or /tmp) and add it. Useful when the job wasn't configured with
-    --extra-py-files.
-
-    We add the ZIP root; if a 'Python' dir exists inside, we add that too.
+    Parse KEY=VALUE strings (for --set). Whitespace around '=' is not allowed.
     """
-    candidates = []
-    if explicit_name:
-        for base in (os.getcwd(), "/tmp"):
-            p = os.path.join(base, explicit_name)
-            if os.path.exists(p):
-                candidates.append(p)
-    else:
-        for base in (os.getcwd(), "/tmp"):
-            candidates.extend(glob.glob(os.path.join(base, f"{zip_prefix}*.zip")))
+    if "=" not in s:
+        raise argparse.ArgumentTypeError(
+            f"--set expects KEY=VALUE but got: {s!r}"
+        )
+    k, v = s.split("=", 1)
+    k = k.strip()
+    if not k:
+        raise argparse.ArgumentTypeError("--set key cannot be empty")
+    return {k: v}
 
-    if not candidates:
-        LOG.info("No local ingestor bundle found (prefix=%r, explicit=%r).", zip_prefix, explicit_name)
-        return
 
-    zip_path = candidates[0]
-    if zip_path not in sys.path:
-        sys.path.insert(0, zip_path)
-        LOG.info("Added ZIP to sys.path: %s", zip_path)
-
-    # Some bundles place code under ZIP/Python — add if present.
-    py_subdir = f"{zip_path}/Python"
-    if os.path.exists(py_subdir) and py_subdir not in sys.path:
-        sys.path.insert(0, py_subdir)
-        LOG.info("Added ZIP/Python to sys.path: %s", py_subdir)
-
-# ---------- Hard-coded env overrides (edit these as needed) ----------
-
-def _apply_manual_env_overrides():
+def _export_env(core: argparse.Namespace, extra_sets: Dict[str, str]):
     """
-    A single place to hard-code environment variables that ApiIngestor will read
-    via ${ENV_VAR} substitution in your YAML.
+    Export both core args and user-provided --set pairs to os.environ
+    so YAML can reference them via ${VARNAME}.
     """
-    overrides = {
-        # Example secrets/tokens / config:
-        # "VENDOR_A_TOKEN": "REPLACE_ME",
-        # "SFDC_TOKEN": "REPLACE_ME",
-        # "AWS_DEFAULT_REGION": "us-east-1",
-
-        # S3 output defaults (only if your YAML references them):
-        # "INGEST_S3_BUCKET": "your-bucket",
-        # "INGEST_S3_PREFIX": "ingestor/outputs/",
+    # Core arguments -> env (helpful for YAML placeholders or logging)
+    mappings = {
+        "RUN_MODE": core.mode or "",
+        "TABLE_NAME": core.table or "",
+        "ENV_NAME": core.env or "",
+        "BACKFILL_START": core.start or "",
+        "BACKFILL_END": core.end or "",
+        "INGEST_YAML_PATH": core.yaml_path or "ingestor.yml",
     }
+    for k, v in mappings.items():
+        if v:
+            os.environ[k] = v
 
-    for k, v in overrides.items():
-        # setdefault -> won't clobber values already provided by the job config
-        os.environ.setdefault(k, str(v))
+    # User-supplied overrides
+    for k, v in extra_sets.items():
+        os.environ[k] = v
 
 
-# ---------- Main ----------
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Glue runner for ApiIngestor (env-backed config)."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["run_once", "backfill"],
+        required=True,
+        help="One-off pull or backfill windowing.",
+    )
+    parser.add_argument(
+        "--table", required=True, help="Table key under 'apis:' in YAML."
+    )
+    parser.add_argument(
+        "--env", dest="env", required=True, help="Env key under 'envs:' in YAML."
+    )
+    parser.add_argument(
+        "--start",
+        required=False,
+        help="YYYY-MM-DD (required for --mode backfill).",
+    )
+    parser.add_argument(
+        "--end",
+        required=False,
+        help="YYYY-MM-DD (required for --mode backfill).",
+    )
+    parser.add_argument(
+        "--yaml_path",
+        default="ingestor.yml",
+        help="Path to the YAML file INSIDE the library ZIP (default: ingestor.yml).",
+    )
+    parser.add_argument(
+        "--set",
+        dest="set_pairs",
+        action="append",
+        type=_parse_kv,
+        default=[],
+        help="Inject KEY=VALUE into process env (repeatable).",
+    )
+    args = parser.parse_args()
 
-def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Glue runner for ApiIngestor")
-    parser.add_argument("--table", required=True, help="Table name in YAML (apis.<table>)")
-    parser.add_argument("--env", dest="env_name", required=True, help="Environment key in YAML (envs.<env>)")
-    # Optional hints if you’re NOT using --extra-py-files:
-    parser.add_argument("--bundle-prefix", default=os.getenv("INGESTOR_BUNDLE_PREFIX", "ingestor_bundle"),
-                        help="Local ZIP filename prefix to search when not using --extra-py-files")
-    parser.add_argument("--bundle-name", default=os.getenv("INGESTOR_BUNDLE_NAME"),
-                        help="Exact local ZIP filename to load (overrides prefix search)")
-    parser.add_argument("--dry-run", action="store_true", help="Parse args / set env / import wrapper, then exit")
+    # Flatten list[dict] from repeated --set into one dict
+    extra_sets: Dict[str, str] = {}
+    for d in args.set_pairs:
+        extra_sets.update(d)
 
-    args = parser.parse_args(argv)
+    # Basic logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    log = logging.getLogger("glue_runner")
 
-    # Make sure our local bundle is importable if --extra-py-files wasn't set
-    try:
-        from ingestor_wrapper import run_ingestor_from_env  # type: ignore
-        LOG.info("Imported wrapper from existing sys.path.")
-    except ModuleNotFoundError:
-        LOG.info("ingestor_wrapper not found on sys.path; attempting to locate local ZIP...")
-        _add_zip_to_syspath(args.bundle_prefix, args.bundle_name)
-        # Try again after modifying sys.path
-        from ingestor_wrapper import run_ingestor_from_env  # type: ignore
+    # Export env so YAML ${...} can see them
+    _export_env(args, extra_sets)
 
-    # Apply manual env overrides (won't overwrite pre-set env vars)
-    _apply_manual_env_overrides()
+    # Log a minimal view (avoid logging secrets!)
+    log.info(
+        "Starting run: mode=%s table=%s env=%s yaml=%s",
+        args.mode,
+        args.table,
+        args.env,
+        args.yaml_path,
+    )
+    if args.mode == "backfill":
+        log.info("Backfill window: start=%s end=%s", args.start, args.end)
 
-    LOG.info("Starting ingestion: table=%s env=%s", args.table, args.env_name)
+    # Call the wrapper (it loads YAML and runs the ApiIngestor)
+    meta = run_ingestor(
+        yaml_path=args.yaml_path,
+        mode=args.mode,
+        table=args.table,
+        env_name=args.env,
+        start=args.start,
+        end=args.end,
+        logger=log,
+    )
 
-    if args.dry_run:
-        LOG.info("Dry run complete. Exiting 0.")
-        return 0
-
-    # Delegate to the wrapper (which reads the YAML packaged in the ZIP)
-    meta = run_ingestor_from_env(table_name=args.table, env_name=args.env_name)
-
-    # Log JSON to make CloudWatch copy/paste friendly
-    LOG.info("Ingestion complete. Metadata:\n%s", json.dumps(meta, indent=2, default=str))
-    # Also print on stdout in case you capture output
-    print(json.dumps(meta, default=str))
-
+    # Print metadata as JSON to stdout for downstream capture
+    print(json.dumps(meta, indent=2, default=str))
+    log.info("Done. Rows=%s, Bytes=%s, Sink=%s", meta.get("rows"), meta.get("bytes"), meta.get("s3_uri"))
     return 0
 
 

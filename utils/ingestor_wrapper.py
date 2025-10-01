@@ -1,88 +1,98 @@
-from __future__ import annotations
+"""
+ingestor_wrapper.py
+
+Thin wrapper that:
+  - reads the YAML config (with ${ENV_VAR} placeholders),
+  - constructs ApiIngestor,
+  - runs either run_once or run_backfill,
+  - returns the metadata dict.
+
+You can call run_ingestor(...) directly from code, or rely on
+environment variables and call run_ingestor_from_environ().
+"""
 
 import logging
-from datetime import date
-from typing import Any, Dict, Optional, Union
+import os
+from datetime import date, datetime
+from typing import Optional
 
 import yaml
 
-# Adjust the import below if your ApiIngestor lives elsewhere
-from utils.api_ingestor import ApiIngestor
+# Adjust this import path to match where ApiIngestor lives in your project
+from utils.api_ingestor import ApiIngestor  # noqa: E402
 
 
-def _make_logger(name: str = "api_ingestor") -> logging.Logger:
-    """Create a simple logger if the caller does not provide one."""
-    logger = logging.getLogger(name)
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        fmt = logging.Formatter(
-            fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-            datefmt="%Y-%m-%dT%H:%M:%SZ",
-        )
-        handler.setFormatter(fmt)
-        logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    return logger
+def _coerce_date(s: Optional[str]) -> Optional[date]:
+    if not s:
+        return None
+    return datetime.strptime(s, "%Y-%m-%d").date()
 
 
-def load_config_from_yaml(yaml_path: str) -> Dict[str, Any]:
-    """
-    Load and parse the YAML configuration file into a Python dict.
-    """
-    with open(yaml_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-
-def _coerce_date(d: Union[str, date]) -> date:
-    """Accept either a date or an ISO string (YYYY-MM-DD) and return a date."""
-    if isinstance(d, date):
-        return d
-    return date.fromisoformat(d)
-
-
-def run_ingest_from_yaml(
-    yaml_path: str,
-    table_name: str,
-    env_name: str,
+def run_ingestor(
     *,
-    mode: str = "once",  # "once" | "backfill"
-    start: Optional[Union[str, date]] = None,
-    end: Optional[Union[str, date]] = None,
+    yaml_path: str = "ingestor.yml",
+    mode: str,
+    table: str,
+    env_name: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
     logger: Optional[logging.Logger] = None,
-) -> Dict[str, Any]:
+):
     """
-    Read config YAML, create an ApiIngestor, run it, and return the metadata dict.
-
-    Args:
-        yaml_path: Path to the YAML config included alongside the code.
-        table_name: The table key under `apis:` in the YAML.
-        env_name: The environment key under `envs:` in the YAML.
-        mode: "once" for a single pull, "backfill" for a windowed backfill.
-        start/end: Required for backfill. Accept date objects or "YYYY-MM-DD" strings.
-        logger: Optional logger; if not provided, a basic one is created.
-
-    Returns:
-        The metadata dictionary returned by ApiIngestor.run_once/run_backfill.
+    Run the ingestor according to args and return the metadata dict.
     """
-    log = logger or _make_logger()
-    config = load_config_from_yaml(yaml_path)
+    log = logger or logging.getLogger("ingestor_wrapper")
+    if not log.handlers:
+        logging.basicConfig(level=logging.INFO)
 
+    # 1) Load YAML (keep env var placeholders; ApiIngestor expands them)
+    with open(yaml_path, "r", encoding="utf-8") as fh:
+        config = yaml.safe_load(fh) or {}
+
+    # 2) Construct ingestor
     ingestor = ApiIngestor(config=config, log=log)
 
-    if mode == "once":
-        return ingestor.run_once(table_name, env_name)
+    # 3) Dispatch
+    if mode == "run_once":
+        meta = ingestor.run_once(table, env_name)
+        return meta
 
     if mode == "backfill":
-        if start is None or end is None:
-            raise ValueError("Backfill mode requires both 'start' and 'end'.")
-        start_d = _coerce_date(start)
-        end_d = _coerce_date(end)
-        return ingestor.run_backfill(table_name, env_name, start_d, end_d)
+        d0 = _coerce_date(start)
+        d1 = _coerce_date(end)
+        if not d0 or not d1:
+            raise ValueError("backfill requires both --start and --end (YYYY-MM-DD).")
+        meta = ingestor.run_backfill(table, env_name, d0, d1)
+        return meta
 
-    raise ValueError(f"Unsupported mode: {mode!r}. Use 'once' or 'backfill'.")
+    raise ValueError(f"Unknown mode: {mode!r}")
 
 
-__all__ = [
-    "load_config_from_yaml",
-    "run_ingest_from_yaml",
-]
+def run_ingestor_from_environ() -> dict:
+    """
+    Optional helper: read core settings from environment variables and run.
+    Useful if your platform injects env vars instead of CLI args.
+
+    Uses:
+      RUN_MODE, TABLE_NAME, ENV_NAME, BACKFILL_START, BACKFILL_END, INGEST_YAML_PATH
+    """
+    mode = os.getenv("RUN_MODE")
+    table = os.getenv("TABLE_NAME")
+    env_name = os.getenv("ENV_NAME")
+    yaml_path = os.getenv("INGEST_YAML_PATH", "ingestor.yml")
+    start = os.getenv("BACKFILL_START")
+    end = os.getenv("BACKFILL_END")
+
+    if not (mode and table and env_name):
+        raise RuntimeError(
+            "RUN_MODE, TABLE_NAME, and ENV_NAME environment variables are required."
+        )
+
+    return run_ingestor(
+        yaml_path=yaml_path,
+        mode=mode,
+        table=table,
+        env_name=env_name,
+        start=start,
+        end=end,
+    )

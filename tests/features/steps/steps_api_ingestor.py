@@ -34,6 +34,7 @@ def step_base_host(context, base):
 
 # ----------------- Cursor pagination -----------------
 
+
 @given('a cursor endpoint "{path}" with two pages of 2 items each')
 def step_cursor_endpoint(context, path):
     full1 = urljoin(context.base, path.lstrip("/"))
@@ -74,6 +75,7 @@ def step_cursor_config(context):
 
 # ----------------- Page pagination -----------------
 
+
 @given('a paged endpoint "{path}" where page 1 has 2 items and page 2 is empty')
 def step_paged_endpoint(context, path):
     full = urljoin(context.base, path.lstrip("/"))
@@ -109,6 +111,7 @@ def step_page_config(context):
 
 # ----------------- Link-header pagination -----------------
 
+
 @given('a link-header chain starting at "{first}" then "{second}"')
 def step_link_header_chain(context, first, second):
     url1 = urljoin(context.base, first.lstrip("/"))
@@ -143,6 +146,7 @@ def step_link_header_config(context):
 
 
 # ----------------- Link expansion -----------------
+
 
 @given('a base endpoint "{path}" that returns items with per-row detail URLs')
 def step_rows_with_details(context, path):
@@ -211,6 +215,7 @@ def step_link_expansion_config(context, token):
 
 # ----------------- Date-window backfill -----------------
 
+
 @given('a date-window endpoint "{path}" that echoes window ranges as items')
 def step_date_window_endpoint(context, path):
     full = urljoin(context.base, path.lstrip("/"))
@@ -253,6 +258,7 @@ def step_date_backfill_config(context):
 
 
 # ----------------- Salesforce SOQL-window backfill -----------------
+
 
 @given('a salesforce endpoint "{path}" that returns done=false then done=true')
 def step_salesforce_endpoint(context, path):
@@ -316,6 +322,7 @@ def step_sf_config(context):
 
 # ----------------- When steps (patched to capture DF) -----------------
 
+
 def _install_capture(ingestor, context):
     # Patch _write_output so we can assert on the produced DataFrame
     def _capture_write_output(self, df, table_name, env_name, out_cfg):
@@ -351,17 +358,26 @@ def step_run_backfill(context, table, env, start, end):
 
 # ----------------- Then steps -----------------
 
+
 @then("the result has {n:d} rows")
 def step_assert_rows(context, n):
     assert hasattr(context, "df"), "No DataFrame on context"
-    assert len(context.df) == n, f"Expected {n} rows, got {len(context.df)}.\n{context.df}"
+    assert (
+        len(context.df) == n
+    ), f"Expected {n} rows, got {len(context.df)}.\n{context.df}"
 
 
-@then('the expanded result has {n:d} rows and includes the detail field "{col}"')
+@then(
+    'the expanded result has {n:d} rows and includes the detail field "{col}"'
+)
 def step_assert_expanded(context, n, col):
     assert hasattr(context, "df"), "No DataFrame on context"
-    assert len(context.df) == n, f"Expected {n} rows, got {len(context.df)}.\n{context.df}"
-    assert col in context.df.columns, f"Expected column '{col}' in expanded DataFrame. Columns: {context.df.columns}"
+    assert (
+        len(context.df) == n
+    ), f"Expected {n} rows, got {len(context.df)}.\n{context.df}"
+    assert (
+        col in context.df.columns
+    ), f"Expected column '{col}' in expanded DataFrame. Columns: {context.df.columns}"
 
 
 @then('the result has {n:d} rows and contains values "{d1}" "{d2}" "{d3}"')

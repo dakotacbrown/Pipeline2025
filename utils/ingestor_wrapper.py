@@ -1,236 +1,160 @@
-"""
-Ingestor wrapper:
-- Reads a YAML config (local file, S3, or package resource inside the ZIP)
-- Creates ApiIngestor
-- Runs once or backfill and returns the metadata dict
-"""
+# ingestor_wrapper.py
+from __future__ import annotations
 
-import io
 import json
 import logging
-import os
+import sys
 from datetime import datetime, date
-from typing import Optional, Dict, Any
+from pathlib import Path
+from typing import Dict, Any, Optional
+from zipfile import ZipFile
 
-# Third party
-try:
-    import yaml
-except Exception as e:
-    raise RuntimeError("PyYAML is required (yaml). Install pyyaml.") from e
+import yaml  # Make sure pyyaml is available on the job
 
-# Local import from your ZIP
-from utils.api_ingestor import ApiIngestor  # noqa: E402
-
-# For package-resource loading (ZIP-internal files)
-try:
-    from importlib.resources import files as ir_files  # Python 3.9+
-except Exception:  # pragma: no cover
-    ir_files = None
-
-# ---------------------------------------------------------------------------
-
-_DEFAULT_RESOURCE_PACKAGE = "ingestor_wrapper"
-_DEFAULT_CANDIDATE_FILENAMES = (
-    "ingestor.yml",
-    "ingestor.yaml",
-    "config.yml",
-    "config.yaml",
-)
-
-# ---------------------------------------------------------------------------
+# Import your ingestor
+from utils.api_ingestor import ApiIngestor
 
 
-def _read_yaml_from_package(resource: Optional[str] = None) -> str:
+LOG = logging.getLogger("ingestor_wrapper")
+if not LOG.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+    )
+
+
+# ---------------------------------------------------------------------
+# Helpers: read YAML from filesystem or from any .zip present on sys.path
+# ---------------------------------------------------------------------
+def _zip_candidates_from_sys_path() -> list[Path]:
     """
-    Read YAML text from inside the ZIP via importlib.resources.
-
-    resource forms supported:
-      - None -> try default filenames in _DEFAULT_RESOURCE_PACKAGE
-      - "ingestor_wrapper:ingestor.yml"  (package:resource)
-      - "res://ingestor_wrapper/ingestor.yml" or "pkg://ingestor_wrapper/ingestor.yml"
-      - "ingestor_wrapper/ingestor.yml" (best-effort)
+    Locate any .zip files referenced by sys.path entries. We normalize
+    entries like 'something.zip/', 'something.zip/Python', etc. back to
+    the real ZIP file path (ending with .zip) and keep uniques.
     """
-    if ir_files is None:
-        raise FileNotFoundError(
-            "importlib.resources not available to load package resources."
-        )
+    cands: list[Path] = []
+    seen = set()
+    for p in sys.path:
+        if ".zip" not in p.lower():
+            continue
+        # Normalize to the actual .zip path
+        idx = p.lower().find(".zip")
+        zip_path = Path(p[: idx + 4]).resolve()
+        if zip_path.exists() and zip_path.suffix.lower() == ".zip":
+            if zip_path not in seen:
+                cands.append(zip_path)
+                seen.add(zip_path)
+    return cands
 
-    pkg = _DEFAULT_RESOURCE_PACKAGE
-    name = None
 
-    if resource:
-        # Normalize different forms
-        if resource.startswith(("res://", "pkg://")):
-            resource = resource.split("://", 1)[1]
-        if ":" in resource:
-            pkg, name = resource.split(":", 1)
-        elif "/" in resource:
-            # "package/path.yml" -> split once
-            pkg, name = resource.split("/", 1)
-        else:
-            # Only a name -> use default package
-            name = resource
+def _read_text_from_zip(zip_path: Path, inner_path: str) -> Optional[str]:
+    """
+    Try to read 'inner_path' from the given zip. We also try common
+    subpath variants used by some bundles:
+      - as-is
+      - Python/<inner_path>
+      - <zip_stem>/<inner_path>
+      - <zip_stem>/Python/<inner_path>
+    Returns text or None if not found.
+    """
+    inner = inner_path.lstrip("/")
 
-        handle = ir_files(pkg).joinpath(name)
-        if not handle.is_file():
-            raise FileNotFoundError(
-                f"Package resource not found: {pkg}:{name}"
-            )
-        return handle.read_text(encoding="utf-8")
+    variants = [inner, f"Python/{inner}"]
+    stem = zip_path.stem
+    variants += [f"{stem}/{inner}", f"{stem}/Python/{inner}"]
 
-    # Auto-discover: look for default names under default package
-    base = ir_files(pkg)
-    for cand in _DEFAULT_CANDIDATE_FILENAMES:
-        handle = base.joinpath(cand)
-        if handle.is_file():
-            return handle.read_text(encoding="utf-8")
+    try:
+        with ZipFile(zip_path, "r") as zf:
+            for v in variants:
+                try:
+                    with zf.open(v) as fh:
+                        data = fh.read()
+                        return data.decode("utf-8")
+                except KeyError:
+                    continue
+    except Exception:
+        # Don’t let a single broken zip abort the search
+        return None
+    return None
+
+
+def _load_yaml_from_anywhere(yaml_path: str) -> Dict[str, Any]:
+    """
+    Load YAML either from the filesystem (if the path exists) or from
+    any .zip referenced by sys.path (typical in AWS Glue jobs).
+    """
+    p = Path(yaml_path)
+    if p.exists():
+        LOG.info("Loading YAML from filesystem: %s", p)
+        return yaml.safe_load(p.read_text())
+
+    # Try every zip on sys.path
+    for z in _zip_candidates_from_sys_path():
+        text = _read_text_from_zip(z, yaml_path)
+        if text is not None:
+            LOG.info("Loaded YAML from zip: %s :: %s", z, yaml_path)
+            return yaml.safe_load(text)
 
     raise FileNotFoundError(
-        f"Could not auto-discover a YAML in package '{pkg}'. "
-        f"Tried: {', '.join(_DEFAULT_CANDIDATE_FILENAMES)}. "
-        f"Pass YAML_PATH env var (e.g. 'ingestor_wrapper:ingestor.yml' or a real file path)."
+        f"Could not locate YAML '{yaml_path}' on disk or in any sys.path zip."
     )
 
 
-def _read_yaml_from_s3(s3_uri: str) -> str:
-    """
-    Read YAML text from s3://bucket/key using boto3.
-    """
-    try:
-        import boto3  # imported lazily so local runs don't require it unless needed
-    except Exception as e:
-        raise RuntimeError("boto3 is required to read S3 URIs.") from e
-
-    if not s3_uri.startswith("s3://"):
-        raise ValueError("S3 URI must start with s3://")
-
-    _, rest = s3_uri.split("s3://", 1)
-    bucket, key = rest.split("/", 1)
-    s3 = boto3.client("s3")
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    return obj["Body"].read().decode("utf-8")
-
-
-def _load_yaml_text(yaml_path: Optional[str]) -> str:
-    """
-    Load YAML text from:
-      1) explicit path/URI if provided
-         - local file path
-         - s3://bucket/key
-         - package resource forms
-      2) otherwise: auto-discover inside 'ingestor_wrapper' package
-    """
-    if yaml_path:
-        # S3?
-        if yaml_path.startswith("s3://"):
-            return _read_yaml_from_s3(yaml_path)
-
-        # Package resource forms?
-        if any(
-            yaml_path.startswith(prefix)
-            for prefix in ("res://", "pkg://")
-        ) or ":" in yaml_path or (
-            "/" in yaml_path and not os.path.exists(yaml_path)
-        ):
-            return _read_yaml_from_package(yaml_path)
-
-        # Local file
-        if os.path.isfile(yaml_path):
-            with open(yaml_path, "r", encoding="utf-8") as f:
-                return f.read()
-
-        # As a last attempt, try package form
-        return _read_yaml_from_package(yaml_path)
-
-    # No path given -> auto-discover in package
-    return _read_yaml_from_package(resource=None)
-
-
-def _build_logger(level: str = "INFO") -> logging.Logger:
-    log = logging.getLogger("ApiIngestor")
-    if not log.handlers:
-        handler = logging.StreamHandler()
-        fmt = logging.Formatter(
-            "%(asctime)s %(levelname)s %(name)s: %(message)s"
-        )
-        handler.setFormatter(fmt)
-        log.addHandler(handler)
-    log.setLevel(getattr(logging, level.upper(), logging.INFO))
-    return log
-
-
-def _parse_iso_date(d: str) -> date:
-    return datetime.strptime(d, "%Y-%m-%d").date()
-
-
+# ---------------------------------------------------------------------
+# Public entrypoint used by the runner
+# ---------------------------------------------------------------------
 def run_ingestor(
-    yaml_path: Optional[str],
     table: str,
-    env: str,
-    backfill: bool = False,
+    env_name: str,
+    yaml_path: str,
+    run_mode: str = "once",
     start: Optional[str] = None,
     end: Optional[str] = None,
-    log_level: str = "INFO",
 ) -> Dict[str, Any]:
     """
-    Main entry for programmatic use (called by the runner).
+    Run the ApiIngestor using config from YAML and return the metadata dict.
 
-    Returns: metadata dict from ApiIngestor.run_once / run_backfill
+    Args:
+        table:     Table key under 'apis' in the YAML (e.g., 'events_api').
+        env_name:  Environment key under 'envs' (e.g., 'dev', 'prod').
+        yaml_path: Path to YAML on disk or inside the uploaded zip, e.g.
+                   'config/ingestor.yml'.
+        run_mode:  'once' or 'backfill'.
+        start:     Backfill start date 'YYYY-MM-DD' (required for backfill).
+        end:       Backfill end date 'YYYY-MM-DD' (required for backfill).
+
+    Returns:
+        Metadata dict returned by ApiIngestor.run_once / run_backfill.
     """
-    logger = _build_logger(log_level)
+    if not table:
+        raise ValueError("Parameter 'table' is required.")
+    if not env_name:
+        raise ValueError("Parameter 'env_name' is required.")
 
-    yaml_text = _load_yaml_text(yaml_path)
-    config = yaml.safe_load(io.StringIO(yaml_text))
+    config = _load_yaml_from_anywhere(yaml_path)
 
-    ing = ApiIngestor(config=config, log=logger)
+    # Minimal logger that ApiIngestor expects (std logging works fine)
+    log = LOG
 
-    if backfill:
+    ingestor = ApiIngestor(config=config, log=log)
+
+    if (run_mode or "once").lower() == "backfill":
         if not start or not end:
             raise ValueError(
-                "BACKFILL is true but START_DATE / END_DATE not provided."
+                "Backfill requires both 'start' and 'end' in YYYY-MM-DD format."
             )
-        start_d = _parse_iso_date(start)
-        end_d = _parse_iso_date(end)
-        meta = ing.run_backfill(table, env, start_d, end_d)
+        try:
+            d0: date = datetime.strptime(start, "%Y-%m-%d").date()
+            d1: date = datetime.strptime(end, "%Y-%m-%d").date()
+        except Exception as e:
+            raise ValueError(
+                f"Invalid start/end; expected YYYY-MM-DD. Got start={start!r}, end={end!r}"
+            ) from e
+
+        meta = ingestor.run_backfill(table_name=table, env_name=env_name, start=d0, end=d1)
     else:
-        meta = ing.run_once(table, env)
+        meta = ingestor.run_once(table_name=table, env_name=env_name)
 
-    # Log and return
-    logger.info("Ingest complete: %s", json.dumps(meta, indent=2))
+    # Helpful for Glue log searchers
+    LOG.info("Ingestor metadata: %s", json.dumps(meta))
     return meta
-
-
-# Optional CLI for local debugging
-def main() -> int:
-    # Use environment variables to keep Glue/UI and local consistent.
-    table = os.environ.get("TABLE_NAME")
-    env = os.environ.get("ENV_NAME")
-    yaml_path = os.environ.get("YAML_PATH")  # optional
-    backfill = os.environ.get("BACKFILL", "false").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    start = os.environ.get("START_DATE")
-    end = os.environ.get("END_DATE")
-    log_level = os.environ.get("LOG_LEVEL", "INFO")
-
-    if not table or not env:
-        raise SystemExit(
-            "Missing TABLE_NAME or ENV_NAME. Set env vars and re-run."
-        )
-
-    run_ingestor(
-        yaml_path=yaml_path,
-        table=table,
-        env=env,
-        backfill=backfill,
-        start=start,
-        end=end,
-        log_level=log_level,
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

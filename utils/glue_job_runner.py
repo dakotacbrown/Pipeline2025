@@ -1,159 +1,93 @@
-#!/usr/bin/env python3
 """
-Glue entrypoint that:
-  1) parses Glue Job parameters (e.g., --mode, --table, --env, --start, --end, --yaml_path, --set),
-  2) exports them into OS environment variables (so ${...} placeholders in YAML work),
-  3) calls the ingestor wrapper to run once or backfill,
-  4) prints the returned metadata as JSON.
+Glue-friendly runner script (works locally too).
 
-Usage examples (Glue UI → Job parameters):
-  --mode        run_once
-  --table       orders_with_details
-  --env         prod
-  --yaml_path   ingestor.yml
+Reads configuration from environment variables, optionally extends sys.path
+(e.g., if you want to hard-code a local ZIP path during testing), then calls
+the ingestor wrapper and prints the resulting metadata dict as JSON.
 
-Backfill example:
-  --mode        backfill
-  --table       events_api
-  --env         qa
-  --start       2025-01-01
-  --end         2025-01-15
-
-Env injection (repeat --set to add many):
-  --set         OUT_BUCKET=my-bucket
-  --set         OUT_PREFIX=ingestor/exports
-  --set         VENDOR_A_TOKEN=eyJhbGciOi...<redacted>...
+Environment variables consumed:
+  - TABLE_NAME        (required)
+  - ENV_NAME          (required)
+  - YAML_PATH         (optional; local path, s3://..., or package resource like "ingestor_wrapper:ingestor.yml")
+  - BACKFILL          (optional: true/false; default false)
+  - START_DATE        (required if BACKFILL=true; format YYYY-MM-DD)
+  - END_DATE          (required if BACKFILL=true; format YYYY-MM-DD)
+  - LOG_LEVEL         (optional; default INFO)
+  - ZIP_PY_PATHS      (optional; colon-separated paths to append to sys.path, e.g. "/tmp/deps.zip:/tmp/other.zip")
 """
-import argparse
+
 import json
-import logging
 import os
 import sys
-from typing import Dict
-
-# The wrapper is packaged in the same Python library ZIP on the Glue job
-from ingestor_wrapper import run_ingestor  # noqa: E402
+from typing import Any, Dict
 
 
-def _parse_kv(s: str) -> Dict[str, str]:
+def _extend_sys_path_from_env() -> None:
     """
-    Parse KEY=VALUE strings (for --set). Whitespace around '=' is not allowed.
+    If ZIP_PY_PATHS is provided, extend sys.path with those entries.
+    Useful when testing locally to simulate Glue's --extra-py-files behavior.
     """
-    if "=" not in s:
-        raise argparse.ArgumentTypeError(
-            f"--set expects KEY=VALUE but got: {s!r}"
-        )
-    k, v = s.split("=", 1)
-    k = k.strip()
-    if not k:
-        raise argparse.ArgumentTypeError("--set key cannot be empty")
-    return {k: v}
+    zip_paths = os.environ.get("ZIP_PY_PATHS")
+    if not zip_paths:
+        return
+    for p in zip_paths.split(":"):
+        p = p.strip()
+        if p and p not in sys.path:
+            sys.path.insert(0, p)
 
 
-def _export_env(core: argparse.Namespace, extra_sets: Dict[str, str]):
-    """
-    Export both core args and user-provided --set pairs to os.environ
-    so YAML can reference them via ${VARNAME}.
-    """
-    # Core arguments -> env (helpful for YAML placeholders or logging)
-    mappings = {
-        "RUN_MODE": core.mode or "",
-        "TABLE_NAME": core.table or "",
-        "ENV_NAME": core.env or "",
-        "BACKFILL_START": core.start or "",
-        "BACKFILL_END": core.end or "",
-        "INGEST_YAML_PATH": core.yaml_path or "ingestor.yml",
-    }
-    for k, v in mappings.items():
-        if v:
-            os.environ[k] = v
-
-    # User-supplied overrides
-    for k, v in extra_sets.items():
-        os.environ[k] = v
+def _read_env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "y")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Glue runner for ApiIngestor (env-backed config)."
-    )
-    parser.add_argument(
-        "--mode",
-        choices=["run_once", "backfill"],
-        required=True,
-        help="One-off pull or backfill windowing.",
-    )
-    parser.add_argument(
-        "--table", required=True, help="Table key under 'apis:' in YAML."
-    )
-    parser.add_argument(
-        "--env", dest="env", required=True, help="Env key under 'envs:' in YAML."
-    )
-    parser.add_argument(
-        "--start",
-        required=False,
-        help="YYYY-MM-DD (required for --mode backfill).",
-    )
-    parser.add_argument(
-        "--end",
-        required=False,
-        help="YYYY-MM-DD (required for --mode backfill).",
-    )
-    parser.add_argument(
-        "--yaml_path",
-        default="ingestor.yml",
-        help="Path to the YAML file INSIDE the library ZIP (default: ingestor.yml).",
-    )
-    parser.add_argument(
-        "--set",
-        dest="set_pairs",
-        action="append",
-        type=_parse_kv,
-        default=[],
-        help="Inject KEY=VALUE into process env (repeatable).",
-    )
-    args = parser.parse_args()
+    _extend_sys_path_from_env()
 
-    # Flatten list[dict] from repeated --set into one dict
-    extra_sets: Dict[str, str] = {}
-    for d in args.set_pairs:
-        extra_sets.update(d)
+    # Import the wrapper from the ZIP (should succeed when ZIP is on sys.path or passed via Glue extra py files).
+    from ingestor_wrapper import run_ingestor  # noqa: WPS433
 
-    # Basic logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
-    log = logging.getLogger("glue_runner")
+    # Required
+    table = os.environ.get("TABLE_NAME")
+    env = os.environ.get("ENV_NAME")
 
-    # Export env so YAML ${...} can see them
-    _export_env(args, extra_sets)
+    if not table or not env:
+        print(
+            "ERROR: TABLE_NAME and ENV_NAME must be set as environment variables.",
+            file=sys.stderr,
+        )
+        return 2
 
-    # Log a minimal view (avoid logging secrets!)
-    log.info(
-        "Starting run: mode=%s table=%s env=%s yaml=%s",
-        args.mode,
-        args.table,
-        args.env,
-        args.yaml_path,
-    )
-    if args.mode == "backfill":
-        log.info("Backfill window: start=%s end=%s", args.start, args.end)
+    # Optional / conditional
+    yaml_path = os.environ.get("YAML_PATH")  # can be omitted to auto-discover
+    backfill = _read_env_bool("BACKFILL", default=False)
+    start = os.environ.get("START_DATE")
+    end = os.environ.get("END_DATE")
+    log_level = os.environ.get("LOG_LEVEL", "INFO")
 
-    # Call the wrapper (it loads YAML and runs the ApiIngestor)
-    meta = run_ingestor(
-        yaml_path=args.yaml_path,
-        mode=args.mode,
-        table=args.table,
-        env_name=args.env,
-        start=args.start,
-        end=args.end,
-        logger=log,
+    # If doing a backfill, sanity-check dates
+    if backfill and (not start or not end):
+        print(
+            "ERROR: BACKFILL=true but START_DATE or END_DATE is missing (YYYY-MM-DD).",
+            file=sys.stderr,
+        )
+        return 3
+
+    # Execute
+    meta: Dict[str, Any] = run_ingestor(
+        yaml_path=yaml_path,
+        table=table,
+        env=env,
+        backfill=backfill,
+        start=start,
+        end=end,
+        log_level=log_level,
     )
 
-    # Print metadata as JSON to stdout for downstream capture
-    print(json.dumps(meta, indent=2, default=str))
-    log.info("Done. Rows=%s, Bytes=%s, Sink=%s", meta.get("rows"), meta.get("bytes"), meta.get("s3_uri"))
+    # Print metadata as a single JSON line (easy to parse in logs)
+    print(json.dumps(meta, separators=(",", ":"), sort_keys=True))
     return 0
 
 

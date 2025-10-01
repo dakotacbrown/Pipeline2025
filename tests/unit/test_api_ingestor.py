@@ -1,4 +1,3 @@
-# test_api_ingestor.py
 import json
 import os
 from datetime import date
@@ -82,8 +81,9 @@ def make_ingestor(logger, monkeypatch):
     """
     Factory that returns a function to construct an ApiIngestor with a patched
     _build_session returning our FakeSession filled with specific responses.
+    Also stubs _write_output to capture the produced DataFrame and avoid S3/boto3.
     """
-    from utils.api_ingestor import (  # <-- replace with your real module path
+    from utils.api_ingestor import (  # <-- replace with your real module path if needed
         ApiIngestor,
     )
 
@@ -91,6 +91,25 @@ def make_ingestor(logger, monkeypatch):
         fake = FakeSession(responses=responses)
         monkeypatch.setenv("TOKEN", "XYZ")
         monkeypatch.setattr(ApiIngestor, "_build_session", lambda self, r: fake)
+
+        # Capture DF and bypass any real I/O in tests
+        def _fake_write_output(self, df, table_name, env_name, out_cfg):
+            # capture the DF so tests can assert on it
+            self._last_df = df.copy()
+            # return stable, dummy metadata
+            fmt = (
+                out_cfg.get("format") if isinstance(out_cfg, dict) else None
+            ) or "csv"
+            return {
+                "format": fmt,
+                "s3_bucket": "test-bucket",
+                "s3_key": "test/key",
+                "s3_uri": "s3://test-bucket/test/key",
+                "bytes": len(df.to_json().encode("utf-8")),
+            }
+
+        monkeypatch.setattr(ApiIngestor, "_write_output", _fake_write_output)
+
         ing = ApiIngestor(config=config, log=logger)
         return ing, fake
 
@@ -118,10 +137,14 @@ def test_env_substitution_applies_to_headers(make_ingestor):
     responses = [FakeResponse(json_data={"data": []})]
     ing, sess = make_ingestor(config, responses)
 
-    df = ing.run_once("my_table", "prod")
+    meta = ing.run_once("my_table", "prod")
+    df = ing._last_df
     assert df.empty
     # session defaults should be applied
     assert sess.headers.get("Authorization") == "Bearer XYZ"
+    # sanity metadata check
+    assert meta["rows"] == 0
+    assert meta["pagination_mode"] == "none"
 
 
 # ---- Tests: pagination modes -------------------------------------------------
@@ -140,10 +163,13 @@ def test_pagination_none_single_call(make_ingestor):
     responses = [FakeResponse(json_data={"data": [{"id": 1}, {"id": 2}]})]
     ing, sess = make_ingestor(config, responses)
 
-    df = ing.run_once("t", "prod")
+    meta = ing.run_once("t", "prod")
+    df = ing._last_df
     assert list(df["id"]) == [1, 2]
     assert len(sess.calls) == 1
     assert sess.calls[0][0] == "http://api/things"
+    assert meta["rows"] == 2
+    assert meta["pagination_mode"] == "none"
 
 
 def test_pagination_page_until_empty(make_ingestor):
@@ -166,12 +192,15 @@ def test_pagination_page_until_empty(make_ingestor):
     ]
     ing, sess = make_ingestor(config, responses)
 
-    df = ing.run_once("t", "prod")
+    meta = ing.run_once("t", "prod")
+    df = ing._last_df
     assert list(df["id"]) == [1, 2]
-    # Two calls: initial + empty page
+    # Two calls: initial + empty page (used to detect stop)
     assert len(sess.calls) == 2
     # page=2 should have been set in the second request
     assert sess.calls[1][1]["params"]["page"] == 2
+    assert meta["rows"] == 2
+    assert meta["pagination_mode"] == "page"
 
 
 def test_pagination_cursor_token(make_ingestor):
@@ -198,12 +227,15 @@ def test_pagination_cursor_token(make_ingestor):
     ]
     ing, sess = make_ingestor(config, responses)
 
-    df = ing.run_once("t", "prod")
+    meta = ing.run_once("t", "prod")
+    df = ing._last_df
     assert list(df["id"]) == [1, 2]
     # First call should include page size limit
     assert sess.calls[0][1]["params"]["limit"] == 2
     # Second call should include cursor=abc
     assert sess.calls[1][1]["params"]["cursor"] == "abc"
+    assert meta["rows"] == 2
+    assert meta["pagination_mode"] == "cursor"
 
 
 def test_pagination_link_header(make_ingestor):
@@ -225,10 +257,13 @@ def test_pagination_link_header(make_ingestor):
     ]
     ing, sess = make_ingestor(config, responses)
 
-    df = ing.run_once("t", "prod")
+    meta = ing.run_once("t", "prod")
+    df = ing._last_df
     assert list(df["id"]) == [1, 2]
     assert len(sess.calls) == 2
     assert sess.calls[1][0] == "http://api/alpha?page=2"
+    assert meta["rows"] == 2
+    assert meta["pagination_mode"] == "link-header"
 
 
 def test_pagination_salesforce(make_ingestor):
@@ -269,10 +304,13 @@ def test_pagination_salesforce(make_ingestor):
     ]
     ing, sess = make_ingestor(config, responses)
 
-    df = ing.run_once("t", "prod")
+    meta = ing.run_once("t", "prod")
+    df = ing._last_df
     assert list(df["id"]) == [1, 2]
     # second call must have used absolute join of relative nextRecordsUrl
     assert sess.calls[1][0].endswith("/services/data/v61.0/query/nextA")
+    assert meta["rows"] == 2
+    assert meta["pagination_mode"] == "salesforce"
 
 
 # ---- Tests: backfill strategies ---------------------------------------------
@@ -305,15 +343,18 @@ def test_backfill_date_windows_two_slices(make_ingestor):
     ]
     ing, sess = make_ingestor(config, responses)
 
-    df = ing.run_backfill(
+    meta = ing.run_backfill(
         "t", "prod", start=date(2024, 1, 1), end=date(2024, 1, 3)
     )
+    df = ing._last_df
     assert list(df["d"]) == ["A1", "B1"]
     # Inspect the params passed on each slice
     p0 = sess.calls[0][1]["params"]
     p1 = sess.calls[1][1]["params"]
     assert p0["start_date"] == "2024-01-01" and p0["end_date"] == "2024-01-02"
     assert p1["start_date"] == "2024-01-03" and p1["end_date"] == "2024-01-03"
+    assert meta["rows"] == 2
+    assert meta["strategy"] == "date"
 
 
 def test_backfill_soql_window_with_salesforce_pager(make_ingestor):
@@ -346,9 +387,10 @@ def test_backfill_soql_window_with_salesforce_pager(make_ingestor):
     ]
     ing, sess = make_ingestor(config, responses)
 
-    df = ing.run_backfill(
+    meta = ing.run_backfill(
         "t", "prod", start=date(2024, 1, 1), end=date(2024, 1, 2)
     )
+    df = ing._last_df
     assert list(df["Id"]) == ["1", "2"]
 
     # Verify 'q' param was injected on each slice, with half-open end date
@@ -356,6 +398,9 @@ def test_backfill_soql_window_with_salesforce_pager(make_ingestor):
     q1 = sess.calls[1][1]["params"]["q"]
     assert "2024-01-01T00:00:00Z" in q0 and "2024-01-02T00:00:00Z" in q0
     assert "2024-01-02T00:00:00Z" in q1 and "2024-01-03T00:00:00Z" in q1
+    assert meta["rows"] == 2
+    assert meta["strategy"] == "soql_window"
+    assert meta["pagination_mode"] == "salesforce"
 
 
 def test_backfill_cursor_with_next_token(make_ingestor):
@@ -385,12 +430,15 @@ def test_backfill_cursor_with_next_token(make_ingestor):
     ]
     ing, sess = make_ingestor(config, responses)
 
-    df = ing.run_backfill(
+    meta = ing.run_backfill(
         "t", "prod", start=date(2024, 1, 1), end=date(2024, 1, 2)
     )
+    df = ing._last_df
     assert list(df["i"]) == [1, 2]
     assert sess.calls[0][1]["params"]["cursor"] == "s0"
     assert sess.calls[1][1]["params"]["cursor"] == "s1"
+    assert meta["rows"] == 2
+    assert meta["strategy"] == "cursor"
 
 
 # ---- Tests: cursor stop conditions ------------------------------------------
@@ -433,10 +481,13 @@ def test_cursor_backfill_stop_by_item(make_ingestor):
     ]
     ing, sess = make_ingestor(config, responses)
 
-    df = ing.run_backfill(
+    meta = ing.run_backfill(
         "t", "prod", start=date(2024, 1, 1), end=date(2024, 1, 2)
     )
+    df = ing._last_df
     assert list(df["id"]) == ["a"]  # trimmed before 'b' because inclusive=False
+    assert meta["rows"] == 1
+    assert meta["strategy"] == "cursor"
 
 
 def test_cursor_backfill_stop_when_older_than(make_ingestor):
@@ -482,11 +533,14 @@ def test_cursor_backfill_stop_when_older_than(make_ingestor):
     ]
     ing, _ = make_ingestor(config, responses)
 
-    df = ing.run_backfill(
+    meta = ing.run_backfill(
         "t", "prod", start=date(2024, 1, 1), end=date(2024, 1, 2)
     )
+    df = ing._last_df
     # only the >= cutoff rows are kept in the final (and loop stops)
     assert list(df["id"]) == [1]
+    assert meta["rows"] == 1
+    assert meta["strategy"] == "cursor"
 
 
 # ---- Tests: link expansion ---------------------------------------------------
@@ -521,7 +575,8 @@ def test_link_expansion_inherits_session_defaults_and_timeout(make_ingestor):
     responses = [base, expanded]
     ing, sess = make_ingestor(config, responses)
 
-    df = ing.run_once("t", "prod")
+    meta = ing.run_once("t", "prod")
+    df = ing._last_df
 
     # We now parse the expanded payload at "items" → column 'k' exists
     assert "k" in df.columns
@@ -537,6 +592,7 @@ def test_link_expansion_inherits_session_defaults_and_timeout(make_ingestor):
     # Session defaults applied globally
     assert sess.headers.get("Authorization") == "Bearer XYZ"
     assert sess.verify is False
+    assert meta["rows"] == 1
 
 
 # ---- Tests: logging redaction -----------------------------------------------
@@ -563,11 +619,12 @@ def test_log_redaction_redacts_sensitive_headers_and_params(
     responses = [FakeResponse(json_data={"data": []})]
     ing, _ = make_ingestor(config, responses)
 
-    ing.run_once("t", "prod")
+    meta = ing.run_once("t", "prod")
     # Last info log should contain redactions
     assert any("***REDACTED***" in m for m in logger.infos)
     assert not any("supersecret" in m for m in logger.infos)
     assert not any("Bearer secret" in m for m in logger.infos)
+    assert meta["rows"] == 0
 
 
 # ---- Tests: whitelist --------------------------------------------------------

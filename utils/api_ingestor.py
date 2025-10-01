@@ -1,9 +1,10 @@
+import gzip
 import os
 import re
 import time
 import traceback
 from datetime import date, timedelta
-from io import StringIO
+from io import BytesIO, StringIO
 from logging import Logger
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
@@ -60,6 +61,12 @@ class ApiIngestor:
         "api_key",
         "authorization",
         "signature",
+        "client_id",
+        "client_secret",
+        "refresh_token",
+        "secret",
+        "password",
+        "private_key",
     }
 
     # ${ENV_VAR} placeholder pattern
@@ -78,9 +85,10 @@ class ApiIngestor:
 
     # ---------- Public entry points ----------
 
-    def run_once(self, table_name: str, env_name: str) -> pd.DataFrame:
+    def run_once(self, table_name: str, env_name: str) -> Dict[str, Any]:
         """
-        Execute a single request (with optional pagination and link expansion).
+        Execute a single request (with optional pagination and link expansion),
+        write the result to the configured sink, and return lightweight metadata.
 
         Steps:
           1) Merge env + API config layers via _prepare
@@ -91,16 +99,28 @@ class ApiIngestor:
           6) Optionally expand per-row URLs
 
         Returns:
-            DataFrame with all records from all pages (if any).
+            {
+            "table": str,
+            "env": str,
+            "rows": int,
+            "format": "csv"|"jsonl"|"parquet",
+            "s3_bucket": str,
+            "s3_key": str,
+            "s3_uri": str,
+            "bytes": int,
+            "started_at": str,      # ISO-8601 UTC
+            "ended_at": str,        # ISO-8601 UTC
+            "duration_s": float,
+            "source_url": str,
+            "pagination_mode": str
+            }
         """
+        started = pd.Timestamp.now(tz="UTC")
         env_cfg, api_cfg, req_opts, parse_cfg = self._prepare(
             table_name, env_name
         )
 
-        # Build or reuse a Session; pop "retries" so it doesn't leak into requests.get(...)
         sess = self._build_session(req_opts.pop("retries", None))
-
-        # Apply session-level defaults so **all** requests inherit them
         safe_opts = self._whitelist_request_opts(req_opts)
         self._apply_session_defaults(sess, safe_opts)
 
@@ -108,17 +128,34 @@ class ApiIngestor:
         self._log_request(url, safe_opts)
 
         try:
-            # Unified pagination
             df = self._paginate(
                 sess, url, safe_opts, parse_cfg, api_cfg.get("pagination")
             )
-
-            # Optional link expansion step (follow URLs embedded in each row)
             link_cfg = api_cfg.get("link_expansion")
             if link_cfg and link_cfg.get("enabled", False):
                 df = self._expand_links(sess, df, link_cfg, parse_cfg)
 
-            return df
+            out_meta = self._write_output(
+                df, table_name, env_name, api_cfg.get("output") or {}
+            )
+            ended = pd.Timestamp.now(tz="UTC")
+            return {
+                "table": table_name,
+                "env": env_name,
+                "rows": int(len(df)),
+                "format": out_meta["format"],
+                "s3_bucket": out_meta["s3_bucket"],
+                "s3_key": out_meta["s3_key"],
+                "s3_uri": out_meta["s3_uri"],
+                "bytes": out_meta["bytes"],
+                "started_at": started.isoformat(),
+                "ended_at": ended.isoformat(),
+                "duration_s": float((ended - started).total_seconds()),
+                "source_url": url,
+                "pagination_mode": (api_cfg.get("pagination") or {}).get(
+                    "mode", "none"
+                ),
+            }
 
         except Exception as e:
             self._log_exception(url, e)
@@ -126,7 +163,7 @@ class ApiIngestor:
 
     def run_backfill(
         self, table_name: str, env_name: str, start: date, end: date
-    ) -> pd.DataFrame:
+    ) -> Dict[str, Any]:
         """
         Windowed backfill over a date range.
 
@@ -136,8 +173,9 @@ class ApiIngestor:
           - "cursor"      : Cursor-bounded backfill with stop conditions
 
         Returns:
-            Concatenated DataFrame of all windows and pages.
+            Metadata dictionary.
         """
+        started = pd.Timestamp.now(tz="UTC")
         env_cfg, api_cfg, base_req_opts, parse_cfg = self._prepare(
             table_name, env_name
         )
@@ -148,7 +186,6 @@ class ApiIngestor:
                 f"Backfill is not enabled for '{table_name}' in config."
             )
 
-        # Build Session and apply session-level defaults once for the entire run
         sess = self._build_session(base_req_opts.pop("retries", None))
         self._apply_session_defaults(
             sess, self._whitelist_request_opts(base_req_opts)
@@ -161,8 +198,7 @@ class ApiIngestor:
         link_cfg = api_cfg.get("link_expansion") or {}
 
         if strategy == "cursor":
-            # Cursor-bounded (no date windows). Good for cursor-only APIs.
-            return self._cursor_backfill(
+            df = self._cursor_backfill(
                 sess=sess,
                 url=url,
                 base_opts=base_req_opts,
@@ -171,14 +207,33 @@ class ApiIngestor:
                 cur_cfg=bf.get("cursor") or {},
                 link_cfg=link_cfg,
             )
+            out_meta = self._write_output(
+                df, table_name, env_name, api_cfg.get("output") or {}
+            )
+            ended = pd.Timestamp.now(tz="UTC")
+            return {
+                "table": table_name,
+                "env": env_name,
+                "rows": int(len(df)),
+                "format": out_meta["format"],
+                "s3_bucket": out_meta["s3_bucket"],
+                "s3_key": out_meta["s3_key"],
+                "s3_uri": out_meta["s3_uri"],
+                "bytes": out_meta["bytes"],
+                "started_at": started.isoformat(),
+                "ended_at": ended.isoformat(),
+                "duration_s": float((ended - started).total_seconds()),
+                "source_url": url,
+                "strategy": "cursor",
+                "pagination_mode": pag_mode,
+            }
 
         if strategy == "soql_window":
-            # Salesforce-only: uses SOQL per window and SF paginator internally.
             if pag_mode != "salesforce":
                 raise ValueError(
                     "soql_window strategy requires pagination.mode == 'salesforce'."
                 )
-            return self._soql_window_backfill(
+            df = self._soql_window_backfill(
                 sess=sess,
                 url=url,
                 base_opts=base_req_opts,
@@ -189,8 +244,28 @@ class ApiIngestor:
                 end=end,
                 link_cfg=link_cfg,
             )
+            out_meta = self._write_output(
+                df, table_name, env_name, api_cfg.get("output") or {}
+            )
+            ended = pd.Timestamp.now(tz="UTC")
+            return {
+                "table": table_name,
+                "env": env_name,
+                "rows": int(len(df)),
+                "format": out_meta["format"],
+                "s3_bucket": out_meta["s3_bucket"],
+                "s3_key": out_meta["s3_key"],
+                "s3_uri": out_meta["s3_uri"],
+                "bytes": out_meta["bytes"],
+                "started_at": started.isoformat(),
+                "ended_at": ended.isoformat(),
+                "duration_s": float((ended - started).total_seconds()),
+                "source_url": url,
+                "strategy": "soql_window",
+                "pagination_mode": pag_mode,
+            }
 
-        # Default: Generic DATE PARAM windows
+        # Default: date-window strategy
         window_days = int(bf.get("window_days", 7))
         start_param = bf.get("start_param", "start_date")
         end_param = bf.get("end_param", "end_date")
@@ -198,13 +273,11 @@ class ApiIngestor:
         per_request_delay = float(bf.get("per_request_delay", 0.0))
 
         all_frames: List[pd.DataFrame] = []
+        num_windows = 0
         current = start
 
         while current <= end:
-            # Inclusive window: [current .. window_end]
             window_end = min(current + timedelta(days=window_days - 1), end)
-
-            # Clone base options and inject window params
             req_opts = dict(base_req_opts)
             params = dict(req_opts.get("params") or {})
             params[start_param] = current.strftime(date_format)
@@ -222,15 +295,12 @@ class ApiIngestor:
                 df = self._paginate(
                     sess, url, safe_opts, parse_cfg, api_cfg.get("pagination")
                 )
-
                 if link_cfg.get("enabled", False):
                     df = self._expand_links(sess, df, link_cfg, parse_cfg)
-
                 all_frames.append(df)
-
+                num_windows += 1
                 if per_request_delay > 0:
                     time.sleep(per_request_delay)
-
             except Exception as e:
                 self._log_exception(
                     url,
@@ -239,12 +309,36 @@ class ApiIngestor:
                 )
                 raise
 
-            # Advance to the next day after this window
             current = window_end + timedelta(days=1)
 
-        if not all_frames:
-            return pd.DataFrame()
-        return pd.concat(all_frames, ignore_index=True)
+        result = (
+            pd.concat(all_frames, ignore_index=True)
+            if all_frames
+            else pd.DataFrame()
+        )
+        out_meta = self._write_output(
+            result, table_name, env_name, api_cfg.get("output") or {}
+        )
+        ended = pd.Timestamp.now(tz="UTC")
+        return {
+            "table": table_name,
+            "env": env_name,
+            "rows": int(len(result)),
+            "format": out_meta["format"],
+            "s3_bucket": out_meta["s3_bucket"],
+            "s3_key": out_meta["s3_key"],
+            "s3_uri": out_meta["s3_uri"],
+            "bytes": out_meta["bytes"],
+            "started_at": started.isoformat(),
+            "ended_at": ended.isoformat(),
+            "duration_s": float((ended - started).total_seconds()),
+            "source_url": url,
+            "strategy": "date",
+            "pagination_mode": (api_cfg.get("pagination") or {}).get(
+                "mode", "none"
+            ),
+            "windows": num_windows,
+        }
 
     # ---------- Core helpers ----------
 
@@ -296,31 +390,45 @@ class ApiIngestor:
                 f"Table config '{table_name}' not found under 'apis'."
             )
 
-        # Global request defaults; table-specific params are merged over them
+        # Global request defaults; table-specific params/headers merged over them
         global_opts = apis_root.get("request_defaults", {}) or {}
         req_opts = dict(global_opts)
-        if "params" in table_cfg:
-            # Merge table params over global params
-            req_opts["params"] = {
-                **(req_opts.get("params") or {}),
-                **(table_cfg["params"] or {}),
-            }
+        # Merge dict-like request bits
+        for k in ("headers", "params"):
+            tv = table_cfg.get(k)
+            if isinstance(tv, dict):
+                req_opts[k] = {**(req_opts.get(k) or {}), **tv}
+        # Override scalars
+        for k in ("timeout", "verify", "auth", "proxies"):
+            if k in table_cfg:
+                req_opts[k] = table_cfg[k]
 
-        # Pick up retries whether under request_defaults or at apis root
-        retries = req_opts.get("retries") or apis_root.get("retries")
+        # Pick up retries with table-level override > request_defaults > apis root
+        retries = (
+            table_cfg.get("retries")
+            or req_opts.get("retries")
+            or apis_root.get("retries")
+        )
         if retries:
             req_opts["retries"] = retries
 
-        # Effective API-level knobs for this run
+        # Effective API-level controls for this run
         api_eff = {
-            "path": apis_root.get("path", ""),
-            "pagination": apis_root.get("pagination", {}) or {},
-            # link_expansion can be partially overridden at the table level
+            "path": table_cfg.get("path", apis_root.get("path", "")),
+            "pagination": {
+                **(apis_root.get("pagination", {}) or {}),
+                **(table_cfg.get("pagination", {}) or {}),
+            },
             "link_expansion": {
                 **(apis_root.get("link_expansion", {}) or {}),
                 **(table_cfg.get("link_expansion", {}) or {}),
             },
             "backfill": table_cfg.get("backfill", {}) or {},
+            # NEW: table-level output overrides global output defaults
+            "output": {
+                **(apis_root.get("output", {}) or {}),
+                **(table_cfg.get("output", {}) or {}),
+            },
         }
 
         # Expand ${ENV_VAR} placeholders everywhere they might appear
@@ -506,7 +614,11 @@ class ApiIngestor:
         while pages < max_pages and next_url:
             resp = sess.get(next_url, **safe)
             resp.raise_for_status()
-            frames.append(self._to_dataframe(resp, parse_cfg))
+            page_df = self._to_dataframe(resp, parse_cfg)
+            # For 'page' pagination, stop before appending an empty page
+            if mode == "page" and page_df.empty:
+                break
+            frames.append(page_df)
             pages += 1
 
             if mode == "cursor":
@@ -535,8 +647,6 @@ class ApiIngestor:
                 params = dict(safe.get("params") or {})
                 params[page_param] = current_page
                 safe["params"] = params
-                if frames[-1].empty:
-                    break
 
             elif mode == "link-header":
                 # Follow RFC5988 Link: <...>; rel="next"
@@ -847,7 +957,9 @@ class ApiIngestor:
         if df.empty:
             return df
 
-        le_timeout = (link_cfg or {}).get("timeout", parse_cfg.get("timeout", None))
+        le_timeout = (link_cfg or {}).get(
+            "timeout", parse_cfg.get("timeout", None)
+        )
         url_fields = (link_cfg or {}).get("url_fields", [])
         if not url_fields:
             return df
@@ -859,7 +971,9 @@ class ApiIngestor:
             urls: List[str] = []
             for fld in url_fields:
                 val = self._get_from_row(row, fld)
-                if isinstance(val, str) and val.startswith(("http://", "https://")):
+                if isinstance(val, str) and val.startswith(
+                    ("http://", "https://")
+                ):
                     urls.append(val)
                 # If you later need to support relative links, resolve with urljoin(base_url, val).
 
@@ -870,13 +984,15 @@ class ApiIngestor:
 
                 # ------ KEY CHANGE: do not inherit base json_record_path by default ------
                 parse_override = dict(parse_cfg)
-                if (parse_override.get("type", "json") == "json"):
+                if parse_override.get("type", "json") == "json":
                     if "json_record_path" in (link_cfg or {}):
                         # If provided for expansion, use it (including explicit None)
-                        if (link_cfg.get("json_record_path") is None):
+                        if link_cfg.get("json_record_path") is None:
                             parse_override.pop("json_record_path", None)
                         else:
-                            parse_override["json_record_path"] = link_cfg["json_record_path"]
+                            parse_override["json_record_path"] = link_cfg[
+                                "json_record_path"
+                            ]
                     else:
                         # Not provided for expansion -> drop the base record path
                         parse_override.pop("json_record_path", None)
@@ -890,14 +1006,15 @@ class ApiIngestor:
             if row_frames:
                 merged = row_frames[0]
                 for f in row_frames[1:]:
-                    merged = merged.merge(f, left_index=True, right_index=True, how="outer")
+                    merged = merged.merge(
+                        f, left_index=True, right_index=True, how="outer"
+                    )
                 expanded_frames.append(merged)
 
         if not expanded_frames:
             return df
 
         return pd.concat(expanded_frames, ignore_index=True)
-
 
     # ---------- Small utilities ----------
 
@@ -941,6 +1058,152 @@ class ApiIngestor:
                 cur = cur.get(k)
             return cur
         return None
+
+    def _write_output(
+        self,
+        df: pd.DataFrame,
+        table_name: str,
+        env_name: str,
+        out_cfg: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Mandatory sink: always attempt to write the DataFrame using the configured output.
+        Returns a metadata dict describing the write (e.g., S3 key, bytes).
+        """
+        if not out_cfg:
+            raise ValueError(
+                "Output config is required but missing (apis.<table>.output or apis.output)."
+            )
+
+        fmt = (out_cfg.get("format") or "csv").lower()
+        if fmt not in {"csv", "parquet", "jsonl"}:
+            raise ValueError(f"Unsupported output.format: {fmt}")
+
+        write_empty = out_cfg.get("write_empty", True)
+        if df.empty and not write_empty:
+            raise ValueError(
+                "DataFrame is empty and output.write_empty=false; refusing to skip since writes are mandatory."
+            )
+
+        s3_cfg = out_cfg.get("s3") or {}
+        if not s3_cfg:
+            raise ValueError(
+                "Output sink must be S3. Provide apis.<table>.output.s3."
+            )
+
+        return self._write_s3(df, table_name, env_name, fmt, s3_cfg)
+
+    def _write_s3(
+        self,
+        df: pd.DataFrame,
+        table_name: str,
+        env_name: str,
+        fmt: str,
+        s3_cfg: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Write the DataFrame to S3 using boto3 and return a metadata dict.
+        """
+        try:
+            import boto3
+        except Exception as e:
+            raise RuntimeError("boto3 is required for S3 output.") from e
+
+        now = pd.Timestamp.now(tz="UTC").to_pydatetime()
+        ctx = {
+            "table": table_name,
+            "env": env_name,
+            "now": now,
+            "today": now.date(),
+        }
+
+        bucket = (s3_cfg.get("bucket") or "").strip()
+        if not bucket:
+            raise ValueError("output.s3.bucket is required.")
+
+        prefix = (s3_cfg.get("prefix") or "").format(**ctx).strip("/")
+        ext = {"csv": "csv", "parquet": "parquet", "jsonl": "jsonl"}[fmt]
+        default_fname = "{table}-{now:%Y%m%dT%H%M%SZ}." + ext
+        filename = (s3_cfg.get("filename") or default_fname).format(**ctx)
+        key = "/".join([p for p in [prefix, filename] if p])
+
+        region_name = s3_cfg.get("region_name")
+        endpoint_url = s3_cfg.get("endpoint_url")
+        session = (
+            boto3.session.Session(region_name=region_name)
+            if region_name
+            else boto3.session.Session()
+        )
+        s3 = session.client("s3", endpoint_url=endpoint_url)
+
+        extra_args = {}
+        if s3_cfg.get("acl"):
+            extra_args["ACL"] = s3_cfg["acl"]
+        if s3_cfg.get("sse"):
+            extra_args["ServerSideEncryption"] = s3_cfg["sse"]
+        if s3_cfg.get("sse_kms_key_id"):
+            extra_args["SSEKMSKeyId"] = s3_cfg["sse_kms_key_id"]
+
+        body_bytes, content_type, content_encoding = self._serialize_df(
+            df, fmt, s3_cfg
+        )
+        if content_type:
+            extra_args["ContentType"] = content_type
+        if content_encoding:
+            extra_args["ContentEncoding"] = content_encoding
+
+        s3.put_object(Bucket=bucket, Key=key, Body=body_bytes, **extra_args)
+
+        meta = {
+            "format": fmt,
+            "s3_bucket": bucket,
+            "s3_key": key,
+            "s3_uri": f"s3://{bucket}/{key}",
+            "bytes": int(len(body_bytes)),
+        }
+        self.log.info(
+            f"[output] Wrote {len(df)} rows ({meta['bytes']} bytes) to {meta['s3_uri']}"
+        )
+        return meta
+
+    def _serialize_df(
+        self,
+        df: pd.DataFrame,
+        fmt: str,
+        s3_cfg: Dict[str, Any],
+    ) -> Tuple[bytes, Optional[str], Optional[str]]:
+        """
+        Serialize a DataFrame to bytes for upload.
+        Returns: (bytes, content_type, content_encoding)
+        """
+        if fmt == "csv":
+            index = bool(s3_cfg.get("index", False))
+            sep = s3_cfg.get("sep", ",")
+            compression = (
+                s3_cfg.get("compression") or ""
+            ).lower()  # e.g., 'gzip'
+            csv_text = df.to_csv(index=index, sep=sep)
+            raw = csv_text.encode("utf-8")
+            if compression == "gzip":
+                buf = BytesIO()
+                with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+                    gz.write(raw)
+                return buf.getvalue(), "text/csv", "gzip"
+            return raw, "text/csv", None
+
+        if fmt == "jsonl":
+            text = df.to_json(orient="records", lines=True, date_format="iso")
+            return text.encode("utf-8"), "application/x-ndjson", None
+
+        if fmt == "parquet":
+            compression = s3_cfg.get("compression", "snappy")
+            if isinstance(compression, str) and compression.lower() == "none":
+                compression = None
+            buf = BytesIO()
+            df.to_parquet(buf, index=False, compression=compression)
+            return buf.getvalue(), "application/vnd.apache.parquet", None
+
+        raise ValueError(f"Unsupported format: {fmt}")
 
     def _log_request(self, url: str, opts: Dict[str, Any], prefix: str = ""):
         """

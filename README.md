@@ -2,116 +2,141 @@
 
 # ApiIngestor
 
-A tiny, config-driven data ingestor for REST APIs. Point it at a YAML config, and it handles:
+Config‑driven HTTP → DataFrame → S3 ingestor with retries, pagination, backfills, and optional per‑row link expansion.
 
-- `requests.Session` with retries/backoff
-- JSON or CSV parsing into `pandas.DataFrame`
-- Pagination (`none`, `cursor`, `page`, `link-header`, Salesforce)
-- Windowed backfills (`date`, `soql_window`, `cursor`)
-- Optional per-row link expansion (follow URLs in each row)
-- `${ENV_VAR}` substitution in config
-- Safe logging with secret redaction
+> Built around `requests.Session`, `pandas`, and `boto3`. Configured via YAML with `${ENV_VAR}` expansion.
 
-It’s designed so **all tables share the same base API path**, with table-specific settings (params/parse/backfill) layered on top.
+---
+
+## Highlights
+
+- **Session-level retries** via `urllib3.Retry` mounted on `requests.Session`.
+- **Pagination**: `none`, `page`, `cursor` (token or chained id), `link-header`, **Salesforce** (`done`/`nextRecordsUrl`).
+- **Backfills**: generic **date windows**, **Salesforce SOQL windowing**, or **cursor-bounded** with stop conditions.
+- **Link expansion**: follow URLs in each row; inherits auth/headers/verify/proxies from the session.
+- **Parsers**: JSON (with record path + key dropping) or CSV.
+- **Output (required)**: writes **CSV / JSONL / Parquet** to **S3** with optional gzip (CSV) and Parquet compression.
+- **Safety**: only whitelisted `requests.get` kwargs are passed; sensitive headers/params are **redacted** in logs.
 
 ---
 
 ## Install
 
 ```bash
-pip install pandas requests urllib3 pytest
+python -m venv .venv && source .venv/bin/activate
+pip install pandas requests urllib3 boto3 pytest behave responses pyarrow fastparquet
 ```
+
+> Parquet requires either `pyarrow` or `fastparquet`.
 
 ---
 
 ## Quick start
 
 ```python
+from utils.api_ingestor import ApiIngestor
 import logging, yaml
-from api_ingestor import ApiIngestor  # your module path
-
-with open("config.yml") as f:
-    cfg = yaml.safe_load(f)
+from datetime import date
 
 log = logging.getLogger("ingestor")
 log.setLevel(logging.INFO)
-log.addHandler(logging.StreamHandler())
+
+with open("config/ingestor.yaml") as f:
+    cfg = yaml.safe_load(f)
 
 ing = ApiIngestor(cfg, log)
 
 # One-off pull
-df = ing.run_once(table_name="accounts", env_name="prod")
+meta = ing.run_once(table_name="events_api", env_name="qa")
+print(meta)
 
-# Windowed backfill (inclusive dates for generic/date strategy)
-from datetime import date
-bf = ing.run_backfill(
-    table_name="accounts",
-    env_name="prod",
-    start=date(2024,1,1),
-    end=date(2024,1,31),
+# Date-window backfill
+meta = ing.run_backfill(
+    table_name="marketing_reports", env_name="prod",
+    start=date(2025, 1, 1), end=date(2025, 1, 31)
 )
+print(meta)
 ```
+
+**Environment variables** inside the YAML like `${SF_TOKEN}` are expanded at runtime.
+Missing env vars are **left as-is** (e.g., `${MISSING}`) so you can detect them.
 
 ---
 
-## Config file (YAML)
+## Configuration (YAML)
 
-Top-level sections: `envs` and `apis`.
+Your code now supports:
+
+- Table‑level `path`, `headers`, `params`, and `pagination` that **merge/override** globals.
+- Global `output` sink (S3) that is **required**; tables can override `output`.
+- Session defaults are **applied to the session** (headers/auth/proxies/verify) so **link expansion inherits them**.
+- Link expansion **does not inherit** the base `json_record_path` by default; set `link_expansion.json_record_path` if needed.
+
+A complete example (trim to what you use):
 
 ```yaml
 envs:
   dev:
     base_url: "https://api.vendor-a.com/"
+  qa:
+    base_url: "https://finance.example.com/api/"
   prod:
-    base_url: "https://your.example.com/"
+    base_url: "https://yourinstance.my.salesforce.com/"
 
 apis:
-  # ---- Global API defaults (shared across all tables) ----
   request_defaults:
     headers:
-      Authorization: "Bearer ${API_TOKEN}"   # expanded at runtime
+      Authorization: "Bearer ${VENDOR_A_TOKEN}"
       Accept: "application/json"
     timeout: 60
     verify: true
-    # You may also include: auth, proxies
-  retries:                      # session-level retry/backoff
+
+  # Default path (used by SF tables unless overridden)
+  path: "services/data/v61.0/query"
+
+  retries:
     total: 4
     backoff_factor: 0.5
     status_forcelist: [429, 500, 502, 503, 504]
     allowed_methods: ["GET"]
 
-  path: "services/data/v61.0/query"  # shared path for *all* tables
-
-  pagination:                        # default paginator (SF example)
+  pagination:
     mode: "salesforce"
     done_path: "done"
     next_url_path: "nextRecordsUrl"
     clear_params_on_next: true
     max_pages: 20000
 
-  link_expansion:                    # global defaults (optional)
+  link_expansion:
     enabled: true
     url_fields: ["detail_url", "links.self"]
     json_record_path: null
     per_request_delay: 0.0
-    timeout: 30
 
-  # ---- Tables (each key below is a table_name) ----
+  # REQUIRED global sink (tables may override)
+  output:
+    format: parquet        # csv | parquet | jsonl
+    write_empty: true
+    s3:
+      bucket: "my-ingest-bucket"
+      prefix: "{env}/{table}/{today:%Y/%m/%d}"
+      region_name: "us-east-1"
+      compression: "snappy"  # only for parquet
 
-  # Salesforce SOQL windowed backfill (uses the global path/pagination above)
+  # --- Salesforce + SOQL windowed backfill ---
   marketing_reports:
+    headers:
+      Authorization: "Bearer ${SF_TOKEN}"
     parse:
       type: "json"
       json_record_path: "records"
       json_drop_keys_any_depth: ["attributes"]
-    params: {}                       # initial params merged over request_defaults.params
     backfill:
       enabled: true
       strategy: "soql_window"
-      date_field: "LastModifiedDate"     # e.g., or SystemModstamp
+      date_field: "LastModifiedDate"
       date_format: "%Y-%m-%dT%H:%M:%SZ"
       window_days: 7
-      per_request_delay: 0.0
       soql_template: |
         SELECT Id, Name, LastModifiedDate
         FROM Account
@@ -119,288 +144,164 @@ apis:
           AND {date_field} <  {end}
         ORDER BY {date_field} ASC
 
-  # Generic date-parameter windowing (non-SF)
-  invoices:
+  # --- Page pagination + date backfill (non-SF) ---
+  events_api:
+    path: "v1/events"
+    headers:
+      Authorization: "Bearer ${FINANCE_TOKEN}"
     parse:
       type: "json"
       json_record_path: "data.items"
-    params:
-      include: "payments"
+    pagination:
+      mode: "page"
+      page_param: "page"
+      start_page: 1
+      page_size_param: "page_size"
+      page_size_value: 500
+      max_pages: 10000
     backfill:
       enabled: true
       strategy: "date"
-      window_days: 3
       start_param: "start_date"
       end_param: "end_date"
       date_format: "%Y-%m-%d"
-      per_request_delay: 0.2
+      window_days: 3
 
-  # Cursor-bounded backfill (no date windows)
-  events_cursor:
+  # --- Cursor pagination (opaque token) + cursor backfill ---
+  activity_feed:
+    path: "v1/activity"
     parse:
       type: "json"
-      json_record_path: "data"
-    params: {}
+      json_record_path: "results"
+    pagination:
+      mode: "cursor"
+      cursor_param: "cursor"
+      next_cursor_path: "meta.next"
+      page_size_param: "limit"
+      page_size_value: 1000
     backfill:
       enabled: true
       strategy: "cursor"
       cursor:
-        start_value: "CURSOR_123"
+        start_value: null
         stop_when_older_than:
-          field: "timestamp"
-          value: "2024-01-01T00:00:00Z"
-    # You can override global pagination if needed:
-    # pagination:
-    #   mode: "cursor"
-    #   next_cursor_path: "meta.next"
-    #   cursor_param: "cursor"
-    #   page_size_param: "limit"
-    #   page_size_value: 1000
-    #   max_pages: 10000
+          field: "created_at"
+          value: "2025-01-01T00:00:00Z"
 
-  # CSV table (single page or link-header pagination)
-  finance_exports:
-    parse:
-      type: "csv"
-    params: {}
-    # pagination:
-    #   mode: "link-header"
+  # --- Link-header pagination ---
+  link_header_api:
+    path: "v1/resources"
+    parse: { type: "json", json_record_path: "data" }
+    pagination: { mode: "link-header" }
+    backfill: { enabled: false }
+
+  # --- No pagination + link expansion ---
+  orders_with_details:
+    path: "v1/orders"
+    parse: { type: "json", json_record_path: "orders" }
+    pagination: { mode: "none" }
+    link_expansion:
+      enabled: true
+      url_fields: ["detail_url", "links.detail"]
+      json_record_path: null
+    output:    # per-table override example
+      format: jsonl
+      s3:
+        bucket: "my-ingest-bucket"
+        prefix: "{env}/orders-with-details/{today:%Y/%m/%d}"
 ```
 
-### Notes on config
+### Output behavior
 
-- **Environment variable expansion**: any string with `${NAME}` gets replaced with `os.environ["NAME"]`. If the env var is missing, the literal `${NAME}` remains (so you can detect it).
-- **Retries** can live under `apis.retries` or inside `apis.request_defaults`; the class will pick them up either way.
-- **Session defaults applied globally**: headers/auth/proxies/verify from `request_defaults` are applied once to the `requests.Session`, so **link expansion requests inherit them**.
+- **CSV**: optional `compression: gzip` → `ContentEncoding=gzip`.
+- **JSONL**: `ContentType=application/x-ndjson`.
+- **Parquet**: `compression` (e.g., `snappy`).
+- S3 key: `prefix/filename`, where default filename is `{table}-{now:%Y%m%dT%H%M%SZ}.{ext}`.
+  - Templating tokens: `{table}`, `{env}`, `{now}`, `{today}`.
 
 ---
 
-## Pagination modes
+## Pagination modes (summary)
 
-- `none` – one GET
-- `salesforce` – uses `done` and `nextRecordsUrl` (relative)  
-  Options: `done_path`, `next_url_path`, `clear_params_on_next`, `max_pages`
-- `cursor` – looks up `next_cursor_path` (e.g., `meta.next`) and sends it as `cursor_param`  
-  Options: `next_cursor_path`, `cursor_param`, `page_size_param`, `page_size_value`, `max_pages`
-- `page` – increments a numeric `page_param` until the page is empty  
-  Options: `page_param`, `start_page`, `page_size_param`, `page_size_value`, `max_pages`
-- `link-header` – follows `Link: <...>; rel="next"` header
+- `none` — single `GET`.
+- `page` — increments `page_param` until an **empty** page is encountered (the empty page is **not** appended).
+- `cursor` — either:
+  - **opaque token** via `next_cursor_path` → send with `cursor_param`, or
+  - **chain field** via `chain_field` (last row’s value becomes next cursor).
+- `link-header` — follows RFC5988 `Link: <...>; rel="next"`.
+- `salesforce` — stops when `done` is `true` or `nextRecordsUrl` is missing; follows **relative** `nextRecordsUrl`.
 
 ---
 
 ## Backfill strategies
 
-- `date` *(default)* – Injects two date params per window (e.g., `start_date`/`end_date`) and paginates within each window.
-- `soql_window` – Salesforce: build SOQL per half-open window `[start, end)` and let SF pagination run within the slice.
-- `cursor` – Start from a cursor (token or ID chaining) and stop by item or time cutoff.
+- `date` — windows controlled by `window_days`, `start_param`, `end_param`, `date_format`.
+- `soql_window` (Salesforce) — half‑open windows `[start, end)`; first call per window sends `?q=<SOQL>`, paginator follows `nextRecordsUrl`.
+- `cursor` — supports:
+  - `cursor.start_value`
+  - `cursor.stop_at_item` `{field, value, inclusive}`
+  - `cursor.stop_when_older_than` `{field, value}` (ISO 8601)
 
 ---
 
 ## Link expansion
 
-- Enabled with `link_expansion.enabled: true`.
-- `url_fields`: list of dot-paths in the base rows that contain URLs to GET (e.g., `"detail_url"`, `"links.self"`).
-- `json_record_path`: if expanded responses have a different record path than the base page, set it here (e.g., `"items"`).
-- `timeout`: optional per-request timeout for expansions (defaults to 30s if omitted).
-- Inherits **auth/headers/verify/proxies** from the session via `_apply_session_defaults`.
-
-> **Tip:** If your expanded payload parses to an empty frame, check `link_expansion.json_record_path`.
+- Set `link_expansion.enabled: true` and provide `url_fields` (dot paths).
+- Session **headers/auth/proxies/verify** are inherited automatically.
+- Expanded responses **do not inherit** the base `json_record_path` unless you set `link_expansion.json_record_path`. By default we parse the expanded payload **as-is**, which is better for object endpoints.
 
 ---
 
 ## Logging & redaction
 
-- `_log_request` prints URL, params, headers **with sensitive keys redacted**:
-  - Headers: `authorization`, `x-api-key`, `api-key`, `proxy-authorization`
-  - Params: `access_token`, `token`, `apikey`, `api_key`, `authorization`, `signature`
-- `_log_exception` includes full stack traces.
+Logs redact common sensitive elements:
+- Headers: `authorization`, `x-api-key`, `api-key`, `proxy-authorization`
+- Params: `access_token`, `token`, `apikey`, `api_key`, `authorization`, `signature`
 
 ---
 
-## Error handling
+## Testing
 
-- Missing `envs.<env>.base_url` → `ValueError`
-- Unknown `apis.<table>` → `KeyError`
-- Unsupported parse type/pagination mode → `ValueError`
-- HTTP errors raise via `resp.raise_for_status()` and are logged.
-
----
-
-## API reference
-
-```python
-run_once(table_name: str, env_name: str) -> pd.DataFrame
-run_backfill(table_name: str, env_name: str, start: date, end: date) -> pd.DataFrame
-```
-
----
-
-## Example usage (Salesforce SOQL window)
-
-```python
-from datetime import date
-df = ing.run_backfill(
-    table_name="marketing_reports",
-    env_name="prod",
-    start=date(2024, 1, 1),
-    end=date(2024, 1, 31),
-)
-```
-
----
-
-## Testing (pytest)
-
-### Run tests
+### Unit tests (pytest)
 
 ```bash
 pytest -q
 ```
 
-### What the unit tests cover
+Covers:
+- env var expansion
+- pagination modes
+- backfills (date, SOQL window, cursor)
+- link expansion (session inheritance + parse override)
+- redaction & request kwarg whitelisting
 
-- Environment variable expansion for headers/params
-- Applying session defaults (headers/auth/proxies/verify)
-- Pagination modes:
-  - `none` (single page)
-  - `salesforce` (`done` + `nextRecordsUrl`)
-  - `cursor` (opaque token)
-  - `page`
-  - `link-header`
-- Backfills:
-  - Generic date windows (merging window params)
-  - SOQL half-open windows
-  - Cursor-bounded with stop conditions
-- Link expansion:
-  - Inherits session defaults
-  - Respects `link_expansion.json_record_path`
-  - Honors per-request expansion `timeout`
-- Redaction in request logs
-- Error paths (missing base_url, unknown table, unsupported parse type)
+### Component tests (behave)
 
-### Example test (link expansion record path)
-
-```python
-import os
-import logging
-import pandas as pd
-import pytest
-
-class FakeResponse:
-    def __init__(self, json_data=None, text=None, headers=None, links=None):
-        self._json = json_data
-        self._text = text or ""
-        self.status_code = 200
-        self.headers = headers or {}
-        self.links = links or {}
-        self.content = (text or "").encode("utf-8")
-
-    def json(self): return self._json
-    def raise_for_status(self): pass
-
-class RecordingSession:
-    """A minimal fake requests.Session that records calls and supports defaults."""
-    def __init__(self):
-        self.headers = {}
-        self.proxies = {}
-        self.verify = True
-        self.auth = None
-        self.calls = []  # list of (url, kwargs)
-        self._queue = []
-
-    def mount(self, *_args, **_kwargs): pass
-    def queue(self, *responses): self._queue.extend(responses)
-
-    def get(self, url, **kwargs):
-        self.calls.append((url, kwargs))
-        # pop next queued response
-        if not self._queue:
-            raise AssertionError("No queued responses left")
-        return self._queue.pop(0)
-
-@pytest.fixture
-def make_ingestor(monkeypatch):
-    import api_ingestor  # your module name
-
-    def _make(config, responses):
-        # env var used in Authorization
-        os.environ["TOKEN"] = "XYZ"
-
-        # logger
-        log = logging.getLogger("t")
-        log.setLevel(logging.INFO)
-        log.handlers[:] = [logging.StreamHandler()]
-
-        ing = api_ingestor.ApiIngestor(config, log)
-
-        sess = RecordingSession()
-
-        # monkeypatch _build_session to return our RecordingSession
-        monkeypatch.setattr(api_ingestor, "requests", api_ingestor.requests)
-        monkeypatch.setattr(api_ingestor, "Session", RecordingSession)
-        monkeypatch.setattr(ing, "_build_session", lambda _r=None: sess)
-
-        # queue responses
-        sess.queue(*responses)
-        return ing, sess
-    return _make
-
-def test_link_expansion_inherits_session_defaults_and_timeout(make_ingestor):
-    import api_ingestor  # your module name
-
-    config = {
-        "envs": {"prod": {"base_url": "http://api/" }},
-        "apis": {
-            "request_defaults": {
-                "headers": {"Authorization": "Bearer ${TOKEN}"},
-                "verify": False
-            },
-            "path": "base",
-            "pagination": {"mode": "none"},
-            "link_expansion": {
-                "enabled": True,
-                "url_fields": ["detail_url"],
-                "timeout": 5,
-                "json_record_path": "items"
-            },
-            "t": {"parse": {"type": "json", "json_record_path": "data"}},
-        },
-    }
-
-    base = FakeResponse(json_data={"data": [{"detail_url": "http://exp/detail"}]})
-    expanded = FakeResponse(json_data={"items": [{"k": 1}]})
-    responses = [base, expanded]
-
-    ing, sess = make_ingestor(config, responses)
-
-    df = ing.run_once("t", "prod")
-    assert "k" in df.columns
-    assert df["k"].tolist() == [1]
-    assert len(sess.calls) == 2
-
-    # 2nd call is the expansion GET → only per-request timeout should be present
-    exp_kwargs = sess.calls[1][1]
-    assert "timeout" in exp_kwargs and len(exp_kwargs) == 1
-
-    # Session defaults were applied globally (so expansion inherits them)
-    assert sess.headers.get("Authorization") == "Bearer XYZ"
-    assert sess.verify is False
+```bash
+behave
 ```
 
-> You can follow the same pattern to test other modes: queue multiple `FakeResponse`s to simulate pages and verify the resulting DataFrame and `sess.calls`.
-
----
-
-## Design details
-
-- **“Fix #2”**: `_apply_session_defaults` copies request defaults (headers/auth/proxies/verify) to the `Session` once. This guarantees **every** request—especially link expansion calls—carries the same auth/headers/TLS/proxy settings without re-passing kwargs on each call.
-- **Env expansion** leaves unresolved `${NAME}` literals intact rather than silently replacing with empty strings.
-- **Normalization**: `_json_obj_to_df` respects `json_record_path`. If it points to a list → `DataFrame(list)`, else `json_normalize(dict)`.
+Scenarios use `responses` to mock HTTP:
+- cursor, page, link‑header
+- link expansion with auth
+- date backfill windows
+- Salesforce SOQL windowing
 
 ---
 
 ## Troubleshooting
 
-- **Empty DataFrame on link expansion**: set `apis.link_expansion.json_record_path` (or override per table) to match the expanded payload (e.g., `"items"`).
-- **Next page never reached**: check `pagination.next_cursor_path` or `page_param/start_page` values.
-- **Salesforce stops at first page**: make sure `pagination.done_path` & `next_url_path` match the response, and `clear_params_on_next: true` if you use an initial `q` param.
+- **Missing global output**: The ingestor requires an S3 sink; define `apis.output` or a per‑table `output`.
+- **Parquet writer missing**: Install `pyarrow` or `fastparquet`.
+- **Auth not applied in link expansion**: Ensure headers/auth are in **request_defaults** or table‑level; they’re copied to the session in `_apply_session_defaults`.
+- **Salesforce next URL**: We join `nextRecordsUrl` **relative** to the host root.
+
+---
+
+## Changelog (recent)
+
+- **Session defaults applied** once to ensure link expansion inherits `headers/auth/proxies/verify`.
+- **Page pagination** stops **before** appending an empty page.
+- **Link expansion parse** no longer inherits base `json_record_path` by default; can be overridden via `link_expansion.json_record_path`.
+- Added **mandatory output sink** (`apis.output`) with S3 metadata in return object.
+- Cleaned up config merging: table‑level `path`, `headers`, `params`, `pagination` override/merge global settings.

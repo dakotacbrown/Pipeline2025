@@ -1,30 +1,27 @@
 import json
 import textwrap
 from datetime import datetime
+from types import MethodType
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import pandas as pd
 import responses
 from behave import given, then, when
 
-# Try to import the ApiIngestor from user's repo (project root must be on sys.path)
 from utils.api_ingestor import ApiIngestor
 
 
 @given('a base API host "{base}"')
 def step_base_host(context, base):
     context.base = base.rstrip("/") + "/"
-    # Minimal config envs
     context.ingestor_config = {
         "envs": {"dev": {"base_url": context.base}},
         "apis": {
-            # global defaults; table-specific blocks added by steps
             "request_defaults": {"headers": {}, "timeout": 10, "verify": True},
-            "path": "",  # we'll override per-table or use full URLs in mocks
+            "path": "",
         },
     }
 
-    # Simple logger stub
     class _Logger:
         def info(self, *args, **kwargs):
             pass
@@ -37,14 +34,10 @@ def step_base_host(context, base):
 
 # ----------------- Cursor pagination -----------------
 
-
 @given('a cursor endpoint "{path}" with two pages of 2 items each')
 def step_cursor_endpoint(context, path):
     full1 = urljoin(context.base, path.lstrip("/"))
-    full2 = urljoin(
-        context.base, path.lstrip("/")
-    )  # same path; next token advances via params
-    # Page 1
+    full2 = urljoin(context.base, path.lstrip("/"))
     context.responses.add(
         responses.GET,
         full1,
@@ -53,7 +46,6 @@ def step_cursor_endpoint(context, path):
         content_type="application/json",
         match=[responses.matchers.query_param_matcher({})],
     )
-    # Page 2 (requires cursor=t2)
     context.responses.add(
         responses.GET,
         full2,
@@ -66,7 +58,7 @@ def step_cursor_endpoint(context, path):
 
 @given("a cursor-table config")
 def step_cursor_config(context):
-    context.ingestor_config["apis"]["path"] = "cursor"  # appended to base
+    context.ingestor_config["apis"]["path"] = "cursor"
     context.ingestor_config["apis"]["pagination"] = {
         "mode": "cursor",
         "next_cursor_path": "meta.next",
@@ -82,11 +74,9 @@ def step_cursor_config(context):
 
 # ----------------- Page pagination -----------------
 
-
 @given('a paged endpoint "{path}" where page 1 has 2 items and page 2 is empty')
 def step_paged_endpoint(context, path):
     full = urljoin(context.base, path.lstrip("/"))
-    # Page 1
     context.responses.add(
         responses.GET,
         full,
@@ -95,7 +85,6 @@ def step_paged_endpoint(context, path):
         content_type="application/json",
         match=[responses.matchers.query_param_matcher({"page": "1"})],
     )
-    # Page 2 -> empty
     context.responses.add(
         responses.GET,
         full,
@@ -120,12 +109,10 @@ def step_page_config(context):
 
 # ----------------- Link-header pagination -----------------
 
-
 @given('a link-header chain starting at "{first}" then "{second}"')
 def step_link_header_chain(context, first, second):
     url1 = urljoin(context.base, first.lstrip("/"))
     url2 = urljoin(context.base, second.lstrip("/"))
-    # First page with Link header to next
     context.responses.add(
         responses.GET,
         url1,
@@ -134,7 +121,6 @@ def step_link_header_chain(context, first, second):
         status=200,
         content_type="application/json",
     )
-    # Second page without next
     context.responses.add(
         responses.GET,
         url2,
@@ -158,11 +144,9 @@ def step_link_header_config(context):
 
 # ----------------- Link expansion -----------------
 
-
 @given('a base endpoint "{path}" that returns items with per-row detail URLs')
 def step_rows_with_details(context, path):
     base_url = urljoin(context.base, path.lstrip("/"))
-    # rows return two items that each point to detail endpoints
     payload = {
         "items": [
             {"id": 1, "detail_url": urljoin(context.base, "detail/1")},
@@ -180,7 +164,6 @@ def step_rows_with_details(context, path):
 
 @given("detail endpoints require Authorization header")
 def step_detail_requires_auth(context):
-    # Define callbacks that verify the Authorization header, else 401
     def _cb(request):
         if request.headers.get("Authorization") == "Bearer TESTTOKEN":
             return (
@@ -200,14 +183,10 @@ def step_detail_requires_auth(context):
         return (401, {}, "")
 
     context.responses.add_callback(
-        responses.GET,
-        urljoin(context.base, "detail/1"),
-        callback=lambda request: _cb(request),
+        responses.GET, urljoin(context.base, "detail/1"), callback=_cb
     )
     context.responses.add_callback(
-        responses.GET,
-        urljoin(context.base, "detail/2"),
-        callback=lambda request: _cb2(request),
+        responses.GET, urljoin(context.base, "detail/2"), callback=_cb2
     )
 
 
@@ -220,35 +199,27 @@ def step_link_expansion_config(context, token):
     }
     context.ingestor_config["apis"]["path"] = "rows"
     context.ingestor_config["apis"]["pagination"] = {"mode": "none"}
-
     context.ingestor_config["apis"]["link_exp_table"] = {
-        "parse": {
-            "type": "json",
-            "json_record_path": "items",  # base response is {"items":[...]}, keep this
-        },
+        "parse": {"type": "json", "json_record_path": "items"},
         "link_expansion": {
             "enabled": True,
             "url_fields": ["detail_url"],
-            # IMPORTANT: don't set json_record_path here since detail is a single object
-            # "json_record_path": null
+            # json_record_path intentionally omitted for expansion
         },
     }
 
 
 # ----------------- Date-window backfill -----------------
 
-
 @given('a date-window endpoint "{path}" that echoes window ranges as items')
 def step_date_window_endpoint(context, path):
     full = urljoin(context.base, path.lstrip("/"))
 
     def callback(request):
-        # Extract params and echo days as items
         parsed = urlparse(request.url)
         q = parse_qs(parsed.query)
         start = q.get("start_date", [""])[0]
         end = q.get("end_date", [""])[0]
-        # produce one item per day inclusively
         d0 = pd.to_datetime(start).date()
         d1 = pd.to_datetime(end).date()
         days = [
@@ -283,13 +254,10 @@ def step_date_backfill_config(context):
 
 # ----------------- Salesforce SOQL-window backfill -----------------
 
-
 @given('a salesforce endpoint "{path}" that returns done=false then done=true')
 def step_salesforce_endpoint(context, path):
     base = urljoin(context.base, path.lstrip("/"))
     next_full = urljoin(context.base, "sf/query/next1")
-
-    # first response: done=false, provide nextRecordsUrl
     context.responses.add(
         responses.GET,
         base,
@@ -301,14 +269,10 @@ def step_salesforce_endpoint(context, path):
         status=200,
         content_type="application/json",
     )
-    # second response (follow nextRecordsUrl): done=true, no next
     context.responses.add(
         responses.GET,
         next_full,
-        json={
-            "done": True,
-            "records": [{"id": "b"}],
-        },
+        json={"done": True, "records": [{"id": "b"}]},
         status=200,
         content_type="application/json",
     )
@@ -331,7 +295,7 @@ def step_sf_config(context):
         WHERE {date_field} >= {start}
           AND {date_field} <  {end}
         ORDER BY {date_field} ASC
-    """
+        """
     ).strip()
     context.ingestor_config["apis"]["sf_soql_table"] = {
         "parse": {
@@ -350,13 +314,28 @@ def step_sf_config(context):
     }
 
 
-# ----------------- When steps -----------------
+# ----------------- When steps (patched to capture DF) -----------------
+
+def _install_capture(ingestor, context):
+    # Patch _write_output so we can assert on the produced DataFrame
+    def _capture_write_output(self, df, table_name, env_name, out_cfg):
+        context.df = df.copy()
+        return {
+            "format": (out_cfg or {}).get("format", "csv"),
+            "s3_bucket": "test-bucket",
+            "s3_key": "test/key",
+            "s3_uri": "s3://test-bucket/test/key",
+            "bytes": len(df.to_json().encode("utf-8")),
+        }
+
+    ingestor._write_output = MethodType(_capture_write_output, ingestor)
 
 
 @when('I run the ingestor once for table "{table}" in env "{env}"')
 def step_run_once(context, table, env):
     ingestor = ApiIngestor(config=context.ingestor_config, log=context.logger)
-    context.df = ingestor.run_once(table, env)
+    _install_capture(ingestor, context)
+    context.meta = ingestor.run_once(table, env)
 
 
 @when(
@@ -364,33 +343,25 @@ def step_run_once(context, table, env):
 )
 def step_run_backfill(context, table, env, start, end):
     ingestor = ApiIngestor(config=context.ingestor_config, log=context.logger)
+    _install_capture(ingestor, context)
     d0 = datetime.strptime(start, "%Y-%m-%d").date()
     d1 = datetime.strptime(end, "%Y-%m-%d").date()
-    context.df = ingestor.run_backfill(table, env, d0, d1)
+    context.meta = ingestor.run_backfill(table, env, d0, d1)
 
 
 # ----------------- Then steps -----------------
 
-
 @then("the result has {n:d} rows")
 def step_assert_rows(context, n):
     assert hasattr(context, "df"), "No DataFrame on context"
-    assert (
-        len(context.df) == n
-    ), f"Expected {n} rows, got {len(context.df)}.\n{context.df}"
+    assert len(context.df) == n, f"Expected {n} rows, got {len(context.df)}.\n{context.df}"
 
 
-@then(
-    'the expanded result has {n:d} rows and includes the detail field "{col}"'
-)
+@then('the expanded result has {n:d} rows and includes the detail field "{col}"')
 def step_assert_expanded(context, n, col):
     assert hasattr(context, "df"), "No DataFrame on context"
-    assert (
-        len(context.df) == n
-    ), f"Expected {n} rows, got {len(context.df)}.\n{context.df}"
-    assert (
-        col in context.df.columns
-    ), f"Expected column '{col}' in expanded DataFrame. Columns: {context.df.columns}"
+    assert len(context.df) == n, f"Expected {n} rows, got {len(context.df)}.\n{context.df}"
+    assert col in context.df.columns, f"Expected column '{col}' in expanded DataFrame. Columns: {context.df.columns}"
 
 
 @then('the result has {n:d} rows and contains values "{d1}" "{d2}" "{d3}"')

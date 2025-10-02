@@ -443,33 +443,67 @@ class ApiIngestor:
         """
         Build a requests.Session and mount an HTTPAdapter with retry/backoff config.
 
-        Note:
-            Retries live at the session/adapter level, not as a requests.get kwarg.
+        Compatible with urllib3 v1.x (uses `method_whitelist`) and v2.x
+        (uses `allowed_methods`). We try the v2 signature first and fall
+        back to the v1 signature if needed.
         """
         s = requests.Session()
-        if retries_cfg:
+
+        if not retries_cfg:
+            return s
+
+        # Pull values from config (with sensible defaults)
+        total = int(retries_cfg.get("total", 3))
+        connect = int(retries_cfg.get("connect", total))
+        read = int(retries_cfg.get("read", total))
+        backoff_factor = float(retries_cfg.get("backoff_factor", 0.5))
+        status_forcelist = tuple(
+            retries_cfg.get("status_forcelist", [429, 500, 502, 503, 504])
+        )
+        allowed = retries_cfg.get("allowed_methods", ["GET"])
+        # Normalize to an uppercase frozenset, as urllib3 expects
+        allowed_set = frozenset(m.upper() for m in allowed)
+
+        # Core kwargs that exist in both lines
+        base_kwargs = dict(
+            total=total,
+            connect=connect,
+            read=read,
+            backoff_factor=backoff_factor,
+            status_forcelist=status_forcelist,
+        )
+
+        # Try urllib3 v2.x signature first (allowed_methods, raise_on_status)
+        try:
             r = Retry(
-                total=int(retries_cfg.get("total", 3)),
-                connect=int(
-                    retries_cfg.get("connect", retries_cfg.get("total", 3))
-                ),
-                read=int(retries_cfg.get("read", retries_cfg.get("total", 3))),
-                backoff_factor=float(retries_cfg.get("backoff_factor", 0.5)),
-                status_forcelist=tuple(
-                    retries_cfg.get(
-                        "status_forcelist", [429, 500, 502, 503, 504]
-                    )
-                ),
-                allowed_methods=frozenset(
-                    retries_cfg.get("allowed_methods", ["GET"])
-                ),
-                respect_retry_after_header=True,
+                **base_kwargs,
+                allowed_methods=allowed_set,
                 raise_on_status=False,
             )
-            adapter = HTTPAdapter(max_retries=r)
-            s.mount("https://", adapter)
-            s.mount("http://", adapter)
+        except TypeError:
+            # Fall back to urllib3 v1.x (method_whitelist, possibly no raise_on_status)
+            try:
+                r = Retry(
+                    **base_kwargs,
+                    method_whitelist=allowed_set,   # deprecated name in v1.x
+                    raise_on_status=False,
+                )
+            except TypeError:
+                # Very old urllib3 without raise_on_status
+                r = Retry(
+                    **base_kwargs,
+                    method_whitelist=allowed_set,
+                )
+
+        # Respect Retry-After header when the attr exists (v1.26+/v2)
+        if hasattr(r, "respect_retry_after_header"):
+            setattr(r, "respect_retry_after_header", True)
+
+        adapter = HTTPAdapter(max_retries=r)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
         return s
+
 
     def _apply_session_defaults(
         self, sess: requests.Session, opts: Dict[str, Any]

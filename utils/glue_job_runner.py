@@ -1,103 +1,100 @@
-# run_step.py
-import argparse
-import importlib
-import json
-import logging
-import os
 import sys
+import os
+import json
+import argparse
+import logging
 from pathlib import Path
 
+# -------------------------------
+# Prepare: add job ZIP to sys.path
+# -------------------------------
+# NOTE: This intentionally mirrors the old implementation (your screenshot):
+#  - rglob a fixed pattern
+#  - error if >1 match
+#  - add "<zip>/<zip_name>/" and "<zip>/<zip_name>/Python" to sys.path
+#  - also add "<zip>/" and "<zip>/Python"
+# Keep the pattern the same as your bundle name.
+files = list(Path.cwd().rglob("ingestor_bundle*.zip"))
 
-# -------- zip path setup (Python path removed) --------
-def setup_path(bundle_glob: str) -> None:
-    """
-    Look in the current working directory for a zip matching bundle_glob
-    (e.g., 'ingestor_bundle*.zip'), and add only:
-        <zip>/
-    """
-    files = list(Path.cwd().rglob(bundle_glob))
-
+def setup_path():
+    """Set up sys.path like the old Glue 4 runner."""
+    files = list(Path.cwd().rglob("ingestor_bundle*.zip"))
     if len(files) > 1:
-        raise ValueError(f"More than one {bundle_glob} zip found: {files}")
+        raise ValueError(f"More than one ingestor_bundle zip found: {files}")
     elif len(files) == 1:
         zip_file_with_zip = files[0].name
-        base_path = f"{zip_file_with_zip}/"
+        zip_file_without_zip = zip_file_with_zip.split(".zip")[0]
 
+        # 1) <zip>/<zip_name>/
+        base_path = f"{zip_file_with_zip}/{zip_file_without_zip}/"
+        sys.path.insert(0, base_path)
+
+        # 2) <zip>/ and <zip>/Python
+        base_path = f"{zip_file_with_zip}/"
         sys.path.insert(0, base_path)
     else:
-        # zero files: no-op
+        # 0 files: do nothing (kept identical to screenshot behavior)
         pass
 
+# Call the prepare step
+setup_path()
 
+# --------------------------------
+# Parse job parameters (Glue args)
+# --------------------------------
 def _parse_args():
     parser = argparse.ArgumentParser()
-
-    parser.add_argument("-y", "--yaml_path", required=True, help="Path to YAML inside the zip or local FS, e.g. 'config/ingestor.yml'")
-    parser.add_argument("--table", required=True, help="Table key under 'apis' in YAML")
-    parser.add_argument("--env", dest="env_name", required=True, help="Env key under 'envs' in YAML (e.g., dev, qa, prod)")
+    parser.add_argument("-y", "--yaml_path", required=True, help="Path inside the zip (e.g. config/ingestor.yml)")
+    parser.add_argument("--table", required=True, help="Table key under 'apis'")
+    parser.add_argument("--env", dest="env_name", required=True, help="Env key under 'envs'")
     parser.add_argument("--run_mode", choices=["once", "backfill"], default="once")
-    parser.add_argument("--backfill_start", help="YYYY-MM-DD (when run_mode=backfill)")
-    parser.add_argument("--backfill_end", help="YYYY-MM-DD (when run_mode=backfill)")
+    parser.add_argument("--backfill_start")
+    parser.add_argument("--backfill_end")
     parser.add_argument("--log_level", default="INFO")
-    parser.add_argument("--bundle_glob", default="ingestor_bundle*.zip", help="Glob for the job zip in CWD")
-    parser.add_argument("--extra_env", action="append", default=[], help="Repeatable KEY=VALUE entries to export to os.environ")
+    parser.add_argument("--extra_env", action="append", default=[], help="KEY=VALUE; repeatable")
 
-    # tolerate Glue's extra flags
+    # Glue often passes extra arguments; ignore them
     args, unknown = parser.parse_known_args()
     if unknown:
-        print(f"[runner] Ignoring {len(unknown)} unknown args from Glue: {unknown[:8]}{' ...' if len(unknown)>8 else ''}")
+        print(f"[runner] Ignoring unknown args: {unknown[:8]}{' ...' if len(unknown)>8 else ''}")
     return args
 
-
-def main() -> int:
+# --------------------------------
+# Main: import wrapper and run it
+# --------------------------------
+def main() -> None:
     args = _parse_args()
 
     logging.basicConfig(
-        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s glue_runner :: %(message)s",
     )
     log = logging.getLogger("glue_runner")
 
-    # Make the zip content importable (ZIP root only)
-    setup_path(args.bundle_glob)
-
-    # Apply any extra env vars (KEY=VALUE)
+    # Optional: export any extra envs
     for kv in args.extra_env:
         if "=" in kv:
             k, v = kv.split("=", 1)
             os.environ[k] = v
             log.info("Set env %s", k)
-        else:
-            log.warning("Skipping malformed --extra_env %r (expected KEY=VALUE)", kv)
 
-    # Import the wrapper after sys.path is patched
-    try:
-        wrapper = importlib.import_module("ingestor_wrapper")
-    except Exception as e:
-        log.error("Could not import 'ingestor_wrapper' after sys.path setup: %s", e)
-        return 2
+    # Import the wrapper from the job zip we just put on sys.path
+    from ingestor_wrapper import run_ingestor
 
     log.info(
-        "Starting wrapper: table=%s env=%s yaml_path=%s mode=%s",
+        "Starting run: table=%s env=%s yaml=%s mode=%s",
         args.table, args.env_name, args.yaml_path, args.run_mode
     )
 
-    try:
-        meta = wrapper.run_ingestor(
-            table=args.table,
-            env_name=args.env_name,
-            yaml_path=args.yaml_path,
-            run_mode=args.run_mode,
-            start=args.backfill_start,
-            end=args.backfill_end,
-        )
-        print(json.dumps({"status": "ok", "meta": meta}))
-        return 0
-    except Exception:
-        log.error("Ingestor wrapper run failed.", exc_info=True)
-        print(json.dumps({"status": "error", "stage": "run_ingestor"}))
-        return 3
-
+    meta = run_ingestor(
+        table=args.table,
+        env_name=args.env_name,
+        yaml_path=args.yaml_path,
+        run_mode=args.run_mode,
+        start=args.backfill_start,
+        end=args.backfill_end,
+    )
+    print(json.dumps({"status": "ok", "meta": meta}))
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

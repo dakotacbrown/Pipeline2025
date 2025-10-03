@@ -116,6 +116,8 @@ class ApiIngestor:
             }
         """
         started = pd.Timestamp.now(tz="UTC")
+        self.log.info(f"[run_once] start table={table_name} env={env_name}")
+
         env_cfg, api_cfg, req_opts, parse_cfg = self._prepare(
             table_name, env_name
         )
@@ -139,6 +141,11 @@ class ApiIngestor:
                 df, table_name, env_name, api_cfg.get("output") or {}
             )
             ended = pd.Timestamp.now(tz="UTC")
+            self.log.info(
+                f"[run_once] done table={table_name} env={env_name} "
+                f"rows={len(df)} duration={(ended - started).total_seconds():.3f}s "
+                f"dest={out_meta.get('s3_uri')}"
+            )
             return {
                 "table": table_name,
                 "env": env_name,
@@ -176,6 +183,9 @@ class ApiIngestor:
             Metadata dictionary.
         """
         started = pd.Timestamp.now(tz="UTC")
+        self.log.info(
+            f"[run_backfill] start table={table_name} env={env_name} range={start}..{end}"
+        )
         env_cfg, api_cfg, base_req_opts, parse_cfg = self._prepare(
             table_name, env_name
         )
@@ -211,6 +221,11 @@ class ApiIngestor:
                 df, table_name, env_name, api_cfg.get("output") or {}
             )
             ended = pd.Timestamp.now(tz="UTC")
+            self.log.info(
+                f"[run_backfill] done strategy=cursor table={table_name} env={env_name} "
+                f"rows={len(df)} duration={(ended - started).total_seconds():.3f}s "
+                f"dest={out_meta.get('s3_uri')}"
+            )
             return {
                 "table": table_name,
                 "env": env_name,
@@ -248,6 +263,11 @@ class ApiIngestor:
                 df, table_name, env_name, api_cfg.get("output") or {}
             )
             ended = pd.Timestamp.now(tz="UTC")
+            self.log.info(
+                f"[run_backfill] done strategy=soql_window table={table_name} env={env_name} "
+                f"rows={len(df)} duration={(ended - started).total_seconds():.3f}s "
+                f"dest={out_meta.get('s3_uri')}"
+            )
             return {
                 "table": table_name,
                 "env": env_name,
@@ -320,6 +340,11 @@ class ApiIngestor:
             result, table_name, env_name, api_cfg.get("output") or {}
         )
         ended = pd.Timestamp.now(tz="UTC")
+        self.log.info(
+            f"[run_backfill] done strategy=date table={table_name} env={env_name} "
+            f"windows={num_windows} rows={len(result)} "
+            f"duration={(ended - started).total_seconds():.3f}s dest={out_meta.get('s3_uri')}"
+        )
         return {
             "table": table_name,
             "env": env_name,
@@ -485,7 +510,7 @@ class ApiIngestor:
             try:
                 r = Retry(
                     **base_kwargs,
-                    method_whitelist=allowed_set,   # deprecated name in v1.x
+                    method_whitelist=allowed_set,  # deprecated name in v1.x
                     raise_on_status=False,
                 )
             except TypeError:
@@ -503,7 +528,6 @@ class ApiIngestor:
         s.mount("https://", adapter)
         s.mount("http://", adapter)
         return s
-
 
     def _apply_session_defaults(
         self, sess: requests.Session, opts: Dict[str, Any]
@@ -1148,7 +1172,7 @@ class ApiIngestor:
             "table": table_name,
             "env": env_name,
             "now": now,
-            "today": now.date(),
+            "today": now,
         }
 
         bucket = (s3_cfg.get("bucket") or "").strip()

@@ -1,8 +1,8 @@
-import sys
-import os
-import json
 import argparse
+import json
 import logging
+import os
+import sys
 from pathlib import Path
 
 # -------------------------------
@@ -15,6 +15,7 @@ from pathlib import Path
 #  - also add "<zip>/" and "<zip>/Python"
 # Keep the pattern the same as your bundle name.
 files = list(Path.cwd().rglob("ingestor_bundle*.zip"))
+
 
 def setup_path():
     """Set up sys.path like the old Glue 4 runner."""
@@ -36,28 +37,44 @@ def setup_path():
         # 0 files: do nothing (kept identical to screenshot behavior)
         pass
 
+
 # Call the prepare step
 setup_path()
+
 
 # --------------------------------
 # Parse job parameters (Glue args)
 # --------------------------------
 def _parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-y", "--yaml_path", required=True, help="Path inside the zip (e.g. config/ingestor.yml)")
+    parser.add_argument(
+        "-y",
+        "--yaml_path",
+        required=True,
+        help="Path inside the zip (e.g. config/ingestor.yml)",
+    )
     parser.add_argument("--table", required=True, help="Table key under 'apis'")
-    parser.add_argument("--env", dest="env_name", required=True, help="Env key under 'envs'")
-    parser.add_argument("--run_mode", choices=["once", "backfill"], default="once")
+    parser.add_argument(
+        "--env", dest="env_name", required=True, help="Env key under 'envs'"
+    )
+    parser.add_argument(
+        "--run_mode", choices=["once", "backfill"], default="once"
+    )
     parser.add_argument("--backfill_start")
     parser.add_argument("--backfill_end")
     parser.add_argument("--log_level", default="INFO")
-    parser.add_argument("--extra_env", action="append", default=[], help="KEY=VALUE; repeatable")
+    parser.add_argument(
+        "--extra_env", action="append", default=[], help="KEY=VALUE; repeatable"
+    )
 
     # Glue often passes extra arguments; ignore them
     args, unknown = parser.parse_known_args()
     if unknown:
-        print(f"[runner] Ignoring unknown args: {unknown[:8]}{' ...' if len(unknown)>8 else ''}")
+        print(
+            f"[runner] Ignoring unknown args: {unknown[:8]}{' ...' if len(unknown)>8 else ''}"
+        )
     return args
+
 
 # --------------------------------
 # Main: import wrapper and run it
@@ -83,7 +100,10 @@ def main() -> None:
 
     log.info(
         "Starting run: table=%s env=%s yaml=%s mode=%s",
-        args.table, args.env_name, args.yaml_path, args.run_mode
+        args.table,
+        args.env_name,
+        args.yaml_path,
+        args.run_mode,
     )
 
     meta = run_ingestor(
@@ -95,6 +115,7 @@ def main() -> None:
         end=args.backfill_end,
     )
     print(json.dumps({"status": "ok", "meta": meta}))
+
 
 if __name__ == "__main__":
     main()

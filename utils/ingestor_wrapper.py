@@ -4,16 +4,15 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from datetime import datetime, date
+from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 from zipfile import ZipFile
 
 import yaml  # pyyaml must be available in the job/bundle
 
 # Your ingestor implementation
 from utils.api_ingestor import ApiIngestor
-
 
 LOG = logging.getLogger("ingestor_wrapper")
 if not LOG.handlers:
@@ -131,7 +130,9 @@ def run_ingestor(
 
     if (run_mode or "once").lower() == "backfill":
         if not start or not end:
-            raise ValueError("Backfill requires both 'start' and 'end' (YYYY-MM-DD).")
+            raise ValueError(
+                "Backfill requires both 'start' and 'end' (YYYY-MM-DD)."
+            )
         try:
             d0: date = datetime.strptime(start, "%Y-%m-%d").date()
             d1: date = datetime.strptime(end, "%Y-%m-%d").date()
@@ -140,7 +141,9 @@ def run_ingestor(
                 f"Invalid start/end; expected YYYY-MM-DD. Got start={start!r}, end={end!r}"
             ) from e
 
-        meta = ing.run_backfill(table_name=table, env_name=env_name, start=d0, end=d1)
+        meta = ing.run_backfill(
+            table_name=table, env_name=env_name, start=d0, end=d1
+        )
     else:
         meta = ing.run_once(table_name=table, env_name=env_name)
 

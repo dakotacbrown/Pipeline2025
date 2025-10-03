@@ -48,7 +48,7 @@ apis:
     write_empty: true
     s3:
       bucket: "my-ingest-bucket"
-      prefix: "{env}/{table}/{today:%Y/%m/%d}"
+      prefix: "{env}/{table}/{today:%Y/%m/%d/%H}"
       region_name: "us-east-1"
       compression: "snappy"              # parquet compression; csv: use "gzip" via per-table override if needed
       # endpoint_url: "https://s3.us-east-1.amazonaws.com"

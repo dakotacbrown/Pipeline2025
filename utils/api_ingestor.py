@@ -768,6 +768,13 @@ class ApiIngestor:
             csv_string = resp.content.decode("utf-8", errors="replace")
             return pd.read_csv(StringIO(csv_string))
 
+        if parse_type in {"jsonl", "ndjson"}:
+            # Each line is a JSON object
+            text = resp.content.decode("utf-8", errors="replace")
+            if not text.strip():
+                return pd.DataFrame()
+            return pd.read_json(StringIO(text), lines=True)
+
         if parse_type == "json":
             data = resp.json()
             drop_keys = set(parse_cfg.get("json_drop_keys_any_depth", []))
@@ -1038,10 +1045,15 @@ class ApiIngestor:
             row_frames: List[pd.DataFrame] = []
             for u in urls:
                 resp = sess.get(u, timeout=le_timeout or 30)
+                self.log.info(
+                    f"[link_expansion] GET {u} -> {getattr(resp, 'headers', {}).get('Content-Type', 'unknown')}, bytes={len(resp.content)}"
+                )
                 resp.raise_for_status()
-
                 # ------ KEY CHANGE: do not inherit base json_record_path by default ------
                 parse_override = dict(parse_cfg)
+                # allow link-expansion to override parse type (e.g., jsonl/csv)
+                if "type" in (link_cfg or {}):
+                    parse_override["type"] = link_cfg["type"]
                 if parse_override.get("type", "json") == "json":
                     if "json_record_path" in (link_cfg or {}):
                         # If provided for expansion, use it (including explicit None)

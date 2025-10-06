@@ -14,7 +14,6 @@ apis:
       X-Client: "ingestor/1.0"
     timeout: 30
     verify: true
-
   # Optional global retry policy (urllib3 Retry via HTTPAdapter)
   retries:
     total: 5
@@ -30,7 +29,7 @@ apis:
     s3:
       bucket: "${BUCKET}"
       region_name: "${REGION}"
-      # {session_id} and {seq} become available when link-expansion sets them.
+      # Use placeholders. {session_id} and {seq} become available when link-expansion sets them.
       prefix: "datalake/{table}/env={env}/dt={today:%Y-%m-%d}"
       compression: snappy
       acl: bucket-owner-full-control
@@ -46,7 +45,8 @@ apis:
     pagination:
       mode: "none"
     output:
-      format: parquet    # override only what you need
+      # override only what you need; inherits other fields from global output
+      format: parquet
 
   # ======================================================================
   # =============== EXAMPLE 2: Page-number pagination ====================
@@ -112,7 +112,6 @@ apis:
       page_size_param: "limit"
       page_size_value: 100
       max_pages: 100000
-
     # Cursor backfill with time guard
     backfill:
       enabled: true
@@ -122,43 +121,40 @@ apis:
         stop_when_older_than:
           field: "createdAt"             # field in the base list rows
           value: "${STOP_ISO}"           # e.g., 2024-01-01T00:00:00Z
-
     # Expand each row's detail link (JSONL payloads), write each session immediately
     link_expansion:
       enabled: true
       url_fields: ["detail_url"]         # column in base list rows
       timeout: 10
       type: jsonl                        # expanded payload is JSONL
-      # json_record_path: null           # (only if expanded payload were JSON object/array)
-
-      # Extract session id from each expanded URL using regex
+      # If your expanded payload were JSON arrays/objects, you could set json_record_path here.
+      # json_record_path: null
+      # Extract session id from each expanded URL
       session_id:
-        from: regex
-        regex:
-          pattern: "(?<=/sessions/)[^/?#]+"
-          group: 0
-          flags: ["IGNORECASE"]          # optional
+        regex: "(?<=/sessions/)[^/?#]+"  # customize if needed
+        group: 0
         policy: "first"                  # first | last | all | require_single
-
       # Write a file for each expanded link (or per session)
       flush:
         mode: "per_link"                 # per_link | per_session | none
         prefix: "logs/{table}/env={env}/session={session_id}/dt={today:%Y-%m-%d}"
         filename: "{table}-{session_id}-{seq:06d}-{now:%Y%m%dT%H%M%SZ}.jsonl"
-
     output:
       format: jsonl
       s3:
-        # Final aggregate output (if any) can also use session_id if the policy sets it
+        # Final “aggregate” output (if any) can also use session_id (will be set to first/last/etc per policy)
         prefix: "logs/{table}/env={env}/final/dt={today:%Y-%m-%d}"
         filename: "{table}-{now:%Y%m%dT%H%M%SZ}.jsonl"
 
   # ======================================================================
-  # =============== EXAMPLE 6: Multi-pull join (AWS cost keys) ===========
-  # =============== Two pulls merged with left join on fields ============
+  # =============== EXAMPLE 6: Multi-pull join (your AWS cost keys) ======
+  # =============== Two pulls merged with left join on fields =============
   # ======================================================================
   aws_cost:
-    path: "cost/v1/report"    # default for both pulls
+    # If both pulls share the same endpoint base, you can put a default path here;
+    # each pull can still override it.
+    path: "cost/v1/report"
+    # Define the pulls to run (in order). Each pull is a normal single request (no pagination).
     multi_pulls:
       - name: "cost_core"
         path: "cost/v1/report"
@@ -186,7 +182,7 @@ apis:
           sumBy: "Hour"
           isFinanceView: true
 
-    # Join instructions
+    # Join instructions: how and which columns to join on
     join:
       how: "left"
       on:
@@ -194,12 +190,14 @@ apis:
         - "accountName"
         - "costStartTimestamp"
         - "costEndTimestamp"
+      # Optional: choose columns to keep/rename from later pulls to avoid collisions
       select_from:
         cost_dept:
-          keep: ["departmentId"]
+          keep: ["departmentId"]         # keep only deptId from pull #2
           rename:
-            departmentId: "departmentId"     # example no-op
+            departmentId: "departmentId" # no-op rename shown as an example
 
+    # (If your runner supports backfill here, add it. For fixed windows you can also use date strategy.)
     backfill:
       enabled: false
 

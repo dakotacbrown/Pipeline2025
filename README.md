@@ -91,6 +91,7 @@ apis:
     timeout: 60
     verify: true
 
+  # Default path (used by SF tables unless overridden)
   path: "services/data/v61.0/query"
 
   retries:
@@ -112,15 +113,17 @@ apis:
     json_record_path: null
     per_request_delay: 0.0
 
+  # REQUIRED global sink (tables may override)
   output:
-    format: parquet
+    format: parquet        # csv | parquet | jsonl
     write_empty: true
     s3:
       bucket: "my-ingest-bucket"
       prefix: "{env}/{table}/{today:%Y/%m/%d}"
       region_name: "us-east-1"
-      compression: "snappy"
+      compression: "snappy"  # only for parquet
 
+  # --- Salesforce + SOQL windowed backfill ---
   marketing_reports:
     headers:
       Authorization: "Bearer ${SF_TOKEN}"
@@ -141,6 +144,7 @@ apis:
           AND {date_field} <  {end}
         ORDER BY {date_field} ASC
 
+  # --- Page pagination + date backfill (non-SF) ---
   events_api:
     path: "v1/events"
     headers:
@@ -163,6 +167,7 @@ apis:
       date_format: "%Y-%m-%d"
       window_days: 3
 
+  # --- Cursor pagination (opaque token) + cursor backfill ---
   activity_feed:
     path: "v1/activity"
     parse:
@@ -183,12 +188,14 @@ apis:
           field: "created_at"
           value: "2025-01-01T00:00:00Z"
 
+  # --- Link-header pagination ---
   link_header_api:
     path: "v1/resources"
     parse: { type: "json", json_record_path: "data" }
     pagination: { mode: "link-header" }
     backfill: { enabled: false }
 
+  # --- No pagination + link expansion ---
   orders_with_details:
     path: "v1/orders"
     parse: { type: "json", json_record_path: "orders" }
@@ -197,65 +204,104 @@ apis:
       enabled: true
       url_fields: ["detail_url", "links.detail"]
       json_record_path: null
-    output:
+    output:    # per-table override example
       format: jsonl
       s3:
         bucket: "my-ingest-bucket"
         prefix: "{env}/orders-with-details/{today:%Y/%m/%d}"
 ```
 
+### Output behavior
+
+- **CSV**: optional `compression: gzip` → `ContentEncoding=gzip`.
+- **JSONL**: `ContentType=application/x-ndjson`.
+- **Parquet**: `compression` (e.g., `snappy`).
+- S3 key: `prefix/filename`, where default filename is `{table}-{now:%Y%m%dT%H%M%SZ}.{ext}`.
+  - Templating tokens: `{table}`, `{env}`, `{now}`, `{today}`.
+
 ---
 
-## Pagination modes
+## Pagination modes (summary)
 
-| Mode | Description |
-|------|--------------|
-| `none` | Single GET |
-| `page` | Increment `page_param` until empty |
-| `cursor` | Follow token or chain field |
-| `link-header` | Follow `Link: <...>; rel="next"` |
-| `salesforce` | Follows `nextRecordsUrl`, stops when `done` |
+- `none` — single `GET`.
+- `page` — increments `page_param` until an **empty** page is encountered (the empty page is **not** appended).
+- `cursor` — either:
+  - **opaque token** via `next_cursor_path` → send with `cursor_param`, or
+  - **chain field** via `chain_field` (last row’s value becomes next cursor).
+- `link-header` — follows RFC5988 `Link: <...>; rel="next"`.
+- `salesforce` — stops when `done` is `true` or `nextRecordsUrl` is missing; follows **relative** `nextRecordsUrl`.
 
 ---
 
 ## Backfill strategies
 
-- `date` — Simple rolling windows by date.
-- `soql_window` — Salesforce SOQL per window.
-- `cursor` — Use start value, stop conditions, or chain field.
+- `date` — windows controlled by `window_days`, `start_param`, `end_param`, `date_format`.
+- `soql_window` (Salesforce) — half‑open windows `[start, end)`; first call per window sends `?q=<SOQL>`, paginator follows `nextRecordsUrl`.
+- `cursor` — supports:
+  - `cursor.start_value`
+  - `cursor.stop_at_item` `{field, value, inclusive}`
+  - `cursor.stop_when_older_than` `{field, value}` (ISO 8601)
 
 ---
 
 ## Link expansion
 
-- Uses `url_fields` to expand related URLs per row.
-- Inherits all session defaults (auth, headers, verify).
-- Can override `type` or `json_record_path`.
-- Writes S3 file per expanded dataset if configured.
+- Set `link_expansion.enabled: true` and provide `url_fields` (dot paths).
+- Session **headers/auth/proxies/verify** are inherited automatically.
+- Expanded responses **do not inherit** the base `json_record_path` unless you set `link_expansion.json_record_path`. By default we parse the expanded payload **as-is**, which is better for object endpoints.
 
 ---
 
 ## Logging & redaction
 
-Logs redact sensitive headers and params.
+Logs redact common sensitive elements:
+- Headers: `authorization`, `x-api-key`, `api-key`, `proxy-authorization`
+- Params: `access_token`, `token`, `apikey`, `api_key`, `authorization`, `signature`
 
 ---
 
 ## Testing
 
-Run all tests:
+### Unit tests (pytest)
 
 ```bash
 pytest -q
 ```
 
-Includes unit and component coverage for all major features.
+Covers:
+- env var expansion
+- pagination modes
+- backfills (date, SOQL window, cursor)
+- link expansion (session inheritance + parse override)
+- redaction & request kwarg whitelisting
+
+### Component tests (behave)
+
+```bash
+behave
+```
+
+Scenarios use `responses` to mock HTTP:
+- cursor, page, link‑header
+- link expansion with auth
+- date backfill windows
+- Salesforce SOQL windowing
 
 ---
 
-## Changelog
+## Troubleshooting
 
-- Added session inheritance for link expansion.
-- Ensured pagination modes are unified.
-- Added support for cursor backfill and per-window SOQL.
-- Enforced required S3 output.
+- **Missing global output**: The ingestor requires an S3 sink; define `apis.output` or a per‑table `output`.
+- **Parquet writer missing**: Install `pyarrow` or `fastparquet`.
+- **Auth not applied in link expansion**: Ensure headers/auth are in **request_defaults** or table‑level; they’re copied to the session in `_apply_session_defaults`.
+- **Salesforce next URL**: We join `nextRecordsUrl` **relative** to the host root.
+
+---
+
+## Changelog (recent)
+
+- **Session defaults applied** once to ensure link expansion inherits `headers/auth/proxies/verify`.
+- **Page pagination** stops **before** appending an empty page.
+- **Link expansion parse** no longer inherits base `json_record_path` by default; can be overridden via `link_expansion.json_record_path`.
+- Added **mandatory output sink** (`apis.output`) with S3 metadata in return object.
+- Cleaned up config merging: table‑level `path`, `headers`, `params`, `pagination` override/merge global settings.

@@ -1,0 +1,227 @@
+envs:
+  dev:
+    base_url: "https://api.vendor-a.com/"
+  qa:
+    base_url: "https://finance.example.com/api/"
+  prod:
+    base_url: "https://yourinstance.my.salesforce.com/"   # fill in
+
+apis:
+  # ---------------------------
+  # GLOBAL DEFAULTS
+  # ---------------------------
+  request_defaults:
+    headers:
+      Authorization: "Bearer ${VENDOR_A_TOKEN}"    # table-level headers can override this
+      Accept: "application/json"
+    timeout: 60
+    verify: true
+
+  # Default SOQL endpoint (only used by tables that don't override `path`)
+  path: "services/data/v61.0/query"
+
+  # Session-level retry config (HTTPAdapter)
+  retries:
+    total: 4
+    backoff_factor: 0.5
+    status_forcelist: [429, 500, 502, 503, 504]
+    allowed_methods: ["GET"]
+
+  # Default paginator: Salesforce
+  pagination:
+    mode: "salesforce"
+    done_path: "done"
+    next_url_path: "nextRecordsUrl"
+    clear_params_on_next: true
+    max_pages: 20000
+
+  # Global link-expansion defaults (merged with table-level)
+  link_expansion:
+    enabled: true
+    url_fields: ["detail_url", "links.self"]
+    json_record_path: null
+    per_request_delay: 0.0
+
+  # -------- Mandatory global output sink (tables may override) --------
+  output:
+    format: parquet                      # csv | parquet | jsonl
+    write_empty: true
+    s3:
+      bucket: "my-ingest-bucket"
+      prefix: "{env}/{table}/{today:%Y/%m/%d/%H}"
+      region_name: "us-east-1"
+      compression: "snappy"              # parquet compression; csv: use "gzip" via per-table override if needed
+      # endpoint_url: "https://s3.us-east-1.amazonaws.com"
+      # acl: "bucket-owner-full-control"
+      # sse: "aws:kms"
+      # sse_kms_key_id: "${KMS_KEY_ID}"
+
+  # =========================================================
+  # 1) SALESFORCE + SOQL WINDOWED BACKFILL
+  #    (inherits global SF `path` + pagination)
+  # =========================================================
+  marketing_reports:
+    # Use SF token for prod runs (overrides global Authorization)
+    headers:
+      Authorization: "Bearer ${SF_TOKEN}"
+    parse:
+      type: "json"
+      json_record_path: "records"
+      json_drop_keys_any_depth: ["attributes"]
+    backfill:
+      enabled: true
+      strategy: "soql_window"
+      date_field: "LastModifiedDate"
+      date_format: "%Y-%m-%dT%H:%M:%SZ"
+      window_days: 7
+      per_request_delay: 0.0
+      soql_template: |
+        SELECT Id, Name, LastModifiedDate
+        FROM Account
+        WHERE {date_field} >= {start}
+          AND {date_field} <  {end}
+        ORDER BY {date_field} ASC
+
+  # =========================================================
+  # 2) GENERIC DATE WINDOWED BACKFILL + PAGE PAGINATION
+  #    (non-SF API → set table path)
+  # =========================================================
+  events_api:
+    path: "v1/events"                    # table-level path override
+    headers:
+      Authorization: "Bearer ${FINANCE_TOKEN}"   # QA token, for example
+    parse:
+      type: "json"
+      json_record_path: "data.items"
+    pagination:
+      mode: "page"
+      page_param: "page"
+      start_page: 1
+      page_size_param: "page_size"
+      page_size_value: 500
+      max_pages: 10000
+    backfill:
+      enabled: true
+      strategy: "date"
+      start_param: "start_date"
+      end_param: "end_date"
+      date_format: "%Y-%m-%d"
+      window_days: 3
+      per_request_delay: 0.0
+
+  # =========================================================
+  # 3) CURSOR PAGINATION (opaque next token) + CURSOR BACKFILL
+  # =========================================================
+  activity_feed:
+    path: "v1/activity"
+    headers:
+      Authorization: "Bearer ${VENDOR_A_TOKEN}"
+    parse:
+      type: "json"
+      json_record_path: "results"
+    pagination:
+      mode: "cursor"
+      cursor_param: "cursor"
+      next_cursor_path: "meta.next"
+      page_size_param: "limit"
+      page_size_value: 1000
+      max_pages: 50000
+    backfill:
+      enabled: true
+      strategy: "cursor"
+      cursor:
+        start_value: null
+        stop_when_older_than:
+          field: "created_at"
+          value: "2025-01-01T00:00:00Z"
+
+  # =========================================================
+  # 4) CURSOR PAGINATION BY CHAINING LAST ID + CURSOR BACKFILL
+  # =========================================================
+  issues_stream:
+    path: "v1/issues"
+    headers:
+      Authorization: "Bearer ${VENDOR_A_TOKEN}"
+    parse:
+      type: "json"
+      json_record_path: "items"
+    pagination:
+      mode: "cursor"
+      cursor_param: "after_id"
+      chain_field: "id"
+      page_size_param: "limit"
+      page_size_value: 1000
+      max_pages: 200000
+    backfill:
+      enabled: true
+      strategy: "cursor"
+      cursor:
+        stop_at_item:
+          field: "id"
+          value: "1234567890"
+          inclusive: false
+
+  # =========================================================
+  # 5) LINK-HEADER PAGINATION
+  # =========================================================
+  link_header_api:
+    path: "v1/resources"
+    headers:
+      Authorization: "Bearer ${VENDOR_A_TOKEN}"
+    parse:
+      type: "json"
+      json_record_path: "data"
+    pagination:
+      mode: "link-header"
+      max_pages: 10000
+    backfill:
+      enabled: false
+
+  # =========================================================
+  # 6) NO PAGINATION + LINK EXPANSION
+  # =========================================================
+  orders_with_details:
+    path: "v1/orders"
+    headers:
+      Authorization: "Bearer ${VENDOR_A_TOKEN}"
+    parse:
+      type: "json"
+      json_record_path: "orders"
+    pagination:
+      mode: "none"
+    link_expansion:
+      enabled: true
+      url_fields: ["detail_url", "links.detail"]
+      json_record_path: null              # detail responses are single objects by default
+      per_request_delay: 0.0
+    backfill:
+      enabled: false
+    # Example per-table output override (JSONL for easier diffing)
+    output:
+      format: jsonl
+      s3:
+        bucket: "my-ingest-bucket"
+        prefix: "{env}/orders-with-details/{today:%Y/%m/%d}"
+
+  # =========================================================
+  # 7) CSV EXAMPLE (no backfill)
+  # =========================================================
+  finance_exports:
+    path: "v1/export.csv"
+    headers:
+      Authorization: "Bearer ${FINANCE_TOKEN}"
+    parse:
+      type: "csv"
+    pagination:
+      mode: "none"
+    backfill:
+      enabled: false
+    # Example: CSV gzip output
+    output:
+      format: csv
+      s3:
+        bucket: "my-ingest-bucket"
+        prefix: "{env}/finance-exports/{today:%Y/%m/%d}"
+        compression: "gzip"               # will set ContentEncoding=gzip
+        sep: ","
+        index: false

@@ -1,0 +1,228 @@
+envs:
+  prod:
+    base_url: "https://api.example.com/"
+  sf:
+    base_url: "https://mydomain.my.salesforce.com/"
+  logs:
+    base_url: "https://logrocket.example.com/"
+
+apis:
+  # ---------- Global request defaults (merged under each table) ----------
+  request_defaults:
+    headers:
+      Authorization: "Bearer ${TOKEN}"         # env-substituted
+      X-Client: "ingestor/1.0"
+    timeout: 30
+    verify: true
+  # Optional global retry policy (urllib3 Retry via HTTPAdapter)
+  retries:
+    total: 5
+    connect: 5
+    read: 5
+    backoff_factor: 0.8
+    status_forcelist: [429, 500, 502, 503, 504]
+    allowed_methods: ["GET"]
+
+  # ---------- Global output defaults (S3) ----------
+  output:
+    format: parquet                           # csv | jsonl | parquet
+    s3:
+      bucket: "${BUCKET}"
+      region_name: "${REGION}"
+      # Use placeholders. {session_id} and {seq} become available when link-expansion sets them.
+      prefix: "datalake/{table}/env={env}/dt={today:%Y-%m-%d}"
+      compression: snappy
+      acl: bucket-owner-full-control
+
+  # ======================================================================
+  # =============== EXAMPLE 1: Single pull, no pagination ================
+  # ======================================================================
+  users_table:
+    path: "v1/users"
+    parse:
+      type: json
+      json_record_path: "data"
+    pagination:
+      mode: "none"
+    output:
+      # override only what you need; inherits other fields from global output
+      format: parquet
+
+  # ======================================================================
+  # =============== EXAMPLE 2: Page-number pagination ====================
+  # ======================================================================
+  paged_items:
+    path: "v1/items"
+    parse:
+      type: json
+      json_record_path: "items"
+    pagination:
+      mode: "page"
+      page_param: "page"
+      start_page: 1
+      page_size_param: "limit"
+      page_size_value: 100
+
+  # ======================================================================
+  # =============== EXAMPLE 3: Link-header pagination ====================
+  # ======================================================================
+  alpha_feed:
+    path: "alpha"
+    parse:
+      type: json
+      json_record_path: "data"
+    pagination:
+      mode: "link-header"
+
+  # ======================================================================
+  # =============== EXAMPLE 4: Salesforce + SOQL backfill ===============
+  # ======================================================================
+  sf_accounts:
+    path: "services/data/v61.0/query"
+    parse:
+      type: json
+      json_record_path: "records"
+      json_drop_keys_any_depth: ["attributes"]
+    pagination:
+      mode: "salesforce"
+      done_path: "done"
+      next_url_path: "nextRecordsUrl"
+      clear_params_on_next: true
+    backfill:
+      enabled: true
+      strategy: "soql_window"
+      window_days: 1
+      date_field: "LastModifiedDate"
+      date_format: "%Y-%m-%dT%H:%M:%SZ"
+      soql_template: "SELECT Id, Name FROM Account WHERE {date_field} >= {start} AND {date_field} < {end}"
+
+  # ======================================================================
+  # =============== EXAMPLE 5: Cursor backfill + link expansion ==========
+  # =============== (JSONL, session-id extraction, per-link flush) =======
+  # ======================================================================
+  logrocket_sessions:
+    path: "api/sessions"
+    parse:
+      type: json
+      json_record_path: "data"
+    pagination:
+      mode: "cursor"
+      cursor_param: "cursor"
+      next_cursor_path: "meta.next"
+      page_size_param: "limit"
+      page_size_value: 100
+      max_pages: 100000
+    # Cursor backfill with time guard
+    backfill:
+      enabled: true
+      strategy: "cursor"
+      cursor:
+        start_value: "${START_CURSOR}"   # optional; can be omitted
+        stop_when_older_than:
+          field: "createdAt"             # field in the base list rows
+          value: "${STOP_ISO}"           # e.g., 2024-01-01T00:00:00Z
+    # Expand each row's detail link (JSONL payloads), write each session immediately
+    link_expansion:
+      enabled: true
+      url_fields: ["detail_url"]         # column in base list rows
+      timeout: 10
+      type: jsonl                        # expanded payload is JSONL
+      # If your expanded payload were JSON arrays/objects, you could set json_record_path here.
+      # json_record_path: null
+      # Extract session id from each expanded URL
+      session_id:
+        regex: "(?<=/sessions/)[^/?#]+"  # customize if needed
+        group: 0
+        policy: "first"                  # first | last | all | require_single
+      # Write a file for each expanded link (or per session)
+      flush:
+        mode: "per_link"                 # per_link | per_session | none
+        prefix: "logs/{table}/env={env}/session={session_id}/dt={today:%Y-%m-%d}"
+        filename: "{table}-{session_id}-{seq:06d}-{now:%Y%m%dT%H%M%SZ}.jsonl"
+    output:
+      format: jsonl
+      s3:
+        # Final “aggregate” output (if any) can also use session_id (will be set to first/last/etc per policy)
+        prefix: "logs/{table}/env={env}/final/dt={today:%Y-%m-%d}"
+        filename: "{table}-{now:%Y%m%dT%H%M%SZ}.jsonl"
+
+  # ======================================================================
+  # =============== EXAMPLE 6: Multi-pull join (your AWS cost keys) ======
+  # =============== Two pulls merged with left join on fields =============
+  # ======================================================================
+  aws_cost:
+    # If both pulls share the same endpoint base, you can put a default path here;
+    # each pull can still override it.
+    path: "cost/v1/report"
+    # Define the pulls to run (in order). Each pull is a normal single request (no pagination).
+    multi_pulls:
+      - name: "cost_core"
+        path: "cost/v1/report"
+        parse:
+          type: json
+          json_record_path: "awsCostReport.awsCostList"
+        params:
+          fromDate: "${START_DATE}"
+          toDate: "${END_DATE}"
+          asvName: "ASVC1SPLATFORMIDENTITYSERVICES,ASVAPIGATEWAYCOMMERCIALIZATION"
+          select: "AsvName,AccountName,Region,ServiceType,Environment,costStartTimestamp,costEndTimestamp"
+          sumBy: "Hour"
+          isFinanceView: true
+
+      - name: "cost_dept"
+        path: "cost/v1/report"
+        parse:
+          type: json
+          json_record_path: "awsCostReport.awsCostList"
+        params:
+          fromDate: "${START_DATE}"
+          toDate: "${END_DATE}"
+          asvName: "ASVC1SPLATFORMIDENTITYSERVICES,ASVAPIGATEWAYCOMMERCIALIZATION"
+          select: "AsvName,AccountName,DepartmentId,costStartTimestamp,costEndTimestamp"
+          sumBy: "Hour"
+          isFinanceView: true
+
+    # Join instructions: how and which columns to join on
+    join:
+      how: "left"
+      on:
+        - "asvName"
+        - "accountName"
+        - "costStartTimestamp"
+        - "costEndTimestamp"
+      # Optional: choose columns to keep/rename from later pulls to avoid collisions
+      select_from:
+        cost_dept:
+          keep: ["departmentId"]         # keep only deptId from pull #2
+          rename:
+            departmentId: "departmentId" # no-op rename shown as an example
+
+    # (If your runner supports backfill here, add it. For fixed windows you can also use date strategy.)
+    backfill:
+      enabled: false
+
+    output:
+      format: parquet
+      s3:
+        prefix: "aws_cost/{table}/env={env}/dt={today:%Y-%m-%d}"
+        compression: snappy
+
+  # ======================================================================
+  # =============== (Optional) Cursor-only example without links =========
+  # ======================================================================
+  cursor_feed:
+    path: "v1/cur"
+    parse:
+      type: json
+      json_record_path: "data"
+    pagination:
+      mode: "cursor"
+      cursor_param: "cursor"
+      next_cursor_path: "meta.next"
+      page_size_param: "limit"
+      page_size_value: 200
+    backfill:
+      enabled: true
+      strategy: "cursor"
+      cursor:
+        start_value: "s0"

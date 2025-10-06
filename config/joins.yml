@@ -1,0 +1,46 @@
+envs:
+  prod:
+    base_url: https://api.example.com/
+
+apis:
+  request_defaults:
+    headers:
+      Authorization: "Bearer ${TOKEN}"
+
+  # defaults the base endpoint for this table
+  path: v1/base
+
+  my_table:
+    parse: { type: json, json_record_path: data }
+    pagination: { mode: none }
+
+    # Optional per-table output, link expansion, etc…
+    output:
+      format: parquet
+      s3:
+        bucket: my-bucket
+        prefix: data/{table}/{env}/{today:%Y-%m-%d}
+
+    # 👇 NEW
+    joins:
+      - name: details
+        path: v1/details                     # endpoint for this join
+        parse: { type: json, json_record_path: items }
+        pagination: { mode: none }           # can be any supported pager
+        on: ["id"]                           # columns to join on
+        how: left                            # optional; defaults to "left"
+        select: ["id", "foo", "bar"]         # optional projection from join DF
+        suffixes: ["", "_details"]           # optional; defaults to ["", "_details"]
+        # Optional request overrides for just this join:
+        params: { include: "foo,bar" }
+        headers: { X-Feature: "1" }
+        timeout: 20
+        verify: true
+
+      - name: metrics
+        path: v1/metrics
+        parse: { type: jsonl }               # joins can parse differently
+        pagination: { mode: cursor, cursor_param: cursor, next_cursor_path: meta.next }
+        on: ["account_id", "date"]
+        select: ["account_id", "date", "impressions", "clicks"]
+        suffixes: ["", "_m"]

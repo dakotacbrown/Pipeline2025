@@ -89,31 +89,6 @@ class ApiIngestor:
         """
         Execute a single request (with optional pagination and link expansion),
         write the result to the configured sink, and return lightweight metadata.
-
-        Steps:
-          1) Merge env + API config layers via _prepare
-          2) Create a retry-enabled Session
-          3) Apply request defaults to the Session (so link expansion inherits them)
-          4) Build the URL from env.base_url + apis.path
-          5) Page through results (if configured) and parse into a DataFrame
-          6) Optionally expand per-row URLs
-
-        Returns:
-            {
-            "table": str,
-            "env": str,
-            "rows": int,
-            "format": "csv"|"jsonl"|"parquet",
-            "s3_bucket": str,
-            "s3_key": str,
-            "s3_uri": str,
-            "bytes": int,
-            "started_at": str,      # ISO-8601 UTC
-            "ended_at": str,        # ISO-8601 UTC
-            "duration_s": float,
-            "source_url": str,
-            "pagination_mode": str
-            }
         """
         started = pd.Timestamp.now(tz="UTC")
         self.log.info(f"[run_once] start table={table_name} env={env_name}")
@@ -173,14 +148,6 @@ class ApiIngestor:
     ) -> Dict[str, Any]:
         """
         Windowed backfill over a date range.
-
-        Strategies (apis.<table>.backfill.strategy):
-          - "date"        : Generic date windows via query params (default)
-          - "soql_window" : Salesforce SOQL per window (uses 'q' param) and SF pagination
-          - "cursor"      : Cursor-bounded backfill with stop conditions
-
-        Returns:
-            Metadata dictionary.
         """
         started = pd.Timestamp.now(tz="UTC")
         self.log.info(
@@ -370,17 +337,10 @@ class ApiIngestor:
     def _expand_env_value(self, v: Any) -> Any:
         """
         Recursively expand ${ENV_VAR} placeholders in strings/dicts/lists.
-
-        Missing env vars are left as-is (e.g., '${FOO}') so callers can detect
-        them instead of silently replacing with empty strings.
         """
         if isinstance(v, str):
-
             def repl(m):
-                return os.getenv(
-                    m.group(1), m.group(0)
-                )  # keep ${...} literal if missing
-
+                return os.getenv(m.group(1), m.group(0))
             return self._ENV_RE.sub(repl, v)
         if isinstance(v, dict):
             return {k: self._expand_env_value(vv) for k, vv in v.items()}
@@ -393,12 +353,6 @@ class ApiIngestor:
     ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         """
         Merge env + API layers and return the effective configs.
-
-        Returns:
-            env_cfg:  env-level settings (must include base_url)
-            api_cfg:  effective API settings for the run (path/pagination/link_expansion/backfill)
-            req_opts: request kwargs defaults (headers/params/verify/auth/proxies/timeout/retries)
-            parse_cfg: parsing options (type=json|csv, json_record_path, etc.)
         """
         # ----- env
         env_cfg = (self.config.get("envs") or {}).get(env_name) or {}
@@ -467,10 +421,6 @@ class ApiIngestor:
     def _build_session(self, retries_cfg: Optional[Dict[str, Any]]) -> Session:
         """
         Build a requests.Session and mount an HTTPAdapter with retry/backoff config.
-
-        Compatible with urllib3 v1.x (uses `method_whitelist`) and v2.x
-        (uses `allowed_methods`). We try the v2 signature first and fall
-        back to the v1 signature if needed.
         """
         s = requests.Session()
 
@@ -486,10 +436,8 @@ class ApiIngestor:
             retries_cfg.get("status_forcelist", [429, 500, 502, 503, 504])
         )
         allowed = retries_cfg.get("allowed_methods", ["GET"])
-        # Normalize to an uppercase frozenset, as urllib3 expects
         allowed_set = frozenset(m.upper() for m in allowed)
 
-        # Core kwargs that exist in both lines
         base_kwargs = dict(
             total=total,
             connect=connect,
@@ -498,7 +446,6 @@ class ApiIngestor:
             status_forcelist=status_forcelist,
         )
 
-        # Try urllib3 v2.x signature first (allowed_methods, raise_on_status)
         try:
             r = Retry(
                 **base_kwargs,
@@ -506,7 +453,6 @@ class ApiIngestor:
                 raise_on_status=False,
             )
         except TypeError:
-            # Fall back to urllib3 v1.x (method_whitelist, possibly no raise_on_status)
             try:
                 r = Retry(
                     **base_kwargs,
@@ -514,13 +460,11 @@ class ApiIngestor:
                     raise_on_status=False,
                 )
             except TypeError:
-                # Very old urllib3 without raise_on_status
                 r = Retry(
                     **base_kwargs,
                     method_whitelist=allowed_set,
                 )
 
-        # Respect Retry-After header when the attr exists (v1.26+/v2)
         if hasattr(r, "respect_retry_after_header"):
             setattr(r, "respect_retry_after_header", True)
 
@@ -535,16 +479,6 @@ class ApiIngestor:
         """
         Copy request-level defaults onto the session so *all* requests (including
         link expansion) inherit them.
-
-        Applies:
-            - headers (merged into session.headers)
-            - auth    (sess.auth)
-            - proxies (merged into session.proxies)
-            - verify  (sess.verify)
-
-        Not applied (session has no global settings for these):
-            - timeout
-            - params
         """
         headers = opts.get("headers")
         if headers:
@@ -570,16 +504,7 @@ class ApiIngestor:
         pag_cfg: Optional[Dict[str, Any]],
     ) -> pd.DataFrame:
         """
-        Unified paginator:
-
-          - mode='none'       : single request
-          - mode='salesforce' : Salesforce 'done' flag + 'nextRecordsUrl'
-          - mode='cursor'     : opaque next token at json path; sent via 'cursor_param'
-          - mode='page'       : increment page param until empty
-          - mode='link-header': follow HTTP Link headers (rel="next")
-
-        Returns:
-            Concatenated DataFrame of all pages for the current slice.
+        Unified paginator with modes: none, salesforce, cursor, page, link-header.
         """
         mode = (pag_cfg or {}).get("mode", "none")
         frames: List[pd.DataFrame] = []
@@ -590,11 +515,8 @@ class ApiIngestor:
             return self._to_dataframe(resp, parse_cfg)
 
         if mode == "salesforce":
-            # Salesforce-style pagination:
-            #   - Stop when 'done' is true OR there is no 'nextRecordsUrl'
-            #   - The 'nextRecordsUrl' is RELATIVE, so we join against host_base
             safe = self._whitelist_request_opts(dict(base_opts))
-            host_base = urljoin(url, "/")  # scheme+host root (keeps origin)
+            host_base = urljoin(url, "/")
             done_path = (pag_cfg or {}).get("done_path", "done")
             next_url_path = (pag_cfg or {}).get(
                 "next_url_path", "nextRecordsUrl"
@@ -612,27 +534,22 @@ class ApiIngestor:
                 resp.raise_for_status()
                 data = resp.json()
 
-                # Drop configured keys anywhere in the JSON before parsing (e.g., SF 'attributes')
                 drop_keys = set(parse_cfg.get("json_drop_keys_any_depth", []))
                 if drop_keys:
                     data = self._drop_keys_any_depth(data, drop_keys)
 
-                # Convert this page -> DataFrame
                 df_page = self._json_obj_to_df(data, parse_cfg)
                 if not df_page.empty:
                     frames.append(df_page)
 
-                # Stop if 'done' or there is no 'nextRecordsUrl'
                 if (data.get(done_path, True)) is True:
                     break
                 next_rel = data.get(next_url_path)
                 if not next_rel:
                     break
 
-                # nextRecordsUrl is relative to host; rebuild a full URL
                 next_url = urljoin(host_base, next_rel)
 
-                # Salesforce expects subsequent calls without the initial query params (e.g., 'q')
                 if clear_params_on_next and "params" in safe:
                     safe = dict(safe)
                     safe.pop("params", None)
@@ -648,7 +565,6 @@ class ApiIngestor:
         safe = self._whitelist_request_opts(opts)
 
         if mode in {"cursor", "page"}:
-            # Respect configured page size if present, and seed first page if needed
             params = dict(safe.get("params") or {})
 
             ps_param = pag_cfg.get("page_size_param") if pag_cfg else None
@@ -659,7 +575,6 @@ class ApiIngestor:
             if mode == "page":
                 page_param = (pag_cfg or {}).get("page_param", "page")
                 start_page = int((pag_cfg or {}).get("start_page", 1))
-                # Only set if not already provided upstream
                 params.setdefault(page_param, start_page)
 
             if params:
@@ -673,14 +588,12 @@ class ApiIngestor:
             resp = sess.get(next_url, **safe)
             resp.raise_for_status()
             page_df = self._to_dataframe(resp, parse_cfg)
-            # For 'page' pagination, stop before appending an empty page
             if mode == "page" and page_df.empty:
                 break
             frames.append(page_df)
             pages += 1
 
             if mode == "cursor":
-                # Look up the next token at the configured JSON path
                 next_cursor = self._dig(
                     resp.json(), (pag_cfg or {}).get("next_cursor_path")
                 )
@@ -690,12 +603,11 @@ class ApiIngestor:
                         next_cursor
                     )
                     safe["params"] = params
-                    next_url = url  # same endpoint with updated cursor param
+                    next_url = url
                 else:
                     next_url = None
 
             elif mode == "page":
-                # Increment a numeric page parameter until the page is empty
                 page_param = (pag_cfg or {}).get("page_param", "page")
                 start_page = int((pag_cfg or {}).get("start_page", 1))
                 current_page = int(
@@ -707,7 +619,6 @@ class ApiIngestor:
                 safe["params"] = params
 
             elif mode == "link-header":
-                # Follow RFC5988 Link: <...>; rel="next"
                 next_link = resp.links.get("next", {}).get("url")
                 next_url = next_link
 
@@ -719,10 +630,7 @@ class ApiIngestor:
         return pd.concat(frames, ignore_index=True)
 
     def _drop_keys_any_depth(self, obj, keys: set):
-        """
-        Recursively drop any dict keys whose name is in `keys`.
-        Useful for removing metadata (e.g., Salesforce 'attributes') before normalization.
-        """
+        """Recursively drop any dict keys whose name is in `keys`."""
         if isinstance(obj, dict):
             return {
                 k: self._drop_keys_any_depth(v, keys)
@@ -736,13 +644,7 @@ class ApiIngestor:
     def _json_obj_to_df(
         self, data_obj: Any, parse_cfg: Dict[str, Any]
     ) -> pd.DataFrame:
-        """
-        Convert an already-decoded JSON object to a DataFrame, respecting
-        json_record_path if provided.
-
-        If the record path points to a list -> DataFrame(list).
-        Else -> json_normalize(dict).
-        """
+        """Convert an already-decoded JSON object to a DataFrame."""
         record_path = parse_cfg.get("json_record_path")
         data = data_obj
         if record_path:
@@ -755,21 +657,13 @@ class ApiIngestor:
     def _to_dataframe(
         self, resp: requests.Response, parse_cfg: Dict[str, Any]
     ) -> pd.DataFrame:
-        """
-        Convert a single HTTP response into a DataFrame.
-
-        CSV:
-            Decode to text and use pandas.read_csv
-        JSON:
-            Optionally drop keys anywhere in the structure, then honor json_record_path
-        """
+        """Convert a single HTTP response into a DataFrame."""
         parse_type = (parse_cfg.get("type") or "json").lower()
         if parse_type == "csv":
             csv_string = resp.content.decode("utf-8", errors="replace")
             return pd.read_csv(StringIO(csv_string))
 
         if parse_type in {"jsonl", "ndjson"}:
-            # Each line is a JSON object
             text = resp.content.decode("utf-8", errors="replace")
             if not text.strip():
                 return pd.DataFrame()
@@ -796,12 +690,7 @@ class ApiIngestor:
         end: date,
         link_cfg: Dict[str, Any],
     ) -> pd.DataFrame:
-        """
-        Salesforce-specific backfill:
-          - Build a HALF-OPEN SOQL window per slice: [start, end)
-          - Send the SOQL via params['q'] for the *first* request in each slice
-          - Let the Salesforce paginator follow 'nextRecordsUrl' within the slice
-        """
+        """Salesforce-specific backfill."""
         window_days = int(bf_cfg.get("window_days", 7))
         per_request_delay = float(bf_cfg.get("per_request_delay", 0.0))
         date_field = bf_cfg.get("date_field", "LastModifiedDate")
@@ -816,7 +705,6 @@ class ApiIngestor:
         current = start
 
         while current <= end:
-            # HALF-OPEN window: [current .. window_end) (end exclusive)
             window_end = min(
                 current + timedelta(days=window_days), end + timedelta(days=1)
             )
@@ -827,7 +715,6 @@ class ApiIngestor:
                 date_field=date_field, start=start_str, end=end_str
             )
 
-            # Inject SOQL as the 'q' parameter (first Salesforce request in a slice)
             req_opts = dict(base_opts)
             params = dict(req_opts.get("params") or {})
             params["q"] = soql
@@ -855,7 +742,6 @@ class ApiIngestor:
                 )
                 raise
 
-            # Next HALF-OPEN window
             current = window_end
 
         if not frames:
@@ -872,21 +758,10 @@ class ApiIngestor:
         cur_cfg: Dict[str, Any],
         link_cfg: Dict[str, Any],
     ) -> pd.DataFrame:
-        """
-        Cursor-bounded backfill.
-
-        Supports two advancement modes:
-          - Opaque token: read next token at next_cursor_path and send via 'cursor_param'
-          - ID chaining : use last row's 'chain_field' value as next cursor
-
-        Optional stop conditions:
-          - stop_at_item: { field, value, inclusive }
-          - stop_when_older_than: { field, value (ISO 8601) }
-        """
+        """Cursor-bounded backfill with optional stop conditions."""
         safe = self._whitelist_request_opts(dict(base_opts))
         frames: List[pd.DataFrame] = []
 
-        # Seed cursor if provided
         start_value = (cur_cfg or {}).get("start_value")
         cursor_param = (pag_cfg or {}).get("cursor_param", "cursor")
         if start_value:
@@ -894,19 +769,15 @@ class ApiIngestor:
             params[cursor_param] = start_value
             safe["params"] = params
 
-        next_cursor_path = (pag_cfg or {}).get(
-            "next_cursor_path"
-        )  # opaque-token style
-        chain_field = (pag_cfg or {}).get("chain_field")  # id-chaining style
+        next_cursor_path = (pag_cfg or {}).get("next_cursor_path")
+        chain_field = (pag_cfg or {}).get("chain_field")
         max_pages = int((pag_cfg or {}).get("max_pages", 10000))
 
-        # Stop-by-item
         stop_item = (cur_cfg or {}).get("stop_at_item") or {}
         stop_field = stop_item.get("field")
         stop_value = stop_item.get("value")
         stop_inclusive = bool(stop_item.get("inclusive", False))
 
-        # Stop-by-time (ISO)
         stop_time_cfg = (cur_cfg or {}).get("stop_when_older_than") or {}
         stop_time_field = stop_time_cfg.get("field")
         stop_time_value = stop_time_cfg.get("value")
@@ -924,7 +795,6 @@ class ApiIngestor:
             resp.raise_for_status()
             df_page = self._to_dataframe(resp, parse_cfg)
 
-            # Stop-by-item: trim current page and finish
             if (
                 stop_field
                 and stop_value
@@ -948,7 +818,6 @@ class ApiIngestor:
                     frames.append(df_page)
                     break
 
-            # Stop-by-time: keep only rows newer/equal than cutoff; then finish
             if (
                 stop_dt is not None
                 and not df_page.empty
@@ -968,14 +837,12 @@ class ApiIngestor:
                         frames.append(trimmed)
                     break
 
-            # Optional per-page link expansion
             if link_cfg.get("enabled", False) and not df_page.empty:
                 df_page = self._expand_links(sess, df_page, link_cfg, parse_cfg)
 
             if not df_page.empty:
                 frames.append(df_page)
 
-            # Compute next cursor
             if next_cursor_path:
                 token = self._dig(resp.json(), next_cursor_path)
                 if token:
@@ -994,7 +861,6 @@ class ApiIngestor:
                 safe["params"] = params
                 next_url = url
             else:
-                # No way to advance
                 next_url = None
 
             pages += 1
@@ -1011,13 +877,18 @@ class ApiIngestor:
         parse_cfg: Dict[str, Any],
     ) -> pd.DataFrame:
         """
-        Follow URLs found in each row and aggregate those payloads into a DataFrame.
+        Follow URLs found in each row, extract a session id via regex (if configured),
+        combine all expanded payloads into a single DataFrame, and return it.
 
-        Notes:
-        - Inherits auth/headers/verify/proxies from the Session (via _apply_session_defaults)
-        - For large datasets, consider batching/async
-        - If expanded responses need a different JSON record path, set link_cfg.json_record_path
-            (otherwise we *drop* any base json_record_path to correctly parse object payloads).
+        Config (apis.*.link_expansion):
+          enabled: true
+          url_fields: ["links.self", "download_url"]
+          session_id_regex: "(?i)[?&]session(?:Id|ID|_id)=([^&]+)"
+          type: "json" | "csv" | "jsonl"           # optional override of parse type
+          json_record_path: "items" | null         # optional override for expanded payloads
+          per_request_delay: 0.0
+          add_source_url: true                     # include 'link_url' column (default true)
+          combine: "concat" | "merge"              # how to combine multiple expanded frames per row (default "concat")
         """
         if df.empty:
             return df
@@ -1030,17 +901,21 @@ class ApiIngestor:
             return df
 
         per_delay = float((link_cfg or {}).get("per_request_delay", 0.0))
+        add_source_url = bool((link_cfg or {}).get("add_source_url", True))
+        combine_mode = (link_cfg or {}).get("combine", "concat").lower()
+
+        # Compile optional session-id regex
+        sid_pattern = (link_cfg or {}).get("session_id_regex")
+        sid_re = re.compile(sid_pattern) if isinstance(sid_pattern, str) and sid_pattern else None
+
         expanded_frames: List[pd.DataFrame] = []
 
         for _, row in df.iterrows():
             urls: List[str] = []
             for fld in url_fields:
                 val = self._get_from_row(row, fld)
-                if isinstance(val, str) and val.startswith(
-                    ("http://", "https://")
-                ):
+                if isinstance(val, str) and val.startswith(("http://", "https://")):
                     urls.append(val)
-                # If you later need to support relative links, resolve with urljoin(base_url, val).
 
             row_frames: List[pd.DataFrame] = []
             for u in urls:
@@ -1049,41 +924,56 @@ class ApiIngestor:
                     f"[link_expansion] GET {u} -> {getattr(resp, 'headers', {}).get('Content-Type', 'unknown')}, bytes={len(resp.content)}"
                 )
                 resp.raise_for_status()
-                # ------ KEY CHANGE: do not inherit base json_record_path by default ------
+
+                # Parse with possible overrides for expansion payloads
                 parse_override = dict(parse_cfg)
-                # allow link-expansion to override parse type (e.g., jsonl/csv)
                 if "type" in (link_cfg or {}):
                     parse_override["type"] = link_cfg["type"]
                 if parse_override.get("type", "json") == "json":
                     if "json_record_path" in (link_cfg or {}):
-                        # If provided for expansion, use it (including explicit None)
                         if link_cfg.get("json_record_path") is None:
                             parse_override.pop("json_record_path", None)
                         else:
-                            parse_override["json_record_path"] = link_cfg[
-                                "json_record_path"
-                            ]
+                            parse_override["json_record_path"] = link_cfg["json_record_path"]
                     else:
-                        # Not provided for expansion -> drop the base record path
                         parse_override.pop("json_record_path", None)
-                # ------------------------------------------------------------------------
 
-                row_frames.append(self._to_dataframe(resp, parse_override))
+                f = self._to_dataframe(resp, parse_override)
+
+                # Attach session_id and/or source url if configured
+                if not f.empty:
+                    if sid_re is not None:
+                        m = sid_re.search(u)
+                        session_id = m.group(1) if m else None
+                        f = f.copy()
+                        f["session_id"] = session_id
+                        if session_id is None:
+                            self.log.debug(f"[link_expansion] No session_id matched for URL: {u}")
+                    if add_source_url:
+                        f = f.copy()
+                        f["link_url"] = u
+
+                row_frames.append(f)
 
                 if per_delay > 0:
                     time.sleep(per_delay)
 
+            # Combine the multiple expanded frames for this source row
             if row_frames:
-                merged = row_frames[0]
-                for f in row_frames[1:]:
-                    merged = merged.merge(
-                        f, left_index=True, right_index=True, how="outer"
-                    )
-                expanded_frames.append(merged)
+                if combine_mode == "merge":
+                    merged = row_frames[0]
+                    for f in row_frames[1:]:
+                        merged = merged.merge(
+                            f, left_index=True, right_index=True, how="outer"
+                        )
+                    expanded_frames.append(merged)
+                else:  # "concat" (default)
+                    expanded_frames.append(pd.concat(row_frames, ignore_index=True))
 
         if not expanded_frames:
             return df
 
+        # Return only the expanded data (singular DataFrame composed from all URLs)
         return pd.concat(expanded_frames, ignore_index=True)
 
     # ---------- Small utilities ----------
@@ -1112,10 +1002,6 @@ class ApiIngestor:
     def _get_from_row(self, row: pd.Series, path: str):
         """
         Read a dot-path from a DataFrame row.
-
-        Supports:
-          - flat columns (exact name match),
-          - dict-like columns (e.g., 'links' holding {'self': 'https://...'})
         """
         if path in row.index:
             return row[path]
@@ -1242,16 +1128,11 @@ class ApiIngestor:
         fmt: str,
         s3_cfg: Dict[str, Any],
     ) -> Tuple[bytes, Optional[str], Optional[str]]:
-        """
-        Serialize a DataFrame to bytes for upload.
-        Returns: (bytes, content_type, content_encoding)
-        """
+        """Serialize a DataFrame to bytes for upload."""
         if fmt == "csv":
             index = bool(s3_cfg.get("index", False))
             sep = s3_cfg.get("sep", ",")
-            compression = (
-                s3_cfg.get("compression") or ""
-            ).lower()  # e.g., 'gzip'
+            compression = (s3_cfg.get("compression") or "").lower()
             csv_text = df.to_csv(index=index, sep=sep)
             raw = csv_text.encode("utf-8")
             if compression == "gzip":
@@ -1276,10 +1157,7 @@ class ApiIngestor:
         raise ValueError(f"Unsupported format: {fmt}")
 
     def _log_request(self, url: str, opts: Dict[str, Any], prefix: str = ""):
-        """
-        Log request details with sensitive headers/params redacted.
-        Helps to debug parameter windows and SOQL slices without leaking secrets.
-        """
+        """Log request details with sensitive headers/params redacted."""
         safe_headers = dict(opts.get("headers") or {})
         for k in list(safe_headers.keys()):
             if k.lower() in self._SENSITIVE_HEADERS:

@@ -1,4 +1,5 @@
 import gzip
+import json
 import os
 import re
 import time
@@ -9,6 +10,7 @@ from logging import Logger
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
+import numpy as np
 import pandas as pd
 import requests
 from requests import Session
@@ -67,6 +69,8 @@ class ApiIngestor:
         "secret",
         "password",
         "private_key",
+        "x-authorization",
+        "auth",
     }
 
     # ${ENV_VAR} placeholder pattern
@@ -339,8 +343,10 @@ class ApiIngestor:
         Recursively expand ${ENV_VAR} placeholders in strings/dicts/lists.
         """
         if isinstance(v, str):
+
             def repl(m):
                 return os.getenv(m.group(1), m.group(0))
+
             return self._ENV_RE.sub(repl, v)
         if isinstance(v, dict):
             return {k: self._expand_env_value(vv) for k, vv in v.items()}
@@ -906,7 +912,11 @@ class ApiIngestor:
 
         # Compile optional session-id regex
         sid_pattern = (link_cfg or {}).get("session_id_regex")
-        sid_re = re.compile(sid_pattern) if isinstance(sid_pattern, str) and sid_pattern else None
+        sid_re = (
+            re.compile(sid_pattern)
+            if isinstance(sid_pattern, str) and sid_pattern
+            else None
+        )
 
         expanded_frames: List[pd.DataFrame] = []
 
@@ -914,7 +924,9 @@ class ApiIngestor:
             urls: List[str] = []
             for fld in url_fields:
                 val = self._get_from_row(row, fld)
-                if isinstance(val, str) and val.startswith(("http://", "https://")):
+                if isinstance(val, str) and val.startswith(
+                    ("http://", "https://")
+                ):
                     urls.append(val)
 
             row_frames: List[pd.DataFrame] = []
@@ -934,7 +946,9 @@ class ApiIngestor:
                         if link_cfg.get("json_record_path") is None:
                             parse_override.pop("json_record_path", None)
                         else:
-                            parse_override["json_record_path"] = link_cfg["json_record_path"]
+                            parse_override["json_record_path"] = link_cfg[
+                                "json_record_path"
+                            ]
                     else:
                         parse_override.pop("json_record_path", None)
 
@@ -948,7 +962,9 @@ class ApiIngestor:
                         f = f.copy()
                         f["session_id"] = session_id
                         if session_id is None:
-                            self.log.debug(f"[link_expansion] No session_id matched for URL: {u}")
+                            self.log.debug(
+                                f"[link_expansion] No session_id matched for URL: {u}"
+                            )
                     if add_source_url:
                         f = f.copy()
                         f["link_url"] = u
@@ -968,7 +984,9 @@ class ApiIngestor:
                         )
                     expanded_frames.append(merged)
                 else:  # "concat" (default)
-                    expanded_frames.append(pd.concat(row_frames, ignore_index=True))
+                    expanded_frames.append(
+                        pd.concat(row_frames, ignore_index=True)
+                    )
 
         if not expanded_frames:
             return df
@@ -1014,6 +1032,36 @@ class ApiIngestor:
                 cur = cur.get(k)
             return cur
         return None
+
+    def _stringify_non_scalars_for_parquet(
+        self, df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Make a DataFrame Parquet-safe (minimal): convert dict/list (and other non-scalars)
+        to JSON strings; keep scalars unchanged. This preserves data but loses nested columns.
+        """
+        if df.empty:
+            return df
+
+        def _to_json_if_needed(v):
+            # Treat NaN/NA as-is
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                return v
+            # Scalars we keep as-is
+            if isinstance(v, (str, int, float, bool, pd.Timestamp)):
+                return v
+            # Everything else (dict, list, set, tuple, custom) → JSON string
+            try:
+                return json.dumps(v, default=str, ensure_ascii=False)
+            except Exception:
+                return str(v)
+
+        # Only touch object-dtype columns (fast)
+        out = df.copy()
+        obj_cols = [c for c in out.columns if out[c].dtype == "object"]
+        for c in obj_cols:
+            out[c] = out[c].map(_to_json_if_needed)
+        return out
 
     def _write_output(
         self,
@@ -1150,8 +1198,10 @@ class ApiIngestor:
             compression = s3_cfg.get("compression", "snappy")
             if isinstance(compression, str) and compression.lower() == "none":
                 compression = None
+            # MINIMAL FIX: stringify dict/list cells so pyarrow can write
+            df_safe = self._stringify_non_scalars_for_parquet(df)
             buf = BytesIO()
-            df.to_parquet(buf, index=False, compression=compression)
+            df_safe.to_parquet(buf, index=False, compression=compression)
             return buf.getvalue(), "application/vnd.apache.parquet", None
 
         raise ValueError(f"Unsupported format: {fmt}")

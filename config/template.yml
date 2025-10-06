@@ -129,7 +129,7 @@ apis:
       url_fields: ["url"]
       type: jsonl
       session_id:
-        regex: "(?<=/sessions/)[^/?#]+"
+        regex: (?<=c1s-cos-)[0-9a-f]-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[0-9a-f](?=\?|/|$)
         group: 0
       flush:
         mode: per_session

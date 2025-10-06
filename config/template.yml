@@ -135,7 +135,7 @@ apis:
       session_id:
         from: regex
         regex:
-          pattern: "(?<=/sessions/)[^/?#]+"
+          pattern: "(?<=c1s-cos-)([^?]+)"
           group: 0
           flags: ["IGNORECASE"]          # optional
         policy: "first"                  # first | last | all | require_single

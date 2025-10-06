@@ -1,4 +1,5 @@
 import gzip
+import json
 import os
 import re
 import time
@@ -9,6 +10,7 @@ from logging import Logger
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
+import numpy as np
 import pandas as pd
 import requests
 from requests import Session
@@ -1219,6 +1221,36 @@ class ApiIngestor:
             self._current_output_ctx.pop("seq", None)
             self._current_output_ctx.pop("session_id", None)
 
+    def _stringify_non_scalars_for_parquet(
+        self, df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Make a DataFrame Parquet-safe (minimal): convert dict/list (and other non-scalars)
+        to JSON strings; keep scalars unchanged. This preserves data but loses nested columns.
+        """
+        if df.empty:
+            return df
+
+        def _to_json_if_needed(v):
+            # Treat NaN/NA as-is
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                return v
+            # Scalars we keep as-is
+            if isinstance(v, (str, int, float, bool, pd.Timestamp)):
+                return v
+            # Everything else (dict, list, set, tuple, custom) → JSON string
+            try:
+                return json.dumps(v, default=str, ensure_ascii=False)
+            except Exception:
+                return str(v)
+
+        # Only touch object-dtype columns (fast)
+        out = df.copy()
+        obj_cols = [c for c in out.columns if out[c].dtype == "object"]
+        for c in obj_cols:
+            out[c] = out[c].map(_to_json_if_needed)
+        return out
+
     def _write_output(
         self,
         df: pd.DataFrame,
@@ -1361,8 +1393,10 @@ class ApiIngestor:
             compression = s3_cfg.get("compression", "snappy")
             if isinstance(compression, str) and compression.lower() == "none":
                 compression = None
+            # MINIMAL FIX: stringify dict/list cells so pyarrow can write
+            df_safe = self._stringify_non_scalars_for_parquet(df)
             buf = BytesIO()
-            df.to_parquet(buf, index=False, compression=compression)
+            df_safe.to_parquet(buf, index=False, compression=compression)
             return buf.getvalue(), "application/vnd.apache.parquet", None
 
         raise ValueError(f"Unsupported format: {fmt}")

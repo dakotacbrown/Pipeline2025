@@ -126,25 +126,16 @@ apis:
     # Expand each row's detail link (JSONL payloads), write each session immediately
     link_expansion:
       enabled: true
-      url_fields: ["detail_url"]         # column in base list rows
-      timeout: 10
-      type: jsonl                        # expanded payload is JSONL
-      # json_record_path: null           # (only if expanded payload were JSON object/array)
-
-      # Extract session id from each expanded URL using regex
+      url_fields: ["url"]
+      type: jsonl
       session_id:
-        from: regex
-        regex:
-          pattern: "(?<=c1s-cos-)([^?]+)"
-          group: 0
-          flags: ["IGNORECASE"]          # optional
-        policy: "first"                  # first | last | all | require_single
-
-      # Write a file for each expanded link (or per session)
+        regex: "(?<=/sessions/)[^/?#]+"
+        group: 0
       flush:
-        mode: "per_link"                 # per_link | per_session | none
-        prefix: "logs/{table}/env={env}/session={session_id}/dt={today:%Y-%m-%d}"
-        filename: "{table}-{session_id}-{seq:06d}-{now:%Y%m%dT%H%M%SZ}.jsonl"
+        mode: per_session
+        prefix: "test/logrocket/{table}/{today:year=%Y/month=%m/day=%d/hour=%H}"
+        filename: "session_{session_id}.parquet"
+        only: true            # <-- NEW: write only flushed session files
 
     output:
       format: jsonl

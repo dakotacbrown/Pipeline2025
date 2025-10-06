@@ -136,6 +136,38 @@ class ApiIngestor:
             if resolved_session_id:
                 self._current_output_ctx["session_id"] = resolved_session_id
 
+            # inside run_once right before out_meta = self._write_output(...)
+            flush_cfg = (api_cfg.get("link_expansion") or {}).get("flush") or {}
+            only_flush = bool(flush_cfg.get("only"))
+
+            if only_flush:
+                # skip aggregate write entirely
+                self.log.info(
+                    "[run_once] only_flush=true -> skipping aggregate write"
+                )
+                ended = pd.Timestamp.now(tz="UTC")
+                return {
+                    "table": table_name,
+                    "env": env_name,
+                    "rows": 0,
+                    "format": (api_cfg.get("output") or {}).get(
+                        "format", "csv"
+                    ),
+                    "s3_bucket": (api_cfg.get("output") or {})
+                    .get("s3", {})
+                    .get("bucket", ""),
+                    "s3_key": "",
+                    "s3_uri": "",
+                    "bytes": 0,
+                    "started_at": started.isoformat(),
+                    "ended_at": ended.isoformat(),
+                    "duration_s": float((ended - started).total_seconds()),
+                    "source_url": url,
+                    "pagination_mode": (api_cfg.get("pagination") or {}).get(
+                        "mode", "none"
+                    ),
+                }
+
             out_meta = self._write_output(
                 df, table_name, env_name, api_cfg.get("output") or {}
             )
@@ -222,6 +254,38 @@ class ApiIngestor:
             resolved_session_id = self._resolve_session_id(link_cfg or {})
             if resolved_session_id:
                 self._current_output_ctx["session_id"] = resolved_session_id
+
+            # inside run_once right before out_meta = self._write_output(...)
+            flush_cfg = (api_cfg.get("link_expansion") or {}).get("flush") or {}
+            only_flush = bool(flush_cfg.get("only"))
+
+            if only_flush:
+                # skip aggregate write entirely
+                self.log.info(
+                    "[run_once] only_flush=true -> skipping aggregate write"
+                )
+                ended = pd.Timestamp.now(tz="UTC")
+                return {
+                    "table": table_name,
+                    "env": env_name,
+                    "rows": 0,
+                    "format": (api_cfg.get("output") or {}).get(
+                        "format", "csv"
+                    ),
+                    "s3_bucket": (api_cfg.get("output") or {})
+                    .get("s3", {})
+                    .get("bucket", ""),
+                    "s3_key": "",
+                    "s3_uri": "",
+                    "bytes": 0,
+                    "started_at": started.isoformat(),
+                    "ended_at": ended.isoformat(),
+                    "duration_s": float((ended - started).total_seconds()),
+                    "source_url": url,
+                    "pagination_mode": (api_cfg.get("pagination") or {}).get(
+                        "mode", "none"
+                    ),
+                }
 
             out_meta = self._write_output(
                 df, table_name, env_name, api_cfg.get("output") or {}

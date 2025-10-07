@@ -127,8 +127,6 @@ class ApiIngestor:
                 df = self._run_multi_pulls_with_join(
                     sess=sess,
                     base_url=env_cfg["base_url"],
-                    table_name=table_name,
-                    env_name=env_name,
                     api_cfg=api_cfg,
                     req_opts=safe_opts,  # table/global defaults; per-pull overrides are merged inside
                 )
@@ -427,8 +425,6 @@ class ApiIngestor:
                     df_win = self._run_multi_pulls_with_join(
                         sess=sess,
                         base_url=env_cfg["base_url"],
-                        table_name=table_name,
-                        env_name=env_name,
                         api_cfg=api_cfg,
                         req_opts=safe_opts,  # carries the window's params
                     )
@@ -1252,20 +1248,33 @@ class ApiIngestor:
         self,
         sess: requests.Session,
         base_url: str,
-        table_name: str,
-        env_name: str,
         api_cfg: Dict[str, Any],
         req_opts: Dict[str, Any],
     ) -> pd.DataFrame:
         """
-        Execute apis.<table>.multi_pulls (each is a single request) and optionally
-        join their DataFrames according to apis.<table>.join.
+        Execute `apis.<table>.multi_pulls` (each is a single, non-paginated request)
+        and optionally join their DataFrames per `apis.<table>.join`.
 
         Per-pull overrides supported:
-        - path          : endpoint path for this pull (defaults to api_cfg['path'])
-        - parse         : parse config for this pull (defaults to table parse or {"type":"json"})
-        - headers       : merged over req_opts.headers
-        - params        : merged over req_opts.params (per-pull wins)
+        - name    : logical name for this pull (required if used in join.select_from)
+        - path    : endpoint path for this pull (defaults to api_cfg['path'])
+        - parse   : parse config for this pull (defaults to {"type": "json"})
+        - headers : merged over req_opts.headers (pull wins on conflicts)
+        - params  : merged over req_opts.params  (pull wins on conflicts)
+
+        Join config (optional):
+        join:
+            how: left|inner|right|outer      # default: left
+            on:  [colA, colB, ...]           # required if joining >=2 pulls
+            case: exact|lower|upper|ignore   # default: exact
+            select_from:
+            <pull_name>:
+                keep:   [list of columns to keep from that right side; join keys auto-added]
+                rename: {from: to, ...}       # applied after keep
+
+        Notes:
+        - `case: ignore` will match join keys case-insensitively by mapping columns.
+        - If a required join key is missing on a right DF, we create an empty column to avoid IndexError.
         """
         pulls = api_cfg.get("multi_pulls") or []
         if not pulls:
@@ -1273,18 +1282,18 @@ class ApiIngestor:
                 "multi_pulls is empty but _run_multi_pulls_with_join was called"
             )
 
+        # ---- Collect all pulls ---------------------------------------------------
         dfs: Dict[str, pd.DataFrame] = {}
 
         for pull in pulls:
             name = pull.get("name") or "pull"
-            # Build the URL for this pull (allow path override)
             pull_path = pull.get("path", api_cfg.get("path", ""))
             url = self._build_url(base_url, pull_path)
 
-            # Start from the table/global request options
+            # Start from table/global request options and apply per-pull overrides
             pull_opts: Dict[str, Any] = dict(req_opts)
 
-            # Merge headers (pull overrides win)
+            # headers: merge
             if "headers" in pull:
                 base_headers = dict(pull_opts.get("headers") or {})
                 pull_opts["headers"] = {
@@ -1292,66 +1301,157 @@ class ApiIngestor:
                     **(pull.get("headers") or {}),
                 }
 
-            # Merge params (pull overrides win)
+            # params: merge (pull wins)
             base_params = dict(pull_opts.get("params") or {})
             pull_params = dict(pull.get("params") or {})
             if base_params or pull_params:
                 pull_opts["params"] = {**base_params, **pull_params}
 
-            # Whitelist only allowed request kwargs once merged
             safe_opts = self._whitelist_request_opts(pull_opts)
 
-            # Per-pull parse config (default to table-level parse or JSON)
-            parse_cfg = pull.get("parse") or (
-                api_cfg.get("parse") or {"type": "json"}
-            )
+            # parse: per-pull or default json
+            parse_cfg = pull.get("parse") or {"type": "json"}
 
-            # Log and fetch
+            # Log the call (with redaction) and GET once (no pagination for multi pulls)
             self._log_request(url, safe_opts, prefix=f"[multi:{name}] ")
             resp_df = self._paginate(
-                sess, url, safe_opts, parse_cfg, api_cfg.get("pagination")
+                sess, url, safe_opts, parse_cfg, pag_cfg=None
             )
             dfs[name] = resp_df
 
-        # If no join section, return the first pull’s frame (or concat if you prefer)
+        # ---- If no join section, return first pull's DF --------------------------
         join_cfg = api_cfg.get("join") or {}
         if not join_cfg:
-            # default behavior: return the first pull’s data
-            first = pulls[0].get("name") if pulls else None
+            first_name = pulls[0].get("name") if pulls else None
             return (
-                dfs.get(first)
-                if first in dfs
+                dfs.get(first_name)
+                if first_name in dfs
                 else next(iter(dfs.values()), pd.DataFrame())
             )
 
-        # Perform the join per config
+        # ---- Prepare join settings ----------------------------------------------
         how = (join_cfg.get("how") or "left").lower()
-        on_cols = join_cfg.get("on") or []
+        on_cols_cfg = list(join_cfg.get("on") or [])
+        case_mode = (
+            join_cfg.get("case") or "exact"
+        ).lower()  # exact|lower|upper|ignore
         select_from = join_cfg.get("select_from") or {}
 
-        # Establish left DF = the first pull listed
+        if len(pulls) < 2:
+            # Nothing to join
+            first_name = pulls[0].get("name")
+            return dfs.get(first_name, pd.DataFrame())
+
+        # Left DF is the first pull
         left_name = pulls[0]["name"]
         left_df = dfs[left_name].copy()
 
-        # Sequentially join each subsequent pull
+        # Utility: normalize column names per case mode requested
+        def _normalize_columns_for_case(
+            df: pd.DataFrame, mode: str
+        ) -> pd.DataFrame:
+            if mode == "lower":
+                return df.rename(columns={c: c.lower() for c in df.columns})
+            if mode == "upper":
+                return df.rename(columns={c: c.upper() for c in df.columns})
+            return df  # exact/ignore keep as-is
+
+        # Utility: given expected join keys (on_cols_cfg), produce a mapping from
+        # expected name -> actual column in df (case-insensitive when mode==ignore).
+        def _resolve_join_keys(
+            df: pd.DataFrame, expected_keys: List[str], mode: str
+        ) -> Dict[str, str]:
+            out = {}
+            cols = list(df.columns)
+            if mode == "ignore":
+                lower_map = {c.lower(): c for c in cols}
+                for k in expected_keys:
+                    out[k] = lower_map.get(
+                        k.lower(), k
+                    )  # fall back to k (may not exist)
+            else:
+                # exact/lower/upper: after normalization, keys should match literally
+                out = {k: k for k in expected_keys}
+            return out
+
+        # Apply case-mode to left df and compute actual join keys on the left
+        if case_mode in ("lower", "upper"):
+            left_df = _normalize_columns_for_case(left_df, case_mode)
+            on_cols = [
+                c.lower() if case_mode == "lower" else c.upper()
+                for c in on_cols_cfg
+            ]
+        elif case_mode == "ignore":
+            # don't rename columns globally; just map keys later
+            on_cols = on_cols_cfg[:]
+        else:
+            on_cols = on_cols_cfg[:]
+
+        # Validate / create missing left join columns as last resort
+        if case_mode == "ignore":
+            left_key_map = _resolve_join_keys(left_df, on_cols, "ignore")
+            for exp, actual in left_key_map.items():
+                if actual not in left_df.columns:
+                    # Create an empty column to avoid merge() indexer errors
+                    left_df[exp] = pd.NA
+            # For merge(), we want to use the expected names; align left columns to expected
+            if any(left_key_map[k] != k for k in on_cols):
+                left_df = left_df.rename(
+                    columns={
+                        left_key_map[k]: k
+                        for k in on_cols
+                        if left_key_map[k] in left_df.columns
+                    }
+                )
+        else:
+            for k in on_cols:
+                if k not in left_df.columns:
+                    left_df[k] = pd.NA
+
+        # ---- Join each subsequent pull ------------------------------------------
         for pull in pulls[1:]:
             rname = pull["name"]
             right_df = dfs[rname].copy()
 
-            # Column selection/renames from this right pull (optional)
-            sel_cfg = select_from.get(rname, {})
+            # Case-mode normalization for right side (same rules as left)
+            if case_mode in ("lower", "upper"):
+                right_df = _normalize_columns_for_case(right_df, case_mode)
+
+            # Resolve which actual columns on the right correspond to the expected join keys
+            if case_mode == "ignore":
+                r_key_map = _resolve_join_keys(right_df, on_cols, "ignore")
+                # ensure every expected key exists (create missing as NA)
+                for exp, actual in r_key_map.items():
+                    if actual not in right_df.columns:
+                        right_df[exp] = pd.NA
+                # align names to expected for the merge
+                rename_for_keys = {
+                    r_key_map[k]: k
+                    for k in on_cols
+                    if r_key_map[k] in right_df.columns and r_key_map[k] != k
+                }
+                if rename_for_keys:
+                    right_df = right_df.rename(columns=rename_for_keys)
+            else:
+                for k in on_cols:
+                    if k not in right_df.columns:
+                        right_df[k] = pd.NA
+
+            # Column selection/renames for this right pull (optional)
+            sel_cfg = select_from.get(rname, {}) or {}
             keep_cols = sel_cfg.get("keep")
             rename_map = sel_cfg.get("rename") or {}
 
             if keep_cols:
-                # always keep join keys if they would be dropped
+                # Always keep join keys too
                 cols_needed = set(keep_cols) | set(on_cols)
-                right_df = right_df[
-                    [c for c in right_df.columns if c in cols_needed]
-                ]
+                actual = [c for c in right_df.columns if c in cols_needed]
+                right_df = right_df[actual]
+
             if rename_map:
                 right_df = right_df.rename(columns=rename_map)
 
+            # Finally merge
             left_df = left_df.merge(right_df, how=how, on=on_cols)
 
         return left_df

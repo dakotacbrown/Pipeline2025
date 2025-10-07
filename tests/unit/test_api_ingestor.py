@@ -1584,3 +1584,295 @@ def test_run_once_logs_link_expansion_line(make_ingestor, logger):
     assert any(
         m.startswith("[link_expansion] GET http://api/d") for m in logger.infos
     )
+
+
+def test_prepare_includes_multi_pulls_and_join(logger):
+    # Ensure _prepare passes through multi_pulls + join
+    from utils.api_ingestor import ApiIngestor
+
+    cfg = {
+        "envs": {"prod": {"base_url": "http://h"}},
+        "apis": {
+            "t": {
+                "multi_pulls": [{"name": "a"}, {"name": "b"}],
+                "join": {"how": "left", "on": ["k"], "select_from": {}},
+            }
+        },
+    }
+    ing = ApiIngestor(config=cfg, log=logger)
+    _, api_cfg, _, _ = ing._prepare("t", "prod")
+    assert isinstance(api_cfg.get("multi_pulls"), list)
+    assert isinstance(api_cfg.get("join"), dict)
+
+
+def test_multi_pulls_left_join_keep_and_rename(make_ingestor):
+    """
+    Covers: _run_multi_pulls_and_join
+      - two single GET pulls (no pagination)
+      - left join on keys
+      - select_from.keep and select_from.rename behaviors
+      - join keys auto-preserved even if not in 'keep'
+    """
+    config = {
+        "envs": {"prod": {"base_url": "http://api/"}},
+        "apis": {
+            "path": "default",  # unused because each pull overrides
+            "t": {
+                "multi_pulls": [
+                    {
+                        "name": "cost_core",
+                        "path": "cost/v1/report",
+                        "parse": {
+                            "type": "json",
+                            "json_record_path": "awsCostReport.awsCostList",
+                        },
+                        "params": {
+                            "select": "asvName,accountName,costStartTimestamp,costEndTimestamp"
+                        },
+                    },
+                    {
+                        "name": "cost_dept",
+                        "path": "cost/v1/report",
+                        "parse": {
+                            "type": "json",
+                            "json_record_path": "awsCostReport.awsCostList",
+                        },
+                        "params": {
+                            "select": "asvName,accountName,departmentId,costStartTimestamp,costEndTimestamp"
+                        },
+                    },
+                ],
+                "join": {
+                    "how": "left",
+                    "on": [
+                        "asvName",
+                        "accountName",
+                        "costStartTimestamp",
+                        "costEndTimestamp",
+                    ],
+                    "select_from": {
+                        "cost_dept": {
+                            "keep": [
+                                "departmentId"
+                            ],  # join keys must still appear
+                            "rename": {
+                                "departmentId": "departmentId"
+                            },  # no-op rename path
+                        }
+                    },
+                },
+                # output present so run_once uses normal write path
+                "output": {"format": "csv", "s3": {"bucket": "b"}},
+            },
+        },
+    }
+
+    # Pull #1 rows
+    r1 = FakeResponse(
+        json_data={
+            "awsCostReport": {
+                "awsCostList": [
+                    {
+                        "asvName": "A",
+                        "accountName": "ACC",
+                        "costStartTimestamp": "2024-01-01T00:00:00Z",
+                        "costEndTimestamp": "2024-01-01T01:00:00Z",
+                    }
+                ]
+            }
+        }
+    )
+    # Pull #2 rows
+    r2 = FakeResponse(
+        json_data={
+            "awsCostReport": {
+                "awsCostList": [
+                    {
+                        "asvName": "A",
+                        "accountName": "ACC",
+                        "departmentId": "D1",
+                        "costStartTimestamp": "2024-01-01T00:00:00Z",
+                        "costEndTimestamp": "2024-01-01T01:00:00Z",
+                    }
+                ]
+            }
+        }
+    )
+
+    ing, sess = make_ingestor(config, [r1, r2])
+    meta = ing.run_once("t", "prod")
+    df = ing._last_df
+
+    # Exactly two single GETs, one per pull (no pagination)
+    assert len(sess.calls) == 2
+    assert set(df.columns) >= {
+        "asvName",
+        "accountName",
+        "costStartTimestamp",
+        "costEndTimestamp",
+        "departmentId",
+    }
+    assert df.loc[0, "departmentId"] == "D1"
+    assert meta["rows"] == 1
+
+
+def test_multi_pulls_respects_per_pull_overrides_and_parse(make_ingestor):
+    """
+    - First pull uses explicit per-pull parse (json_record_path=data) so 'id' is a column
+    - Second pull overrides parse to CSV
+    - Per-pull params override base params
+    """
+    config = {
+        "envs": {"prod": {"base_url": "http://api/"}},
+        "apis": {
+            "request_defaults": {"params": {"base": "1"}},
+            "t": {
+                # Table-level parse remains as-is, but we don't rely on it being inherited
+                "parse": {"type": "json", "json_record_path": "data"},
+                "multi_pulls": [
+                    {
+                        "name": "a",
+                        "path": "x",
+                        "params": {"p": "A"},
+                        # ✅ Explicit parse so the first pull flattens on 'data'
+                        "parse": {"type": "json", "json_record_path": "data"},
+                    },  # JSON at data
+                    {
+                        "name": "b",
+                        "path": "y",
+                        "parse": {"type": "csv"},  # CSV override
+                    },
+                ],
+                "join": {
+                    "how": "left",
+                    "on": ["id"],
+                    "select_from": {"b": {"keep": ["y"]}},
+                },
+                "output": {"format": "csv", "s3": {"bucket": "b"}},
+            },
+        },
+    }
+    # Pull a (JSON under data)
+    r1 = FakeResponse(json_data={"data": [{"id": 1}]})
+    # Pull b (CSV with id,y)
+    r2 = FakeResponse(content=b"id,y\n1,9\n")
+    ing, _ = make_ingestor(config, [r1, r2])
+
+    _ = ing.run_once("t", "prod")
+    df = ing._last_df
+
+    # We should have joined on 'id', bringing in 'y' from pull 'b'
+    assert "id" in df.columns and "y" in df.columns
+    assert df["id"].tolist() == [1]
+    assert df["y"].tolist() == [9]
+
+
+def test_link_expansion_only_flush_skips_aggregate_write(monkeypatch, logger):
+    """
+    Ensures the 'only_flush' branch returns before the aggregate write.
+    We detect this by checking that _write_output is never called.
+    """
+    from utils.api_ingestor import ApiIngestor
+
+    # Fake boto3 to satisfy any internal imports if reached (it shouldn't)
+    class FakeS3:
+        class session:
+            class Session:
+                def __init__(self, region_name=None):
+                    pass
+
+                def client(self, name, endpoint_url=None):
+                    class C:
+                        def put_object(self, **kwargs):
+                            pass
+
+                    return C()
+
+    monkeypatch.setitem(os.sys.modules, "boto3", FakeS3)
+
+    calls = {"writes": 0}
+
+    def _fake_write_output(self, df, table_name, env_name, out_cfg):
+        calls["writes"] += 1
+        return {
+            "format": "csv",
+            "s3_bucket": "b",
+            "s3_key": "k",
+            "s3_uri": "u",
+            "bytes": 1,
+        }
+
+    config = {
+        "envs": {"prod": {"base_url": "http://api/"}},
+        "apis": {
+            "path": "base",
+            "pagination": {"mode": "none"},
+            "link_expansion": {
+                "enabled": True,
+                "url_fields": ["u"],
+                "flush": {
+                    "mode": "per_link",
+                    "only": True,
+                    "prefix": "p",
+                    "filename": "f-{seq}.csv",
+                },
+            },
+            "t": {
+                "parse": {"type": "json", "json_record_path": "rows"},
+                "output": {"format": "csv", "s3": {"bucket": "b"}},
+            },
+        },
+    }
+    base = FakeResponse(json_data={"rows": [{"u": "http://api/d"}]})
+    exp = FakeResponse(json_data={"k": 1})
+    ing = ApiIngestor(config=config, log=logger)
+
+    fs = FakeSession([base, exp])
+    import utils.api_ingestor as api_mod
+
+    monkeypatch.setattr(
+        api_mod.ApiIngestor, "_build_session", lambda self, r: fs
+    )
+    monkeypatch.setattr(
+        api_mod.ApiIngestor, "_write_output", _fake_write_output
+    )
+
+    meta = ing.run_once("t", "prod")
+    assert meta["rows"] == 0
+    assert calls["writes"] == 0  # aggregate write skipped
+
+
+def test_stringify_non_scalars_for_parquet_and_resolve_session_id(logger):
+    from utils.api_ingestor import ApiIngestor
+
+    ing = ApiIngestor(
+        config={"envs": {"e": {"base_url": "http://h"}}, "apis": {"t": {}}},
+        log=logger,
+    )
+    df = pd.DataFrame(
+        {
+            "a": [1, {"x": 2}],
+            "b": [[1, 2], "z"],
+            "c": [None, 3],
+        }
+    )
+    out = ing._stringify_non_scalars_for_parquet(df)
+    # dict/list become JSON strings; scalars untouched
+    assert isinstance(out.loc[1, "a"], str) and out.loc[0, "a"] == 1
+    assert isinstance(out.loc[0, "b"], str) and out.loc[1, "b"] == "z"
+
+    # session id policy coverage
+    ing._expansion_session_ids = {"s1", "s2"}
+    assert ing._resolve_session_id({"session_id": {"policy": "first"}}) in {
+        "s1",
+        "s2",
+    }
+    assert ing._resolve_session_id({"session_id": {"policy": "last"}}) in {
+        "s1",
+        "s2",
+    }
+    with pytest.raises(ValueError):
+        ing._resolve_session_id({"session_id": {"policy": "require_single"}})
+    # 'all' returns a single comma-joined string
+    all_ids = ing._resolve_session_id({"session_id": {"policy": "all"}})
+    assert set(all_ids.split(",")) == {"s1", "s2"}

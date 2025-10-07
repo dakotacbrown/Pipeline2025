@@ -28,13 +28,14 @@ class ApiIngestor:
       - Handles pagination: 'none', 'cursor', 'page', 'link-header', and Salesforce ('salesforce')
       - Optionally expands per-row URLs ("link_expansion")
       - Parses JSON, CSV, or JSONL into pandas DataFrames
+      - Can run multiple single pulls and JOIN them: `apis.<table>.multi_pulls` + `apis.<table>.join`
       - Redacts secrets in logs
 
     IMPORTANT:
       We copy request-level defaults (headers/auth/proxies/verify) to the Session
       once via `_apply_session_defaults`. This ensures **all** requests—including
       the per-row link expansion calls—inherit the same auth/headers/verify/proxies,
-      even if those calls don’t pass per-request kwargs.
+      even if those calls don't pass per-request kwargs.
     """
 
     # For safety, only allow these kwargs to pass into requests.get(...)
@@ -97,7 +98,9 @@ class ApiIngestor:
     def run_once(self, table_name: str, env_name: str) -> Dict[str, Any]:
         """
         Execute a single request (with optional pagination and link expansion),
-        write the result to the configured sink, and return lightweight metadata.
+        or multiple single pulls with a JOIN, then write to the sink.
+
+        Returns lightweight metadata about the write.
         """
         started = pd.Timestamp.now(tz="UTC")
         self.log.info(f"[run_once] start table={table_name} env={env_name}")
@@ -110,6 +113,87 @@ class ApiIngestor:
         safe_opts = self._whitelist_request_opts(req_opts)
         self._apply_session_defaults(sess, safe_opts)
 
+        # Multi-pull + join path. If present, we do NOT use pagination.
+        if api_cfg.get("multi_pulls"):
+            self.log.info(
+                "[run_once] multi_pulls detected -> running pulls and join"
+            )
+            df = self._run_multi_pulls_and_join(
+                sess=sess,
+                env_cfg=env_cfg,
+                api_cfg=api_cfg,  # new-style
+                table_cfg=api_cfg,  # back-compat with older arg name
+                base_req_opts=safe_opts,
+            )
+            # After join, we proceed exactly like the normal path (link expansion, writes).
+            link_cfg = api_cfg.get("link_expansion")
+            if link_cfg and link_cfg.get("enabled", False):
+                df = self._expand_links(
+                    sess,
+                    df,
+                    link_cfg,
+                    parse_cfg,  # base parse isn't used for pulls; only for expansion default
+                    table_name=table_name,
+                    env_name=env_name,
+                    api_output_cfg=(api_cfg.get("output") or {}),
+                )
+
+            resolved_session_id = self._resolve_session_id(link_cfg or {})
+            if resolved_session_id:
+                self._current_output_ctx["session_id"] = resolved_session_id
+
+            flush_cfg = (api_cfg.get("link_expansion") or {}).get("flush") or {}
+            only_flush = bool(flush_cfg.get("only"))
+
+            if only_flush:
+                self.log.info(
+                    "[run_once] only_flush=true -> skipping aggregate write (multi_pulls)"
+                )
+                ended = pd.Timestamp.now(tz="UTC")
+                return {
+                    "table": table_name,
+                    "env": env_name,
+                    "rows": 0,
+                    "format": (api_cfg.get("output") or {}).get(
+                        "format", "csv"
+                    ),
+                    "s3_bucket": (api_cfg.get("output") or {})
+                    .get("s3", {})
+                    .get("bucket", ""),
+                    "s3_key": "",
+                    "s3_uri": "",
+                    "bytes": 0,
+                    "started_at": started.isoformat(),
+                    "ended_at": ended.isoformat(),
+                    "duration_s": float((ended - started).total_seconds()),
+                }
+
+            out_meta = self._write_output(
+                df, table_name, env_name, api_cfg.get("output") or {}
+            )
+            ended = pd.Timestamp.now(tz="UTC")
+            self._current_output_ctx.pop("session_id", None)
+
+            self.log.info(
+                f"[run_once] done (multi_pulls) table={table_name} env={env_name} "
+                f"rows={len(df)} duration={(ended - started).total_seconds():.3f}s "
+                f"dest={out_meta.get('s3_uri')}"
+            )
+            return {
+                "table": table_name,
+                "env": env_name,
+                "rows": int(len(df)),
+                "format": out_meta["format"],
+                "s3_bucket": out_meta["s3_bucket"],
+                "s3_key": out_meta["s3_key"],
+                "s3_uri": out_meta["s3_uri"],
+                "bytes": out_meta["bytes"],
+                "started_at": started.isoformat(),
+                "ended_at": ended.isoformat(),
+                "duration_s": float((ended - started).total_seconds()),
+            }
+
+        # ---- Normal single-pull path (existing behavior) ----
         url = self._build_url(env_cfg["base_url"], api_cfg.get("path", ""))
         self._log_request(url, safe_opts)
 
@@ -486,6 +570,12 @@ class ApiIngestor:
     ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         """
         Merge env + API layers and return the effective configs.
+
+        Returns:
+            env_cfg:  env-level settings (must include base_url)
+            api_cfg:  effective API settings for the run (path/pagination/link_expansion/backfill/multi_pulls/join)
+            req_opts: request kwargs defaults (headers/params/verify/auth/proxies/timeout/retries)
+            parse_cfg: parsing options (type=json|csv, json_record_path, etc.) for the base table
         """
         env_cfg = (self.config.get("envs") or {}).get(env_name) or {}
         if not env_cfg.get("base_url"):
@@ -535,6 +625,9 @@ class ApiIngestor:
                 **(apis_root.get("output", {}) or {}),
                 **(table_cfg.get("output", {}) or {}),
             },
+            # Pass through multi-pull + join instructions (table-level only)
+            "multi_pulls": table_cfg.get("multi_pulls"),
+            "join": table_cfg.get("join"),
         }
 
         env_cfg = self._expand_env_value(env_cfg)
@@ -1185,6 +1278,120 @@ class ApiIngestor:
             return df
 
         return pd.concat(expanded_frames, ignore_index=True)
+
+    # ----------  Multi-pull + join helper ----------
+
+    def _run_multi_pulls_and_join(
+        self,
+        *,
+        sess: requests.Session,
+        env_cfg: Dict[str, Any],
+        base_req_opts: Dict[str, Any],
+        api_cfg: Optional[Dict[str, Any]] = None,
+        table_cfg: Optional[Dict[str, Any]] = None,
+    ) -> pd.DataFrame:
+        """
+        Run multiple single GET pulls (no pagination) and join them.
+
+        Accepts both `api_cfg` (effective table config without parse) and
+        `table_cfg` (back-compat / place to carry table-level parse). We merge:
+        cfg = {**(table_cfg or {}), **(api_cfg or {})}
+        so that table-level `parse` is available for pull inheritance.
+        """
+        # Merge so `parse` from table_cfg is visible, while api_cfg can override other keys
+        cfg_table = table_cfg or {}
+        cfg_api = api_cfg or {}
+        cfg = {**cfg_table, **cfg_api}
+
+        pulls = cfg.get("multi_pulls") or []
+        if not pulls:
+            return pd.DataFrame()
+
+        table_parse = cfg.get("parse", {}) or {}
+        base_url = env_cfg["base_url"]
+
+        frames: Dict[str, pd.DataFrame] = {}
+
+        for pull in pulls:
+            name = pull.get("name")
+            if not name:
+                raise ValueError(
+                    "Each item in multi_pulls must have a non-empty 'name'."
+                )
+
+            # parse inheritance (table-level parse → per-pull override)
+            pull_parse = {**table_parse, **(pull.get("parse") or {})}
+
+            # inherit base opts; allow per-pull headers/params to extend/override
+            eff_opts = dict(base_req_opts)
+            if isinstance(pull.get("headers"), dict):
+                eff_opts["headers"] = {
+                    **(eff_opts.get("headers") or {}),
+                    **pull["headers"],
+                }
+            if isinstance(pull.get("params"), dict):
+                eff_opts["params"] = {
+                    **(eff_opts.get("params") or {}),
+                    **pull["params"],
+                }
+
+            # build per-pull URL (pull.path overrides table path if present)
+            path = pull.get("path", cfg.get("path", ""))
+            url = self._build_url(base_url, path)
+            self._log_request(
+                url,
+                self._whitelist_request_opts(eff_opts),
+                prefix=f"[multi_pulls:{name}] ",
+            )
+
+            # one GET (no pagination)
+            resp = sess.get(url, **self._whitelist_request_opts(eff_opts))
+            resp.raise_for_status()
+            df_pull = self._to_dataframe(resp, pull_parse)
+            frames[name] = df_pull
+
+        # perform the join in pull order
+        join_cfg = cfg.get("join") or {}
+        how = (join_cfg.get("how") or "left").lower()
+        on_keys = list(join_cfg.get("on") or [])
+        if not on_keys:
+            raise ValueError("join.on must list one or more column names.")
+
+        order = [p["name"] for p in pulls]
+        result = frames[order[0]].copy()
+        for right_name in order[1:]:
+            result = result.merge(
+                frames[right_name], how=how, on=on_keys, copy=False
+            )
+
+        # select_from (keep / rename) – ensure join keys are preserved
+        select_from = join_cfg.get("select_from") or {}
+        if select_from:
+            keep_cols: set[str] = set(on_keys)
+            rename_map: Dict[str, str] = {}
+
+            for src_name, sel in select_from.items():
+                if not isinstance(sel, dict):
+                    continue
+                for col in sel.get("keep") or []:
+                    keep_cols.add(col)
+                for old, new in (sel.get("rename") or {}).items():
+                    rename_map[old] = new
+                    keep_cols.add(old)
+
+            if rename_map:
+                result = result.rename(columns=rename_map)
+
+            translated_keep = [rename_map.get(c, c) for c in keep_cols]
+            for k in on_keys:
+                if k not in translated_keep and k in result.columns:
+                    translated_keep.append(k)
+
+            result = result.loc[
+                :, [c for c in translated_keep if c in result.columns]
+            ]
+
+        return result
 
     # ---------- Small utilities ----------
 

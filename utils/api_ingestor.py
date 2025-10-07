@@ -590,12 +590,9 @@ class ApiIngestor:
                 **(apis_root.get("output", {}) or {}),
                 **(table_cfg.get("output", {}) or {}),
             },
+            # Pass through multi-pull + join instructions (table-level only)
             "multi_pulls": table_cfg.get("multi_pulls"),
-            # allow a root default join, overridden by table-level join
-            "join": {
-                **(apis_root.get("join", {}) or {}),
-                **(table_cfg.get("join", {}) or {}),
-            },
+            "join": table_cfg.get("join"),
         }
 
         env_cfg = self._expand_env_value(env_cfg)
@@ -1285,10 +1282,7 @@ class ApiIngestor:
             # Merge headers (pull overrides win)
             if "headers" in pull:
                 base_headers = dict(pull_opts.get("headers") or {})
-                pull_opts["headers"] = {
-                    **base_headers,
-                    **(pull.get("headers") or {}),
-                }
+                pull_opts["headers"] = {**base_headers, **(pull.get("headers") or {})}
 
             # Merge params (pull overrides win)
             base_params = dict(pull_opts.get("params") or {})
@@ -1299,9 +1293,7 @@ class ApiIngestor:
             safe_opts = self._whitelist_request_opts(pull_opts)
 
             # Per-pull parse config (default to table-level parse or JSON)
-            parse_cfg = pull.get("parse") or (
-                api_cfg.get("parse") or {"type": "json"}
-            )
+            parse_cfg = pull.get("parse") or (api_cfg.get("parse") or {"type": "json"})
 
             self._log_request(url, safe_opts, prefix=f"[multi:{name}] ")
             resp_df = self._paginate(
@@ -1397,9 +1389,7 @@ class ApiIngestor:
                 keep_cols = set(str(c) for c in keep_cols)
                 # ensure all right join keys are preserved
                 keep_cols |= set(right_on)
-                right_df = right_df[
-                    [c for c in right_df.columns if c in keep_cols]
-                ]
+                right_df = right_df[[c for c in right_df.columns if c in keep_cols]]
 
             if rename_map:
                 # normalize rename keys if case-insensitive
@@ -1407,11 +1397,7 @@ class ApiIngestor:
                     norm_map = {}
                     lower_map = {c.lower(): c for c in right_df.columns}
                     for src, dst in rename_map.items():
-                        actual = (
-                            src
-                            if src in right_df.columns
-                            else lower_map.get(src.lower())
-                        )
+                        actual = src if src in right_df.columns else lower_map.get(src.lower())
                         if actual:
                             norm_map[actual] = dst
                     rename_map = norm_map
@@ -1426,6 +1412,7 @@ class ApiIngestor:
                 )
 
         return left_df
+
 
     # ---------- Small utilities ----------
 

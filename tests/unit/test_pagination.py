@@ -1,3 +1,5 @@
+from urllib.parse import quote
+
 import pandas as pd
 import pytest
 
@@ -218,19 +220,29 @@ def test_paginate_salesforce_multiple_pages_clear_params(
     base = "https://sf.example/services/data/v61.0/query"
     next_rel = "/services/data/v61.0/query/next123"
 
+    # Build encoded q EXACTLY as the code under test does
+    q_raw = "SELECT Id, Name FROM Account WHERE Name = 'Acme'"
+    encoded_q = quote(q_raw, safe="*(),.:=<>-_'\"$")
+    encoded_first = f"{base}?q={encoded_q}"
+
     sess = FakeSession(
         {
-            base: [
+            encoded_first: [
                 FakeResponse(
                     json_data={
                         "done": False,
-                        "records": [{"Id": "1"}],
+                        "records": [{"Id": "1", "Name": "Acme"}],
                         "nextRecordsUrl": next_rel,
                     }
                 )
             ],
             "https://sf.example/services/data/v61.0/query/next123": [
-                FakeResponse(json_data={"done": True, "records": [{"Id": "2"}]})
+                FakeResponse(
+                    json_data={
+                        "done": True,
+                        "records": [{"Id": "2", "Name": "Acme"}],
+                    }
+                )
             ],
         }
     )
@@ -240,7 +252,8 @@ def test_paginate_salesforce_multiple_pages_clear_params(
     df = pagination.paginate(
         sess,
         base,
-        {"params": {"q": "SOQL", "ignored": "x"}},
+        # q supplied in params; paginate moves it into the URL and removes it from params
+        {"params": {"q": q_raw, "ignored": "x"}},
         parse_cfg,
         {
             "mode": "salesforce",
@@ -250,13 +263,22 @@ def test_paginate_salesforce_multiple_pages_clear_params(
         },
     )
 
-    assert df.to_dict("records") == [{"Id": "1"}, {"Id": "2"}]
-    assert sess.calls[0][0] == base and "params" in sess.calls[0][1]
+    assert df.to_dict("records") == [
+        {"Id": "1", "Name": "Acme"},
+        {"Id": "2", "Name": "Acme"},
+    ]
+
+    # First call uses encoded URL; q removed from params but others remain
+    assert sess.calls[0][0] == encoded_first
+    assert "q" not in sess.calls[0][1]["params"]
+    assert sess.calls[0][1]["params"].get("ignored") == "x"
+
+    # Second call follows nextRecordsUrl; params cleared
     assert (
         sess.calls[1][0]
         == "https://sf.example/services/data/v61.0/query/next123"
     )
-    assert "params" not in sess.calls[1][1]
+    assert "params" not in sess.calls[1][1] or not sess.calls[1][1]["params"]
 
 
 # --- Tests: unsupported mode --------------------------------------------------

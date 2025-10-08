@@ -78,7 +78,7 @@ def test_run_once_single_pull_writes_and_resolves_session_id(
         }
 
     monkeypatch.setattr(
-        "api_ingestor.api_ingestor._write_output",
+        "api_ingestor.api_ingestor.write_output",
         lambda ctx, df, out: fake_write(ctx, df, out),
     )
 
@@ -136,7 +136,7 @@ def test_run_once_multi_pulls_join(monkeypatch, logger, base_config):
     )
 
     monkeypatch.setattr(
-        "api_ingestor.api_ingestor._write_output",
+        "api_ingestor.api_ingestor.write_output",
         lambda ctx, df, out: {
             "format": "jsonl",
             "s3_bucket": "b",
@@ -182,7 +182,7 @@ def test_run_once_flush_only_skips_write(monkeypatch, logger, base_config):
 
     # If this is called, test should fail
     monkeypatch.setattr(
-        "api_ingestor.api_ingestor._write_output",
+        "api_ingestor.api_ingestor.write_output",
         lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("write_output should not be called")
         ),
@@ -228,7 +228,7 @@ def test_run_backfill_cursor_strategy(monkeypatch, logger, base_config):
         "api_ingestor.api_ingestor.apply_session_defaults", lambda *a, **k: None
     )
     monkeypatch.setattr(
-        "api_ingestor.api_ingestor._write_output",
+        "api_ingestor.api_ingestor.write_output",
         lambda ctx, df, out: {
             "format": "jsonl",
             "s3_bucket": "b",
@@ -285,7 +285,7 @@ def test_run_backfill_soql_window(monkeypatch, logger, base_config):
         "api_ingestor.api_ingestor.apply_session_defaults", lambda *a, **k: None
     )
     monkeypatch.setattr(
-        "api_ingestor.api_ingestor._write_output",
+        "api_ingestor.api_ingestor.write_output",
         lambda ctx, df, out: {
             "format": "jsonl",
             "s3_bucket": "b",
@@ -369,7 +369,7 @@ def test_run_backfill_date_window_single_pull(monkeypatch, logger, base_config):
         "api_ingestor.api_ingestor.apply_session_defaults", lambda *a, **k: None
     )
     monkeypatch.setattr(
-        "api_ingestor.api_ingestor._write_output",
+        "api_ingestor.api_ingestor.write_output",
         lambda ctx, df, out: {
             "format": "jsonl",
             "s3_bucket": "b",
@@ -417,7 +417,7 @@ def test_run_backfill_date_window_multi_pulls(monkeypatch, logger, base_config):
         "api_ingestor.api_ingestor.apply_session_defaults", lambda *a, **k: None
     )
     monkeypatch.setattr(
-        "api_ingestor.api_ingestor._write_output",
+        "api_ingestor.api_ingestor.write_output",
         lambda ctx, df, out: {
             "format": "jsonl",
             "s3_bucket": "b",

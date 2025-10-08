@@ -1,5 +1,4 @@
 import pandas as pd
-import pytest
 
 from api_ingestor.small_utils import (
     ALLOWED_REQUEST_KW,

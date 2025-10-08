@@ -324,8 +324,8 @@ def step_sf_config(context):
 
 
 def _install_capture(ingestor, context):
-    # Patch _write_output so we can assert on the produced DataFrame
-    def _capture_write_output(self, df, table_name, env_name, out_cfg):
+    # Patch write_output so we can assert on the produced DataFrame
+    def _capturewrite_output(self, df, table_name, env_name, out_cfg):
         context.df = df.copy()
         return {
             "format": (out_cfg or {}).get("format", "csv"),
@@ -335,7 +335,7 @@ def _install_capture(ingestor, context):
             "bytes": len(df.to_json().encode("utf-8")),
         }
 
-    ingestor._write_output = MethodType(_capture_write_output, ingestor)
+    ingestor.write_output = MethodType(_capturewrite_output, ingestor)
 
 
 @when('I run the ingestor once for table "{table}" in env "{env}"')

@@ -1,7 +1,7 @@
 # tests/unit/test_http_extended.py
 from requests import Session
 
-from api_ingestor import http
+from api_ingestor import request_helpers
 
 
 class CaptureLog:
@@ -18,16 +18,22 @@ class CaptureLog:
 
 def test_build_url_various_slashes():
     # base with trailing, path with leading
-    assert http.build_url("https://api/", "/v1") == "https://api/v1"
+    assert request_helpers.build_url("https://api/", "/v1") == "https://api/v1"
     # base without trailing, path no leading
-    assert http.build_url("https://api", "v1") == "https://api/v1"
+    assert request_helpers.build_url("https://api", "v1") == "https://api/v1"
     # both present, ensure no double slashes
-    assert http.build_url("https://api/", "v1/items") == "https://api/v1/items"
-    assert http.build_url("https://api", "/v1/items") == "https://api/v1/items"
+    assert (
+        request_helpers.build_url("https://api/", "v1/items")
+        == "https://api/v1/items"
+    )
+    assert (
+        request_helpers.build_url("https://api", "/v1/items")
+        == "https://api/v1/items"
+    )
 
 
 def test_build_session_no_retries_returns_session():
-    s = http.build_session(None)
+    s = request_helpers.build_session(None)
     assert isinstance(s, Session)
     # default mounts still exist (requests has some defaults), but our function
     # adds explicit mounts only when retries_cfg is provided, so we just check type here.
@@ -40,7 +46,7 @@ def test_build_session_with_retries_normal_path():
         "status_forcelist": [500],
         "allowed_methods": ["GET", "POST"],
     }
-    s = http.build_session(cfg)
+    s = request_helpers.build_session(cfg)
     assert isinstance(s, Session)
     # verify our adapters were mounted (keys are exactly 'https://' and 'http://')
     assert "https://" in s.adapters
@@ -76,10 +82,10 @@ def test_build_session_fallback_to_method_whitelist(monkeypatch):
             return RetryPhase1(*args, **kwargs)
         return RetryPhase2(*args, **kwargs)
 
-    monkeypatch.setattr(http, "Retry", RetryDispatcher)
+    monkeypatch.setattr(request_helpers, "Retry", RetryDispatcher)
 
     cfg = {"total": 1, "allowed_methods": ["GET"]}
-    s = http.build_session(cfg)
+    s = request_helpers.build_session(cfg)
     assert isinstance(s, Session)
     assert "phase1" in calls["phase"]
     assert "phase2" in calls["phase"]
@@ -89,7 +95,7 @@ def test_build_session_fallback_to_method_whitelist(monkeypatch):
 
 def test_apply_session_defaults_sets_fields():
     s = Session()
-    http.apply_session_defaults(
+    request_helpers.apply_session_defaults(
         s,
         {
             "headers": {"X-Api-Key": "secret"},
@@ -111,7 +117,7 @@ def test_apply_session_defaults_sets_fields():
 def test_log_request_redacts_sensitive_items():
     log = CaptureLog()
     ctx = {"log": log}
-    http.log_request(
+    request_helpers.log_request(
         ctx,
         "https://api/x",
         {
@@ -137,7 +143,7 @@ def test_log_exception_includes_url_and_stacktrace():
     try:
         raise RuntimeError("boom")
     except Exception as e:
-        http.log_exception(ctx, "https://api/x", e, prefix="[E] ")
+        request_helpers.log_exception(ctx, "https://api/x", e, prefix="[E] ")
     assert log.errors, "expected an error log line"
     err = log.errors[-1]
     assert "https://api/x" in err

@@ -5,20 +5,19 @@ import pandas as pd
 
 from api_ingestor.backfill import cursor_backfill, soql_window_backfill
 from api_ingestor.config import prepare
-from api_ingestor.http import (
+from api_ingestor.link_expansion import expand_links, resolve_session_id
+from api_ingestor.multipull import run_multi_pulls_with_join
+from api_ingestor.output import write_output, write_s3
+from api_ingestor.pagination import paginate
+from api_ingestor.parsing import (
+    to_dataframe as _to_dataframe,  # for ctx injection
+)
+from api_ingestor.request_helpers import (
     apply_session_defaults,
     build_session,
     build_url,
     log_exception,
     log_request,
-)
-from api_ingestor.link_expansion import expand_links, resolve_session_id
-from api_ingestor.multipull import run_multi_pulls_with_join
-from api_ingestor.output import write_output as _write_output
-from api_ingestor.output import write_s3 as _write_s3
-from api_ingestor.pagination import paginate
-from api_ingestor.parsing import (
-    to_dataframe as _to_dataframe,  # for ctx injection
 )
 from api_ingestor.small_utils import whitelist_request_opts
 
@@ -51,7 +50,9 @@ class ApiIngestor:
             "expansion_session_ids": set(),
             "flush_seq": 0,
             "to_dataframe": _to_dataframe,
-            "write_s3": lambda df, fmt, s3_cfg: _write_s3(ctx, df, fmt, s3_cfg),
+            "write_s3": lambda df, fmt, s3_cfg: write_s3(
+                ctx, ctx["table"], ctx["env"], df, fmt, s3_cfg
+            ),
             "log_request": log_request,
             "log_exception": log_exception,
         }
@@ -123,7 +124,7 @@ class ApiIngestor:
                     ),
                 }
 
-            out_meta = _write_output(ctx, df, api_cfg.get("output") or {})
+            out_meta = write_output(ctx, df, api_cfg.get("output") or {})
             ended = pd.Timestamp.now(tz="UTC")
             ctx["current_output_ctx"].pop("session_id", None)
 
@@ -183,7 +184,9 @@ class ApiIngestor:
             "expansion_session_ids": set(),
             "flush_seq": 0,
             "to_dataframe": _to_dataframe,
-            "write_s3": lambda df, fmt, s3_cfg: _write_s3(ctx, df, fmt, s3_cfg),
+            "write_s3": lambda df, fmt, s3_cfg: write_s3(
+                ctx, ctx["table"], ctx["env"], df, fmt, s3_cfg
+            ),
             "log_request": log_request,
             "log_exception": log_exception,
         }
@@ -233,7 +236,7 @@ class ApiIngestor:
                     "source_url": url,
                     "pagination_mode": pag_mode,
                 }
-            out_meta = _write_output(ctx, df, api_cfg.get("output") or {})
+            out_meta = write_output(ctx, df, api_cfg.get("output") or {})
             ended = pd.Timestamp.now(tz="UTC")
             self.log.info(
                 f"[run_backfill] done strategy=cursor table={table_name} env={env_name} "
@@ -277,7 +280,7 @@ class ApiIngestor:
             sid = resolve_session_id(ctx["expansion_session_ids"], link_cfg)
             if sid:
                 ctx["current_output_ctx"]["session_id"] = sid
-            out_meta = _write_output(ctx, df, api_cfg.get("output") or {})
+            out_meta = write_output(ctx, df, api_cfg.get("output") or {})
             ended = pd.Timestamp.now(tz="UTC")
             self.log.info(
                 f"[run_backfill] done strategy=soql_window table={table_name} env={env_name} "
@@ -372,7 +375,7 @@ class ApiIngestor:
         sid = resolve_session_id(ctx["expansion_session_ids"], link_cfg)
         if sid:
             ctx["current_output_ctx"]["session_id"] = sid
-        out_meta = _write_output(ctx, result, api_cfg.get("output") or {})
+        out_meta = write_output(ctx, result, api_cfg.get("output") or {})
         ended = pd.Timestamp.now(tz="UTC")
 
         self.log.info(

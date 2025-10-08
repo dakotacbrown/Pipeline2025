@@ -67,8 +67,7 @@ def build_session(retries_cfg: Optional[Dict[str, Any]]) -> Session:
             )
         except TypeError:
             r = Retry(**base_kwargs, method_whitelist=allowed_set)
-    if hasattr(r, "respect_retry_after_header"):
-        setattr(r, "respect_retry_after_header", True)
+
     adapter = HTTPAdapter(max_retries=r)
     s.mount("https://", adapter)
     s.mount("http://", adapter)

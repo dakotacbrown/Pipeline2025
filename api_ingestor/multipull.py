@@ -3,8 +3,8 @@ from typing import Any, Dict, List
 import pandas as pd
 from requests import Session
 
-from api_ingestor.http import build_url, log_request
 from api_ingestor.pagination import paginate
+from api_ingestor.request_helpers import build_url, log_request
 from api_ingestor.small_utils import whitelist_request_opts
 
 

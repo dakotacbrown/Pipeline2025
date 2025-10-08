@@ -1,6 +1,4 @@
-# tests/unit/test_backfill_extended.py
-import types
-from datetime import date, timedelta
+from datetime import date
 
 import pandas as pd
 import pytest

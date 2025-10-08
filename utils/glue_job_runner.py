@@ -71,7 +71,7 @@ def _parse_args():
     args, unknown = parser.parse_known_args()
     if unknown:
         print(
-            f"[runner] Ignoring unknown args: {unknown[:8]}{' ...' if len(unknown)>8 else ''}"
+            f"[runner] Ignoring unknown args: {unknown[:8]}{' ...' if len(unknown) > 8 else ''}"
         )
     return args
 

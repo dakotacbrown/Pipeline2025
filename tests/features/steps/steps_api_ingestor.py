@@ -8,7 +8,7 @@ import pandas as pd
 import responses
 from behave import given, then, when
 
-from utils.api_ingestor import ApiIngestor
+from api_ingestor import ApiIngestor
 
 
 @given('a base API host "{base}"')

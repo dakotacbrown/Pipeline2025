@@ -2,7 +2,6 @@ from logging import Logger
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pandas as pd
 import pytest
 
 import utils.helper_functions as hf

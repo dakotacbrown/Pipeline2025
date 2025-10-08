@@ -1,155 +1,143 @@
+# =========================
+# Config template (ApiIngestor)
+# =========================
+
+# ---------- Environments ----------
 envs:
   prod:
     base_url: "https://api.example.com/"
   sf:
-    base_url: "https://mydomain.my.salesforce.com/"
+    base_url: "https://yourdomain.my.salesforce.com/"
   logs:
     base_url: "https://logrocket.example.com/"
 
+# ---------- APIs root ----------
 apis:
-  # ---------- Global request defaults (merged under each table) ----------
+  # (Optional) global request defaults merged into each table's request:
   request_defaults:
     headers:
-      Authorization: "Bearer ${TOKEN}"         # env-substituted
-      X-Client: "ingestor/1.0"
+      Authorization: "Bearer ${API_TOKEN}"   # env-substitution supported
+      X-Client: "my-ingestor"
+    params:
+      locale: "en-US"
     timeout: 30
     verify: true
-
-  # Optional global retry policy (urllib3 Retry via HTTPAdapter)
+    proxies: {}          # e.g. { https: "http://proxy:8080" }
+  # (Optional) global retries used unless table overrides:
   retries:
-    total: 5
-    connect: 5
-    read: 5
-    backoff_factor: 0.8
+    total: 3
+    connect: 3
+    read: 3
+    backoff_factor: 0.5
     status_forcelist: [429, 500, 502, 503, 504]
     allowed_methods: ["GET"]
 
-  # ---------- Global output defaults (S3) ----------
+  # (Optional) global pagination defaults a table can inherit/override:
+  pagination:
+    mode: "none"         # none | cursor | page | link-header | salesforce
+    # cursor-mode example keys:
+    cursor_param: "cursor"
+    next_cursor_path: "meta.next"
+    max_pages: 10000
+    # page-mode example keys:
+    page_param: "page"
+    start_page: 1
+    page_size_param: "pageSize"
+    page_size_value: 100
+    # salesforce-mode example keys:
+    done_path: "done"
+    next_url_path: "nextRecordsUrl"
+    clear_params_on_next: true
+
+  # (Optional) global link-expansion defaults a table can inherit/override:
+  link_expansion:
+    enabled: false
+    url_fields: []        # e.g. ["links.self", "url"]
+    # If expansion payloads need different parsing than the base:
+    # type: json|csv|jsonl
+    # json_record_path: null | "path.to.list"
+    timeout: 30
+    per_request_delay: 0.0
+    # Control writing of expanded payloads:
+    flush:
+      mode: "none"        # none | per_link | per_session
+      prefix: "exp/{env}/{session_id}/{seq}"
+      filename: "{table}-{session_id}-{seq}-{now:%Y%m%dT%H%M%SZ}.jsonl"
+      only: false         # true => do not write aggregate; only write flush parts
+    # Session ID extraction & policy for filenames:
+    session_id:
+      regex: "/sessions/([A-Za-z0-9_-]+)"  # applied on URL
+      group: 1
+      policy: "first"      # first | last | all | require_single
+
+  # (Optional) global output defaults a table can inherit/override:
   output:
-    format: parquet                           # csv | jsonl | parquet
+    format: "parquet"     # csv | parquet | jsonl
+    write_empty: true
     s3:
-      bucket: "${BUCKET}"
-      region_name: "${REGION}"
-      # {session_id} and {seq} become available when link-expansion sets them.
-      prefix: "datalake/{table}/env={env}/dt={today:%Y-%m-%d}"
-      compression: snappy
-      acl: bucket-owner-full-control
+      bucket: "${S3_BUCKET}"
+      prefix: "{table}/env={env}/dt={today:%Y-%m-%d}"
+      filename: "{table}-{now:%Y%m%dT%H%M%SZ}.parquet"
+      region_name: "${AWS_REGION}"
+      endpoint_url: ""     # leave empty for AWS; set for MinIO/Alt S3
+      # ACL / SSE (optional):
+      # acl: "bucket-owner-full-control"
+      # sse: "aws:kms"
+      # sse_kms_key_id: "arn:aws:kms:...."
+      # CSV-specific:
+      sep: ","
+      compression: "snappy"  # parquet: snappy|gzip|zstd|none ; csv: gzip|"" ; jsonl: ignored
+      index: false
 
-  # ======================================================================
-  # =============== EXAMPLE 1: Single pull, no pagination ================
-  # ======================================================================
-  users_table:
-    path: "v1/users"
-    parse:
-      type: json
-      json_record_path: "data"
-    pagination:
-      mode: "none"
-    output:
-      format: parquet    # override only what you need
+  # ========== Example table definitions ==========
 
-  # ======================================================================
-  # =============== EXAMPLE 2: Page-number pagination ====================
-  # ======================================================================
-  paged_items:
+  # 1) Single-pull with pagination
+  my_items:
     path: "v1/items"
     parse:
-      type: json
+      type: "json"
       json_record_path: "items"
-    pagination:
-      mode: "page"
-      page_param: "page"
-      start_page: 1
-      page_size_param: "limit"
-      page_size_value: 100
-
-  # ======================================================================
-  # =============== EXAMPLE 3: Link-header pagination ====================
-  # ======================================================================
-  alpha_feed:
-    path: "alpha"
-    parse:
-      type: json
-      json_record_path: "data"
-    pagination:
-      mode: "link-header"
-
-  # ======================================================================
-  # =============== EXAMPLE 4: Salesforce + SOQL backfill ===============
-  # ======================================================================
-  sf_accounts:
-    path: "services/data/v61.0/query"
-    parse:
-      type: json
-      json_record_path: "records"
-      json_drop_keys_any_depth: ["attributes"]
-    pagination:
-      mode: "salesforce"
-      done_path: "done"
-      next_url_path: "nextRecordsUrl"
-      clear_params_on_next: true
-    backfill:
-      enabled: true
-      strategy: "soql_window"
-      window_days: 1
-      date_field: "LastModifiedDate"
-      date_format: "%Y-%m-%dT%H:%M:%SZ"
-      soql_template: "SELECT Id, Name FROM Account WHERE {date_field} >= {start} AND {date_field} < {end}"
-
-  # ======================================================================
-  # =============== EXAMPLE 5: Cursor backfill + link expansion ==========
-  # =============== (JSONL, session-id extraction, per-link flush) =======
-  # ======================================================================
-  logrocket_sessions:
-    path: "api/sessions"
-    parse:
-      type: json
-      json_record_path: "data"
+      # Drop noisy keys anywhere in the JSON (optional):
+      # json_drop_keys_any_depth: ["attributes", "links"]
     pagination:
       mode: "cursor"
       cursor_param: "cursor"
       next_cursor_path: "meta.next"
-      page_size_param: "limit"
-      page_size_value: 100
-      max_pages: 100000
-
-    # Cursor backfill with time guard
+      max_pages: 500
+    # Request overrides (merged with request_defaults above):
+    headers:
+      X-Feature-Flag: "ingest-items"
+    params:
+      includeArchived: "false"
+    retries:
+      total: 5            # override global
+      backoff_factor: 0.25
     backfill:
       enabled: true
-      strategy: "cursor"
+      strategy: "date"    # date | cursor | soql_window
+      # date strategy:
+      window_days: 7
+      start_param: "start_date"
+      end_param: "end_date"
+      date_format: "%Y-%m-%d"
+      per_request_delay: 0.0
+      # cursor strategy:
       cursor:
-        start_value: "${START_CURSOR}"   # optional; can be omitted
+        start_value: ""   # seed
+        stop_at_item:
+          field: "id"
+          value: ""       # stop when first seen
+          inclusive: false
         stop_when_older_than:
-          field: "createdAt"             # field in the base list rows
-          value: "${STOP_ISO}"           # e.g., 2024-01-01T00:00:00Z
-
-    # Expand each row's detail link (JSONL payloads), write each session immediately
+          field: "updatedAt"
+          value: ""       # ISO date/time
     link_expansion:
-      enabled: true
-      url_fields: ["url"]
-      type: jsonl
-      session_id:
-        regex: (?<=c1s-cos-)[0-9a-f]-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[0-9a-f](?=\?|/|$)
-        group: 0
-      flush:
-        mode: per_session
-        prefix: "test/logrocket/{table}/{today:year=%Y/month=%m/day=%d/hour=%H}"
-        filename: "session_{session_id}.parquet"
-        only: true            # <-- NEW: write only flushed session files
+      enabled: false
+      url_fields: []
 
-    output:
-      format: jsonl
-      s3:
-        # Final aggregate output (if any) can also use session_id if the policy sets it
-        prefix: "logs/{table}/env={env}/final/dt={today:%Y-%m-%d}"
-        filename: "{table}-{now:%Y%m%dT%H%M%SZ}.jsonl"
-
-  # ======================================================================
-  # =============== EXAMPLE 6: Multi-pull join (AWS cost keys) ===========
-  # =============== Two pulls merged with left join on fields ============
-  # ======================================================================
+  # 2) Multi-pulls + join
   aws_cost:
-    path: "cost/v1/report"    # default for both pulls
+    path: "cost/v1/report"  # default for pulls
     multi_pulls:
       - name: "cost_core"
         path: "cost/v1/report"
@@ -163,7 +151,6 @@ apis:
           select: "AsvName,AccountName,Region,ServiceType,Environment,costStartTimestamp,costEndTimestamp"
           sumBy: "Hour"
           isFinanceView: true
-
       - name: "cost_dept"
         path: "cost/v1/report"
         parse:
@@ -176,46 +163,86 @@ apis:
           select: "AsvName,AccountName,DepartmentId,costStartTimestamp,costEndTimestamp"
           sumBy: "Hour"
           isFinanceView: true
-
-    # Join instructions
     join:
-      how: "left"
-      on:
-        - "asvName"
-        - "accountName"
-        - "costStartTimestamp"
-        - "costEndTimestamp"
+      how: "left"          # left | inner | right | outer
+      on: ["asvName", "accountName", "costStartTimestamp", "costEndTimestamp"]
+      case: "ignore"       # exact | lower | upper | ignore
       select_from:
         cost_dept:
-          keep: ["departmentId"]
+          keep: ["departmentId"]     # join keys auto-kept
           rename:
-            departmentId: "departmentId"     # example no-op
-
-    backfill:
-      enabled: false
-
+            departmentId: "departmentId"  # no-op example
     output:
-      format: parquet
+      format: "parquet"
       s3:
+        bucket: "${S3_BUCKET}"
         prefix: "aws_cost/{table}/env={env}/dt={today:%Y-%m-%d}"
-        compression: snappy
+        filename: "{table}-{now:%Y%m%dT%H%M%SZ}.parquet"
+        compression: "snappy"
 
-  # ======================================================================
-  # =============== (Optional) Cursor-only example without links =========
-  # ======================================================================
-  cursor_feed:
-    path: "v1/cur"
+  # 3) Salesforce (SOQL) with SF pagination + windowed backfill
+  sf_accounts:
+    path: "/services/data/v61.0/query"
     parse:
-      type: json
-      json_record_path: "data"
+      type: "json"
+      json_record_path: "records"
+      json_drop_keys_any_depth: ["attributes"]
     pagination:
-      mode: "cursor"
-      cursor_param: "cursor"
-      next_cursor_path: "meta.next"
-      page_size_param: "limit"
-      page_size_value: 200
+      mode: "salesforce"
+      done_path: "done"
+      next_url_path: "nextRecordsUrl"
+      clear_params_on_next: true
+      max_pages: 10000
     backfill:
       enabled: true
-      strategy: "cursor"
-      cursor:
-        start_value: "s0"
+      strategy: "soql_window"
+      window_days: 1
+      date_field: "LastModifiedDate"
+      date_format: "%Y-%m-%dT%H:%M:%SZ"
+      per_request_delay: 0.0
+      # Fill this with your SELECT template; placeholders are {date_field}, {start}, {end}
+      soql_template: >
+        SELECT Id, Name, LastModifiedDate
+        FROM Account
+        WHERE {date_field} >= {start} AND {date_field} < {end}
+    output:
+      format: "jsonl"
+      s3:
+        bucket: "${S3_BUCKET}"
+        prefix: "salesforce/account/env={env}/dt={today:%Y-%m-%d}"
+        filename: "{table}-{now:%Y%m%dT%H%M%SZ}.jsonl"
+
+  # 4) Logs with link expansion & per-session flush
+  log_sessions:
+    path: "/v1/sessions"
+    parse:
+      type: "json"
+      json_record_path: "sessions"
+    pagination:
+      mode: "page"
+      page_param: "page"
+      start_page: 1
+      page_size_param: "limit"
+      page_size_value: 200
+    link_expansion:
+      enabled: true
+      url_fields: ["links.events"]
+      type: "jsonl"            # event stream as NDJSON
+      json_record_path: null   # ignore base record path for expansion
+      flush:
+        mode: "per_session"
+        prefix: "logs/{env}/{session_id}"
+        filename: "{table}-{session_id}-{seq}-{now:%Y%m%dT%H%M%SZ}.jsonl"
+        only: false
+      session_id:
+        regex: "/sessions/([A-Za-z0-9_-]+)/events"
+        group: 1
+        policy: "require_single"
+    output:
+      format: "csv"
+      s3:
+        bucket: "${S3_BUCKET}"
+        prefix: "logs/{table}/env={env}/dt={today:%Y-%m-%d}"
+        filename: "{table}-{now:%Y%m%dT%H%M%SZ}.csv"
+        compression: ""        # "" or "gzip"
+        index: false

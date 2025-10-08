@@ -12,7 +12,7 @@ from zipfile import ZipFile
 import yaml  # pyyaml must be available in the job/bundle
 
 # Your ingestor implementation
-from utils.api_ingestor import ApiIngestor
+from api_ingestor import ApiIngestor
 
 LOG = logging.getLogger("ingestor_wrapper")
 if not LOG.handlers:
@@ -26,8 +26,9 @@ if not LOG.handlers:
 # Helpers: load YAML from disk or from any .zip found on sys.path
 # ---------------------------------------------------------------------
 def _zip_candidates_from_sys_path() -> list[Path]:
-    """
-    Find any .zip files referenced by sys.path entries. Handles entries like:
+    """Find any .zip files referenced by sys.path entries.
+
+    Handles entries like:
       '<zip>.zip', '<zip>.zip/', '<zip>.zip/Python', etc.
     Returns unique, existing Paths to the .zip files.
     """
@@ -51,12 +52,9 @@ def _zip_candidates_from_sys_path() -> list[Path]:
 
 
 def _read_text_from_zip(zip_path: Path, inner_path: str) -> Optional[str]:
-    """
-    Try to read a file from a zip, considering common subpath layouts:
-      inner_path
-      Python/inner_path
-      <zip_stem>/inner_path
-      <zip_stem>/Python/inner_path
+    """Try to read a file from a zip, considering common subpath layouts:
+
+    inner_path   Python/inner_path   <zip_stem>/inner_path <zip_stem>/Python/inner_path
     Returns the text or None if not found.
     """
     inner = inner_path.lstrip("/")
@@ -79,9 +77,7 @@ def _read_text_from_zip(zip_path: Path, inner_path: str) -> Optional[str]:
 
 
 def _load_yaml_from_anywhere(yaml_path: str) -> Dict[str, Any]:
-    """
-    Load YAML from disk (if present) or from any zip on sys.path (Glue job style).
-    """
+    """Load YAML from disk (if present) or from any zip on sys.path (Glue job style)."""
     p = Path(yaml_path)
     if p.exists():
         LOG.info("Loading YAML from filesystem: %s", p)
@@ -109,8 +105,7 @@ def run_ingestor(
     start: Optional[str] = None,
     end: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Execute the ApiIngestor and return the metadata dict.
+    """Execute the ApiIngestor and return the metadata dict.
 
     Args:
         table:     Table key under 'apis' in the YAML (e.g. 'events_api').

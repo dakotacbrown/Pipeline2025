@@ -10,19 +10,14 @@ from api_ingestor.pagination import paginate
 from api_ingestor.parsing import to_dataframe
 from api_ingestor.small_utils import dig, whitelist_request_opts
 
+# backfill.py
+
 
 def cursor_backfill(
-    ctx: Dict[str, Any],
-    sess: Session,
-    url: str,
-    base_opts: Dict[str, Any],
-    parse_cfg: Dict[str, Any],
-    pag_cfg: Dict[str, Any],
-    cur_cfg: Dict[str, Any],
-    link_cfg: Dict[str, Any],
-) -> pd.DataFrame:
+    ctx, sess, url, base_opts, parse_cfg, pag_cfg, cur_cfg, link_cfg
+):
     safe = whitelist_request_opts(dict(base_opts))
-    frames: List[pd.DataFrame] = []
+    frames = []
 
     start_value = (cur_cfg or {}).get("start_value")
     cursor_param = (pag_cfg or {}).get("cursor_param", "cursor")
@@ -35,6 +30,7 @@ def cursor_backfill(
     chain_field = (pag_cfg or {}).get("chain_field")
     max_pages = int((pag_cfg or {}).get("max_pages", 10000))
 
+    # stop guards
     stop_item = (cur_cfg or {}).get("stop_at_item") or {}
     stop_field = stop_item.get("field")
     stop_value = stop_item.get("value")
@@ -57,6 +53,7 @@ def cursor_backfill(
         resp.raise_for_status()
         df_page = to_dataframe(resp, parse_cfg)
 
+        # stop-by-item
         if (
             stop_field
             and stop_value
@@ -71,20 +68,11 @@ def cursor_backfill(
                     if stop_inclusive
                     else df_page.loc[:idx].iloc[:-1]
                 )
-                if link_cfg.get("enabled", False) and not df_page.empty:
-                    df_page = expand_links(
-                        ctx,
-                        sess,
-                        df_page,
-                        link_cfg,
-                        parse_cfg,
-                        table_name=None,
-                        env_name=None,
-                        api_output_cfg=None,
-                    )
-                frames.append(df_page)
+                if not df_page.empty:
+                    frames.append(df_page)
                 break
 
+        # stop-by-time
         if (
             stop_dt is not None
             and not df_page.empty
@@ -97,35 +85,13 @@ def cursor_backfill(
             if not keep_mask.all():
                 trimmed = df_page[keep_mask]
                 if not trimmed.empty:
-                    if link_cfg.get("enabled", False):
-                        trimmed = expand_links(
-                            ctx,
-                            sess,
-                            trimmed,
-                            link_cfg,
-                            parse_cfg,
-                            table_name=None,
-                            env_name=None,
-                            api_output_cfg=None,
-                        )
                     frames.append(trimmed)
                 break
-
-        if link_cfg.get("enabled", False) and not df_page.empty:
-            df_page = expand_links(
-                ctx,
-                sess,
-                df_page,
-                link_cfg,
-                parse_cfg,
-                table_name=None,
-                env_name=None,
-                api_output_cfg=None,
-            )
 
         if not df_page.empty:
             frames.append(df_page)
 
+        # advance cursor
         if next_cursor_path:
             token = dig(resp.json(), next_cursor_path)
             if token:
@@ -148,7 +114,21 @@ def cursor_backfill(
 
         pages += 1
 
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    # single-shot expansion (matches run_once)
+    if link_cfg.get("enabled", False) and not result.empty:
+        result = expand_links(
+            ctx,
+            sess,
+            result,
+            link_cfg,
+            parse_cfg,
+            table_name=None,
+            env_name=None,
+            api_output_cfg=None,
+        )
+    return result
 
 
 def soql_window_backfill(

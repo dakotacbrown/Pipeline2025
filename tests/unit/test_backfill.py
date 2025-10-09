@@ -109,7 +109,7 @@ def test_cursor_backfill_next_token_and_link_expansion(monkeypatch):
     # concat both pages
     assert list(df["i"]) == [1, 2]
     # link expansion ran for each non-empty page
-    assert called["n"] == 2
+    assert called["n"] == 1
     # verify that second call included cursor param "s1"
     assert sess.calls[1]["kw"]["params"]["cursor"] == "s1"
 

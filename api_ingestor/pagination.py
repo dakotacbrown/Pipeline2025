@@ -12,6 +12,20 @@ from api_ingestor.parsing import (
 from api_ingestor.small_utils import dig, whitelist_request_opts
 
 
+def _encode_soql_for_q(soql: str) -> str:
+    """
+    Encode SOQL for the query component exactly like Insomnia's URL preview:
+    - RFC 3986 percent-encoding for the *query* component
+    - spaces -> %20 (NOT '+')
+    - commas stay ',' (safe)
+    - quotes and operators are percent-encoded
+    """
+    # normalize any accidental lower-case 'z' at end of ISO timestamps
+    soql = soql.replace("z", "Z")
+    # Keep only harmless sub-delims unescaped; notably keep comma
+    return quote(soql, safe="()*._-,")
+
+
 def paginate(
     sess: Session,
     url: str,
@@ -40,17 +54,14 @@ def paginate(
         )
         max_pages = int((pag_cfg or {}).get("max_pages", 10000))
 
-        # --- SOQL ENCODING FIX ---
-        # Salesforce expects the SOQL in the URL with percent-encoded spaces (%20),
-        # not form-style pluses (+). So we move q into the URL ourselves and remove
-        # it from params so requests doesn't re-encode it.
+        # --- Build first URL with encoded 'q' in the URL (not form-encoded) ---
         q = (safe.get("params") or {}).get("q")
         if q:
-            encoded_q = quote(q, safe="*(),.:=<>-_'\"$")
+            encoded_q = _encode_soql_for_q(q)
             base_only = url.split("?", 1)[0]
             first_url = f"{base_only}?q={encoded_q}"
 
-            # remove q from params
+            # remove q from params so requests doesn't re-encode it
             safe = dict(safe)
             ps = dict(safe.get("params") or {})
             ps.pop("q", None)
@@ -60,7 +71,7 @@ def paginate(
                 safe.pop("params", None)
         else:
             first_url = url
-        # -------------------------
+        # ----------------------------------------------------------------------
 
         pages = 0
         next_url = first_url
@@ -92,13 +103,12 @@ def paginate(
 
             pages += 1
 
-        if not frames:
-            return pd.DataFrame()
-        return pd.concat(frames, ignore_index=True)
+        return (
+            pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        )
 
-    # Non-Salesforce modes
-    opts = dict(base_opts)
-    safe = whitelist_request_opts(opts)
+    # ---------- Non-Salesforce modes ----------
+    safe = whitelist_request_opts(dict(base_opts))
 
     if mode in {"cursor", "page"}:
         params = dict(safe.get("params") or {})
@@ -157,6 +167,4 @@ def paginate(
         else:
             raise ValueError(f"Unsupported pagination mode: {mode}")
 
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()

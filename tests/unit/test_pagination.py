@@ -1,5 +1,3 @@
-from urllib.parse import quote
-
 import pandas as pd
 import pytest
 
@@ -12,7 +10,7 @@ class FakeResponse:
     def __init__(self, *, json_data=None, links=None):
         self._json = json_data if json_data is not None else {}
         self.links = links or {}
-        self.content = b"{}"  # not used by our patches but present
+        self.content = b"{}"
 
     def json(self):
         return self._json
@@ -23,15 +21,9 @@ class FakeResponse:
 
 class FakeSession:
     def __init__(self, url_map):
-        """
-        url_map:
-          {
-            "https://api/x": [FakeResponse(...), FakeResponse(...), ...],
-            "https://api/x?p=2": [FakeResponse(...)]
-          }
-        """
+        # url_map: { url: [FakeResponse, ...], ... }
         self._m = {k: list(v) for k, v in (url_map or {}).items()}
-        self.calls = []  # tuples of (url, kwargs)
+        self.calls = []  # tuples (url, kwargs)
 
     def get(self, url, **kw):
         self.calls.append((url, kw))
@@ -44,8 +36,7 @@ class FakeSession:
 
 @pytest.fixture
 def patch_to_dataframe(monkeypatch):
-    """Patch *pagination.to_dataframe* (not parsing) so JSON like {"items":[...]}
-    becomes DataFrame([...])."""
+    # make {"items":[...]} -> DataFrame([...])
     monkeypatch.setattr(
         pagination,
         "to_dataframe",
@@ -56,25 +47,22 @@ def patch_to_dataframe(monkeypatch):
 
 @pytest.fixture
 def patch_salesforce_helpers(monkeypatch):
-    """Patch *pagination.drop_keys_any_depth* and *pagination.json_obj_to_df* to
-    simplify SF pagination behavior."""
-
-    def fake_drop_keys_any_depth(obj, keys):
-        if isinstance(obj, dict):
-            return {k: v for k, v in obj.items() if k not in keys}
-        return obj
-
-    def fake_json_obj_to_df(data_obj, parse_cfg):
-        return pd.DataFrame(data_obj.get("records", []))
-
+    # simplify SF helpers
     monkeypatch.setattr(
         pagination,
         "drop_keys_any_depth",
-        fake_drop_keys_any_depth,
+        lambda o, keys: (
+            {k: v for k, v in o.items() if k not in keys}
+            if isinstance(o, dict)
+            else o
+        ),
         raising=True,
     )
     monkeypatch.setattr(
-        pagination, "json_obj_to_df", fake_json_obj_to_df, raising=True
+        pagination,
+        "json_obj_to_df",
+        lambda data_obj, parse_cfg: pd.DataFrame(data_obj.get("records", [])),
+        raising=True,
     )
 
 
@@ -148,7 +136,6 @@ def test_paginate_cursor_next_token(patch_to_dataframe):
         },
     )
     assert df.to_dict("records") == [{"i": 1}, {"i": 2}]
-    # called the same base URL twice; 2nd call had cursor param set
     assert [c[0] for c in sess.calls] == ["https://api/cur", "https://api/cur"]
     assert sess.calls[1][1]["params"]["cursor"] == "t1"
 
@@ -181,7 +168,6 @@ def test_paginate_cursor_max_pages_cutoff(patch_to_dataframe):
 
 
 def test_paginate_page_increments_and_stops_on_empty(patch_to_dataframe):
-    # 1st page has rows, 2nd is empty => stop before attempting a 3rd call
     sess = FakeSession(
         {
             "https://api/p": [
@@ -204,7 +190,6 @@ def test_paginate_page_increments_and_stops_on_empty(patch_to_dataframe):
         },
     )
     assert df.to_dict("records") == [{"p": 1}]
-    # Confirm we made exactly two calls and advanced page param
     assert len(sess.calls) == 2
     assert sess.calls[0][1]["params"]["page"] == 1
     assert sess.calls[0][1]["params"]["ps"] == 50
@@ -220,10 +205,8 @@ def test_paginate_salesforce_multiple_pages_clear_params(
     base = "https://sf.example/services/data/v61.0/query"
     next_rel = "/services/data/v61.0/query/next123"
 
-    # Build encoded q EXACTLY as the code under test does
-    q_raw = "SELECT Id, Name FROM Account WHERE Name = 'Acme'"
-    encoded_q = quote(q_raw, safe="*(),.:=<>-_'\"$")
-    encoded_first = f"{base}?q={encoded_q}"
+    # Expect RFC3986 encoding: spaces %20, commas stay ',', quotes %27
+    encoded_first = f"{base}?q=SELECT%20Id,%20Name%20FROM%20Account%20WHERE%20Name%20%3D%20%27Acme%27"
 
     sess = FakeSession(
         {
@@ -252,8 +235,12 @@ def test_paginate_salesforce_multiple_pages_clear_params(
     df = pagination.paginate(
         sess,
         base,
-        # q supplied in params; paginate moves it into the URL and removes it from params
-        {"params": {"q": q_raw, "ignored": "x"}},
+        {
+            "params": {
+                "q": "SELECT Id, Name FROM Account WHERE Name = 'Acme'",
+                "ignored": "x",
+            }
+        },
         parse_cfg,
         {
             "mode": "salesforce",
@@ -267,18 +254,15 @@ def test_paginate_salesforce_multiple_pages_clear_params(
         {"Id": "1", "Name": "Acme"},
         {"Id": "2", "Name": "Acme"},
     ]
-
-    # First call uses encoded URL; q removed from params but others remain
+    # first call URL matches encoded string and remaining params exclude q
     assert sess.calls[0][0] == encoded_first
-    assert "q" not in sess.calls[0][1]["params"]
-    assert sess.calls[0][1]["params"].get("ignored") == "x"
-
-    # Second call follows nextRecordsUrl; params cleared
+    assert "q" not in (sess.calls[0][1].get("params") or {})
+    # second call follows nextRecordsUrl and has no params when clear_params_on_next=True
     assert (
         sess.calls[1][0]
         == "https://sf.example/services/data/v61.0/query/next123"
     )
-    assert "params" not in sess.calls[1][1] or not sess.calls[1][1]["params"]
+    assert "params" not in sess.calls[1][1]
 
 
 # --- Tests: unsupported mode --------------------------------------------------

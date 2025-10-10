@@ -19,15 +19,9 @@ def cursor_backfill(
     safe = whitelist_request_opts(dict(base_opts))
     frames = []
 
-    start_value = (cur_cfg or {}).get("start_value")
     cursor_param = (pag_cfg or {}).get("cursor_param", "cursor")
-    if start_value:
-        params = dict(safe.get("params") or {})
-        params[cursor_param] = start_value
-        safe["params"] = params
 
     next_cursor_path = (pag_cfg or {}).get("next_cursor_path")
-    chain_field = (pag_cfg or {}).get("chain_field")
     max_pages = int((pag_cfg or {}).get("max_pages", 10000))
 
     # stop guards
@@ -101,14 +95,6 @@ def cursor_backfill(
                 next_url = url
             else:
                 next_url = None
-        elif chain_field:
-            if df_page.empty or chain_field not in df_page.columns:
-                break
-            last_val = df_page[chain_field].iloc[-1]
-            params = dict(safe.get("params") or {})
-            params[cursor_param] = last_val
-            safe["params"] = params
-            next_url = url
         else:
             next_url = None
 

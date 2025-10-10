@@ -108,7 +108,7 @@ def test_cursor_backfill_next_token_and_link_expansion(monkeypatch):
 
     # concat both pages
     assert list(df["i"]) == [1, 2]
-    # link expansion ran for each non-empty page
+    # link expansion runs once on the concatenated result
     assert called["n"] == 1
     # verify that second call included cursor param "s1"
     assert sess.calls[1]["kw"]["params"]["cursor"] == "s1"
@@ -133,8 +133,7 @@ def test_cursor_backfill_stop_item_inclusive_false(monkeypatch):
         "to_dataframe",
         lambda resp, parse: pd.DataFrame(resp.json()["data"]),
     )
-    # expand_links should be invoked on trimmed page as well
-    called = {"n": 0}
+    # expand_links should be invoked on trimmed page as well (single-shot at end stays the same)
     monkeypatch.setattr(
         backfill, "expand_links", lambda *a, **k: a[2]
     )  # pass-through DF
@@ -247,43 +246,6 @@ def test_cursor_backfill_stop_when_older_than_with_link_expansion(monkeypatch):
     # Should keep only >= threshold, invoke expansion once, and stop loop
     assert list(df["ts"]) == ["2024-01-02T00:00:00Z"]
     assert x["called"] == 1
-
-
-def test_cursor_backfill_chain_field(monkeypatch):
-    # No next_cursor_path; use chain_field with last id from page
-    sess = FakeSession(
-        {
-            "https://api/cur": [
-                FakeResponse(json_data={"items": [{"id": 1}, {"id": 2}]}),
-                FakeResponse(json_data={"items": []}),  # empty -> loop ends
-            ]
-        }
-    )
-    monkeypatch.setattr(
-        backfill,
-        "to_dataframe",
-        lambda resp, parse: pd.DataFrame(resp.json()["items"]),
-    )
-
-    df = backfill.cursor_backfill(
-        ctx=_ctx(),
-        sess=sess,
-        url="https://api/cur",
-        base_opts={"params": {}},
-        parse_cfg={"type": "json", "json_record_path": "items"},
-        pag_cfg={
-            "mode": "cursor",
-            "cursor_param": "cursor",
-            "chain_field": "id",
-        },
-        cur_cfg={},
-        link_cfg={},
-    )
-
-    # First page appended, second empty -> stops
-    assert list(df["id"]) == [1, 2]
-    # Verify chained param equals last id ("2")
-    assert sess.calls[1]["kw"]["params"]["cursor"] == 2
 
 
 def test_cursor_backfill_max_pages(monkeypatch):

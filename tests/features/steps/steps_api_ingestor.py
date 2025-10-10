@@ -1,14 +1,42 @@
 import json
 import textwrap
 from datetime import datetime
-from types import MethodType
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import pandas as pd
 import responses
 from behave import given, then, when
 
-from api_ingestor import ApiIngestor
+import api_ingestor.api_ingestor as ingestor_mod  # <-- patch target
+from api_ingestor.api_ingestor import ApiIngestor
+
+# ----------------- Helper: patch write_output inside ApiIngestor module -----------------
+
+
+def _install_capture(context):
+    """
+    Patch api_ingestor.api_ingestor.write_output so ApiIngestor.run_once/backfill
+    won't require output config and we can capture the produced DataFrame.
+    """
+    if not hasattr(context, "_orig_ai_write_output"):
+        context._orig_ai_write_output = ingestor_mod.write_output
+
+    def _capture_write_output(ctx, df, out_cfg):
+        # Save DF for assertions
+        context.df = df.copy()
+        # Return a plausible meta dict (fields used by ApiIngestor)
+        return {
+            "format": (out_cfg or {}).get("format", "csv"),
+            "s3_bucket": "test-bucket",
+            "s3_key": "test/key",
+            "s3_uri": "s3://test-bucket/test/key",
+            "bytes": len(df.to_json().encode("utf-8")),
+        }
+
+    ingestor_mod.write_output = _capture_write_output
+
+
+# ----------------- Background -----------------
 
 
 @given('a base API host "{base}"')
@@ -32,13 +60,14 @@ def step_base_host(context, base):
     context.logger = _Logger()
 
 
-# ----------------- Cursor pagination -----------------
+# ----------------- Cursor pagination (run_once) -----------------
 
 
 @given('a cursor endpoint "{path}" with two pages of 2 items each')
 def step_cursor_endpoint(context, path):
     full1 = urljoin(context.base, path.lstrip("/"))
     full2 = urljoin(context.base, path.lstrip("/"))
+    # First call: no cursor param yet
     context.responses.add(
         responses.GET,
         full1,
@@ -47,6 +76,7 @@ def step_cursor_endpoint(context, path):
         content_type="application/json",
         match=[responses.matchers.query_param_matcher({})],
     )
+    # Second call: with cursor=t2
     context.responses.add(
         responses.GET,
         full2,
@@ -320,28 +350,37 @@ def step_sf_config(context):
     }
 
 
-# ----------------- When steps (patched to capture DF) -----------------
+# ----------------- Cursor backfill (explicit) -----------------
 
 
-def _install_capture(ingestor, context):
-    # Patch write_output so we can assert on the produced DataFrame
-    def _capturewrite_output(self, df, table_name, env_name, out_cfg):
-        context.df = df.copy()
-        return {
-            "format": (out_cfg or {}).get("format", "csv"),
-            "s3_bucket": "test-bucket",
-            "s3_key": "test/key",
-            "s3_uri": "s3://test-bucket/test/key",
-            "bytes": len(df.to_json().encode("utf-8")),
-        }
+@given(
+    'a cursor-backfill-table config with start_value "{seed}" and max_pages {mp:d}'
+)
+def step_cursor_bf_config(context, seed, mp):
+    context.ingestor_config["apis"]["path"] = "cursor"
+    context.ingestor_config["apis"]["pagination"] = {
+        "mode": "cursor",
+        "next_cursor_path": "meta.next",
+        "cursor_param": "cursor",
+        "max_pages": mp,
+    }
+    context.ingestor_config["apis"]["cursor_bf_table"] = {
+        "parse": {"type": "json", "json_record_path": "items"},
+        "backfill": {
+            "enabled": True,
+            "strategy": "cursor",
+            "cursor": {"start_value": seed},
+        },
+    }
 
-    ingestor.write_output = MethodType(_capturewrite_output, ingestor)
+
+# ----------------- When steps -----------------
 
 
 @when('I run the ingestor once for table "{table}" in env "{env}"')
 def step_run_once(context, table, env):
+    _install_capture(context)
     ingestor = ApiIngestor(config=context.ingestor_config, log=context.logger)
-    _install_capture(ingestor, context)
     context.meta = ingestor.run_once(table, env)
 
 
@@ -349,8 +388,8 @@ def step_run_once(context, table, env):
     'I run the backfill for table "{table}" in env "{env}" from "{start}" to "{end}"'
 )
 def step_run_backfill(context, table, env, start, end):
+    _install_capture(context)
     ingestor = ApiIngestor(config=context.ingestor_config, log=context.logger)
-    _install_capture(ingestor, context)
     d0 = datetime.strptime(start, "%Y-%m-%d").date()
     d1 = datetime.strptime(end, "%Y-%m-%d").date()
     context.meta = ingestor.run_backfill(table, env, d0, d1)
@@ -361,23 +400,23 @@ def step_run_backfill(context, table, env, start, end):
 
 @then("the result has {n:d} rows")
 def step_assert_rows(context, n):
-    assert hasattr(context, "df"), "No DataFrame on context"
-    assert (
-        len(context.df) == n
-    ), f"Expected {n} rows, got {len(context.df)}.\n{context.df}"
+    assert hasattr(
+        context, "df"
+    ), "No DataFrame captured; was write_output patched?"
+    got = len(context.df)
+    assert got == n, f"Expected {n} rows, got {got}.\n{context.df}"
 
 
 @then(
     'the expanded result has {n:d} rows and includes the detail field "{col}"'
 )
 def step_assert_expanded(context, n, col):
-    assert hasattr(context, "df"), "No DataFrame on context"
-    assert (
-        len(context.df) == n
-    ), f"Expected {n} rows, got {len(context.df)}.\n{context.df}"
+    assert hasattr(context, "df")
+    got = len(context.df)
+    assert got == n, f"Expected {n} rows, got {got}.\n{context.df}"
     assert (
         col in context.df.columns
-    ), f"Expected column '{col}' in expanded DataFrame. Columns: {context.df.columns}"
+    ), f"Missing column '{col}'. Columns: {list(context.df.columns)}"
 
 
 @then('the result has {n:d} rows and contains values "{d1}" "{d2}" "{d3}"')

@@ -41,3 +41,9 @@ Feature: ApiIngestor component behavior
     And a soql-window-table config
     When I run the backfill for table "sf_soql_table" in env "dev" from "2021-01-01" to "2021-01-01"
     Then the result has 2 rows with ids "a" and "b"
+
+  Scenario: Cursor backfill honors start_value and stops by max pages
+    Given a cursor endpoint "/cursor" with two pages of 2 items each
+    And a cursor-backfill-table config with start_value "s0" and max_pages 2
+    When I run the backfill for table "cursor_bf_table" in env "dev" from "2021-01-01" to "2021-01-01"
+    Then the result has 4 rows

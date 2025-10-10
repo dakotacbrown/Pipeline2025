@@ -10,14 +10,29 @@ from api_ingestor.pagination import paginate
 from api_ingestor.parsing import to_dataframe
 from api_ingestor.small_utils import dig, whitelist_request_opts
 
-# backfill.py
-
 
 def cursor_backfill(
-    ctx, sess, url, base_opts, parse_cfg, pag_cfg, cur_cfg, link_cfg
-):
+    ctx: Dict[str, Any],
+    sess: Session,
+    url: str,
+    base_opts: Dict[str, Any],
+    parse_cfg: Dict[str, Any],
+    pag_cfg: Dict[str, Any],
+    cur_cfg: Dict[str, Any],
+    link_cfg: Dict[str, Any],
+) -> pd.DataFrame:
+    """
+    Cursor backfill that:
+      - Seeds the initial request with cur_cfg.start_value (if provided)
+        into params[cursor_param].
+      - Follows pag_cfg.next_cursor_path to advance.
+      - Respects pag_cfg.max_pages.
+      - Applies optional stop guards (stop_at_item, stop_when_older_than).
+      - Performs link expansion ONCE after the final DataFrame is built
+        (to match run_once parity and avoid N*page expansion).
+    """
     safe = whitelist_request_opts(dict(base_opts))
-    frames = []
+    frames: List[pd.DataFrame] = []
 
     cursor_param = (pag_cfg or {}).get("cursor_param", "cursor")
 
@@ -50,7 +65,7 @@ def cursor_backfill(
         # stop-by-item
         if (
             stop_field
-            and stop_value
+            and stop_value is not None
             and not df_page.empty
             and stop_field in df_page.columns
         ):
@@ -85,7 +100,7 @@ def cursor_backfill(
         if not df_page.empty:
             frames.append(df_page)
 
-        # advance cursor
+        # advance cursor strictly via next_cursor_path
         if next_cursor_path:
             token = dig(resp.json(), next_cursor_path)
             if token:
@@ -96,6 +111,7 @@ def cursor_backfill(
             else:
                 next_url = None
         else:
+            # No way to continue
             next_url = None
 
         pages += 1

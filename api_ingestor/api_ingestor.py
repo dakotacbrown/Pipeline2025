@@ -9,9 +9,7 @@ from api_ingestor.link_expansion import expand_links, resolve_session_id
 from api_ingestor.multipull import run_multi_pulls_with_join
 from api_ingestor.output import write_output, write_s3
 from api_ingestor.pagination import paginate
-from api_ingestor.parsing import (
-    to_dataframe as _to_dataframe,  # for ctx injection
-)
+from api_ingestor.parsing import to_dataframe
 from api_ingestor.request_helpers import (
     apply_session_defaults,
     build_session,
@@ -49,7 +47,7 @@ class ApiIngestor:
             "current_output_ctx": {},
             "expansion_session_ids": set(),
             "flush_seq": 0,
-            "to_dataframe": _to_dataframe,
+            "to_dataframe": to_dataframe,
             "write_s3": lambda df, fmt, s3_cfg: write_s3(
                 ctx, ctx["table"], ctx["env"], df, fmt, s3_cfg
             ),
@@ -183,7 +181,7 @@ class ApiIngestor:
             "current_output_ctx": {},
             "expansion_session_ids": set(),
             "flush_seq": 0,
-            "to_dataframe": _to_dataframe,
+            "to_dataframe": to_dataframe,
             "write_s3": lambda df, fmt, s3_cfg: write_s3(
                 ctx, ctx["table"], ctx["env"], df, fmt, s3_cfg
             ),

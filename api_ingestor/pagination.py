@@ -15,14 +15,11 @@ from api_ingestor.small_utils import dig, whitelist_request_opts
 def _encode_soql_for_q(soql: str) -> str:
     """
     Encode SOQL for the query component exactly like Insomnia's URL preview:
-    - RFC 3986 percent-encoding for the *query* component
     - spaces -> %20 (NOT '+')
-    - commas stay ',' (safe)
-    - quotes and operators are percent-encoded
+    - commas remain ','
+    - RFC3986 query-component encoding for everything else
     """
-    # normalize any accidental lower-case 'z' at end of ISO timestamps
     soql = soql.replace("z", "Z")
-    # Keep only harmless sub-delims unescaped; notably keep comma
     return quote(soql, safe="()*._-,")
 
 
@@ -39,11 +36,13 @@ def paginate(
     mode = (pag_cfg or {}).get("mode", "none")
     frames: List[pd.DataFrame] = []
 
+    # ---------- No pagination ----------
     if mode == "none":
         resp = sess.get(url, **whitelist_request_opts(base_opts))
         resp.raise_for_status()
         return to_dataframe(resp, parse_cfg)
 
+    # ---------- Salesforce (SOQL query) ----------
     if mode == "salesforce":
         safe = whitelist_request_opts(dict(base_opts))
         host_base = urljoin(url, "/")
@@ -54,14 +53,13 @@ def paginate(
         )
         max_pages = int((pag_cfg or {}).get("max_pages", 10000))
 
-        # --- Build first URL with encoded 'q' in the URL (not form-encoded) ---
+        # Place q in URL (encoded) to avoid form-style '+' for spaces
         q = (safe.get("params") or {}).get("q")
         if q:
             encoded_q = _encode_soql_for_q(q)
             base_only = url.split("?", 1)[0]
             first_url = f"{base_only}?q={encoded_q}"
-
-            # remove q from params so requests doesn't re-encode it
+            # remove q from params so requests doesn't touch it
             safe = dict(safe)
             ps = dict(safe.get("params") or {})
             ps.pop("q", None)
@@ -71,7 +69,6 @@ def paginate(
                 safe.pop("params", None)
         else:
             first_url = url
-        # ----------------------------------------------------------------------
 
         pages = 0
         next_url = first_url
@@ -107,13 +104,13 @@ def paginate(
             pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         )
 
-    # ---------- Non-Salesforce modes ----------
+    # ---------- Cursor / Page / Link-header ----------
     safe = whitelist_request_opts(dict(base_opts))
 
     if mode in {"cursor", "page"}:
         params = dict(safe.get("params") or {})
-        ps_param = pag_cfg.get("page_size_param") if pag_cfg else None
-        ps_value = pag_cfg.get("page_size_value") if pag_cfg else None
+        ps_param = (pag_cfg or {}).get("page_size_param")
+        ps_value = (pag_cfg or {}).get("page_size_value")
         if ps_param and ps_value:
             params[ps_param] = ps_value
         if mode == "page":
@@ -133,6 +130,7 @@ def paginate(
         page_df = to_dataframe(resp, parse_cfg)
         if mode == "page" and page_df.empty:
             break
+
         frames.append(page_df)
         pages += 1
 

@@ -1,5 +1,5 @@
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import pandas as pd
 from requests import Session
@@ -14,10 +14,10 @@ from api_ingestor.small_utils import dig, whitelist_request_opts
 
 def _encode_soql_for_q(soql: str) -> str:
     """
-    Encode SOQL for the query component exactly like Insomnia's URL preview:
-    - spaces -> %20 (NOT '+')
+    Encode SOQL for query component like Insomnia's URL preview:
+    - spaces -> %20 (not '+')
     - commas remain ','
-    - RFC3986 query-component encoding for everything else
+    - RFC3986 query-component encoding for the rest
     """
     soql = soql.replace("z", "Z")
     return quote(soql, safe="()*._-,")
@@ -31,7 +31,7 @@ def paginate(
     pag_cfg: Optional[Dict[str, Any]],
 ) -> pd.DataFrame:
     """
-    Unified paginator for modes: none, salesforce, cursor, page, link-header.
+    Unified paginator for: none, salesforce, cursor, page, link-header.
     """
     mode = (pag_cfg or {}).get("mode", "none")
     frames: List[pd.DataFrame] = []
@@ -45,13 +45,25 @@ def paginate(
     # ---------- Salesforce (SOQL query) ----------
     if mode == "salesforce":
         safe = whitelist_request_opts(dict(base_opts))
-        host_base = urljoin(url, "/")
         done_path = (pag_cfg or {}).get("done_path", "done")
         next_url_path = (pag_cfg or {}).get("next_url_path", "nextRecordsUrl")
         clear_params_on_next = bool(
             (pag_cfg or {}).get("clear_params_on_next", True)
         )
         max_pages = int((pag_cfg or {}).get("max_pages", 10000))
+
+        parts = urlsplit(url)
+        idx = parts.path.find("/services/")
+        proxy_prefix = parts.path[:idx] if idx >= 0 else ""
+        base_with_prefix = urlunsplit(
+            (
+                parts.scheme,
+                parts.netloc,
+                proxy_prefix.rstrip("/") + "/",
+                "",
+                "",
+            )
+        )
 
         # Place q in URL (encoded) to avoid form-style '+' for spaces
         q = (safe.get("params") or {}).get("q")
@@ -72,6 +84,7 @@ def paginate(
 
         pages = 0
         next_url = first_url
+
         while pages < max_pages and next_url:
             resp = sess.get(next_url, **safe)
             resp.raise_for_status()
@@ -85,15 +98,24 @@ def paginate(
             if not df_page.empty:
                 frames.append(df_page)
 
+            # Stop if Salesforce says we're done
             if (data.get(done_path, True)) is True:
                 break
 
+            # Follow Salesforce nextRecordsUrl
             nxt = data.get(next_url_path)
             if not nxt:
                 break
 
-            next_url = urljoin(host_base, nxt)
+            # If SF returns an absolute URL, use it as-is.
+            # Otherwise, join under the proxy prefix and preserve '/query/...'
+            if isinstance(nxt, str) and nxt.startswith(("http://", "https://")):
+                next_url = nxt
+            else:
+                # lstrip('/') is crucial; otherwise urljoin would drop the prefix.
+                next_url = urljoin(base_with_prefix, str(nxt).lstrip("/"))
 
+            # Clear params after the first page if requested
             if clear_params_on_next and "params" in safe:
                 safe = dict(safe)
                 safe.pop("params", None)

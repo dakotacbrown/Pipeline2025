@@ -59,7 +59,7 @@ File: `api_ingestor.py`
 - `run_backfill(table_name, env_name, start, end)`:
   Chooses one of:
   - **`strategy = "cursor"`** → `backfill.cursor_backfill(...)`
-  - **`strategy = "soql_window"`** → `backfill.soql_window_backfill(...)`  
+  - **`strategy = "soql_window"`** → `backfill.soql_window_backfill(...)`
     (requires `pagination.mode == "salesforce"`)
   - **default “date-window”**: Slides windows of `window_days`, injects
     `start_param`/`end_param`, and calls `paginate(...)` (or `multi_pulls`), concatenating results.
@@ -72,25 +72,25 @@ Both methods share the same context and link-expansion semantics, so behavior is
 
 ### Modes
 
-- `none`  
+- `none`
   One GET → `parsing.to_dataframe(...)` → return.
 
-- `cursor`  
-  Injects optional `page_size_param/page_size_value`.  
+- `cursor`
+  Injects optional `page_size_param/page_size_value`.
   On each page:
   - `to_dataframe(...)`
   - `next_cursor = dig(resp.json(), next_cursor_path)`
   - If present: set `params[cursor_param] = next_cursor` and **re-call the same URL**
   - Stop when `max_pages` reached or the API stops returning a cursor
 
-- `page`  
-  Injects page size and `page_param` (starting at `start_page`).  
+- `page`
+  Injects page size and `page_param` (starting at `start_page`).
   Stops on first empty page **or** `max_pages` (whichever first).
 
-- `link-header`  
+- `link-header`
   Follow `resp.links["next"]["url"]` until missing (or `max_pages`).
 
-- `salesforce`  
+- `salesforce`
   Special handling for SOQL:
   - The **first** URL is composed as `f"{base_url}?q={encoded_soql}"`.
   - `q` is **removed from** `safe["params"]` so `requests` doesn’t form-encode it.
@@ -120,9 +120,9 @@ Two specialized strategies plus the default date-window flow:
 ### 1) Cursor backfill: `cursor_backfill(...)`
 
 - Accepts:
-  - `pag_cfg` (cursor pagination config):  
+  - `pag_cfg` (cursor pagination config):
     `next_cursor_path`, `cursor_param`, `page_size_param/value`, `max_pages`
-  - `cur_cfg` (backfill-specific guards):  
+  - `cur_cfg` (backfill-specific guards):
     - `start_value`: seed cursor token (placed into `params[cursor_param]` **before the first call**)
     - `stop_at_item`: `{ field, value, inclusive }` → trim the page when that item is seen and **stop**
     - `stop_when_older_than`: `{ field, value }` → keep only rows with timestamp ≥ value and **stop**
@@ -245,25 +245,25 @@ It’s useful when link expansion isn’t the right shape (e.g., the “join” 
 
 ## Request helpers (`request_helpers.py`)
 
-- `build_session(retries_cfg)`  
+- `build_session(retries_cfg)`
   Returns a `requests.Session` with `urllib3`-style retry/backoff based on config:
   - `total`, `backoff_factor`, `status_forcelist`, `allowed_methods`
-- `apply_session_defaults(session, safe_defaults)`  
+- `apply_session_defaults(session, safe_defaults)`
   Applies headers, timeout, and TLS settings
-- `build_url(base_url, path)`  
+- `build_url(base_url, path)`
   Joins environment `base_url` with per-table `path`
-- `log_request(ctx, url, request_opts, prefix="")` and `log_exception(...)`  
+- `log_request(ctx, url, request_opts, prefix="")` and `log_exception(...)`
   Hook points used throughout `ApiIngestor` and backfills
 
 ---
 
 ## Small utils (`small_utils.py`)
 
-- `whitelist_request_opts(opts)`  
+- `whitelist_request_opts(opts)`
   Filter request kwargs to a safe subset for `requests.get(...)` (e.g., `params`, `headers`, `timeout`, `verify`, `auth`, `json`, `data`)
-- `dig(obj, dotted_path)`  
+- `dig(obj, dotted_path)`
   Safe traversal of nested dicts/lists using a dotted path (used by cursor pagination to find `next_cursor_path`)
-- `get_from_row(row, dotted_path)`  
+- `get_from_row(row, dotted_path)`
   Pulls nested fields from a pandas row for link expansion
 
 ---

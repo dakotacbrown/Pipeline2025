@@ -14,10 +14,8 @@ from api_ingestor.api_ingestor import ApiIngestor
 
 
 def _install_capture(context):
-    """
-    Patch api_ingestor.api_ingestor.write_output so ApiIngestor.run_once/backfill
-    won't require output config and we can capture the produced DataFrame.
-    """
+    """Patch api_ingestor.api_ingestor.write_output so ApiIngestor.run_once/backfill
+    won't require output config and we can capture the produced DataFrame."""
     if not hasattr(context, "_orig_ai_write_output"):
         context._orig_ai_write_output = ingestor_mod.write_output
 

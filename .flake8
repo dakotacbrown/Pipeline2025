@@ -16,7 +16,7 @@ select = B,B950,C,E,F,W
 # E203: Whitespace before ',', ';', or ':'
 # E501: Line too long
 # E704: Multiple statements on one line
-extend-ignore = E203,E501,E704
+extend-ignore = E203,E501,E704,W503
 
 exclude = venv, __pycache__, .git
 

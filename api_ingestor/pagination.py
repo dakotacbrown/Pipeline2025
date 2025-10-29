@@ -13,8 +13,8 @@ from api_ingestor.small_utils import dig, whitelist_request_opts
 
 
 def _encode_soql_for_q(soql: str) -> str:
-    """
-    Encode SOQL for query component like Insomnia's URL preview:
+    """Encode SOQL for query component like Insomnia's URL preview:
+
     - spaces -> %20 (not '+')
     - commas remain ','
     - RFC3986 query-component encoding for the rest

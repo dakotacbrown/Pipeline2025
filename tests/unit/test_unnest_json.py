@@ -3,15 +3,10 @@ import os
 import pandas as pd
 import pytest
 from pandas.testing import assert_frame_equal
-
-from unnest.json import unnest_json_column
-
-# --- Make Spark imports safe ---
-pytest.importorskip("pyspark", reason="PySpark not installed")
 from pyspark.sql import SparkSession
 from pyspark.sql import types as T
 
-from unnest.json import unnest_json_column_spark
+from unnest.json import unnest_json_column, unnest_json_column_spark
 
 
 def _order(df: pd.DataFrame) -> pd.DataFrame:

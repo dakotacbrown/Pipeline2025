@@ -215,72 +215,108 @@ def unnest_json_column_spark(
     Fully flatten a JSON column in Spark:
       - Parses strings with from_json (supply `schema` for best typing)
       - Recursively flattens nested structs
-      - Sequentially explode_outer arrays (one at a time) to avoid cartesian blowups
+      - Sequentially explode_outer arrays (one at a time)
       - Converts maps -> array<struct<key,value>> -> explode -> flatten
-
-    Returns a wide, flat DataFrame. Empty arrays are preserved via explode_outer.
+    Produces columns WITHOUT the root prefix (e.g., 'a', 'b_c', 'arr_x' not 'payload_a').
+    Empty/NULL arrays are preserved as a single NULL row.
     """
     if column not in df.columns:
         raise KeyError(f"Column '{column}' not found.")
 
-    base_cols = [c for c in df.columns if c != column]
-    dfj = _ensure_json_struct(df.select(*df.columns), column, schema)
+    root_prefix = f"{column}{sep}"
 
-    # Start by moving the JSON fields to top-level if it's a struct
+    # Keep a copy of the original JSON so keep_original=True works
+    base_cols = [c for c in df.columns if c != column]
+    dfj = df.select(
+        *base_cols, F.col(column).alias("__orig_json__"), F.col(column)
+    )
+
+    # Parse to structured type if needed
+    dfj = _ensure_json_struct(dfj, column, schema)
+
+    def _strip_root_prefix(d: DataFrame) -> DataFrame:
+        # Rename any columns starting with "payload_" (or whatever root is) to drop that prefix
+        renames = [c for c in d.columns if c.startswith(root_prefix)]
+        for c in renames:
+            d = d.withColumnRenamed(c, c[len(root_prefix) :])
+        return d
+
     iter_count = 0
     while iter_count < max_iters:
         iter_count += 1
 
-        # 1) If `column` is a struct, flatten it once
-        if isinstance(dfj.schema[column].dataType, T.StructType):
+        progressed = False
+
+        # 1) If the original root column still exists and is a struct, flatten it
+        if column in dfj.columns and isinstance(
+            dfj.schema[column].dataType, T.StructType
+        ):
             dfj = _flatten_struct_once(dfj, column, sep)
-        else:
-            # Not a struct at top-level. If it's an array or map, we’ll handle below.
-            pass
+            dfj = _strip_root_prefix(dfj)
+            progressed = True
 
-        # 2) Flatten any other top-level structs (created by previous step or by explode)
-        struct_col = _first_struct_col(dfj)
-        if struct_col:
-            dfj = _flatten_struct_once(dfj, struct_col, sep)
-            continue
+        # 2) Flatten any other struct
+        if not progressed:
+            struct_col = _first_struct_col(dfj)
+            if struct_col:
+                dfj = _flatten_struct_once(dfj, struct_col, sep)
+                # no need to strip root here unless this struct was nested under the root name
+                dfj = _strip_root_prefix(dfj)
+                progressed = True
 
-        # 3) Explode the first array we find (outer to preserve empties), then loop
-        arr_col = _first_array_col(dfj)
-        if arr_col:
-            dfj = dfj.withColumn(
-                arr_col,
-                F.when(F.size(arr_col) == 0, F.array(F.lit(None))).otherwise(
-                    F.col(arr_col)
-                ),
-            )
-            dfj = dfj.withColumn(arr_col, F.explode_outer(F.col(arr_col)))
-            continue
+        # 3) Explode a single array (preserve [] and NULL as a single NULL row)
+        if not progressed:
+            arr_col = _first_array_col(dfj)
+            if arr_col:
+                dfj = dfj.withColumn(
+                    arr_col,
+                    F.when(F.col(arr_col).isNull(), F.array(F.lit(None)))
+                    .when(F.size(F.col(arr_col)) == 0, F.array(F.lit(None)))
+                    .otherwise(F.col(arr_col)),
+                )
+                dfj = dfj.withColumn(arr_col, F.explode_outer(F.col(arr_col)))
+                dfj = _strip_root_prefix(dfj)
+                progressed = True
 
-        # 4) Convert a map into entries -> explode -> flatten
-        map_col = _first_map_col(dfj)
-        if map_col:
-            # turn map into array<struct<key, value>>
-            dfj = dfj.withColumn(map_col, F.map_entries(F.col(map_col)))
-            dfj = dfj.withColumn(map_col, F.explode_outer(F.col(map_col)))
-            # map entry is a struct with 'key' and 'value'
-            dfj = _flatten_struct_once(dfj, map_col, sep)
-            continue
+        # 4) Map -> entries -> explode -> flatten to *_key, *_value
+        if not progressed:
+            map_col = _first_map_col(dfj)
+            if map_col:
+                dfj = dfj.withColumn(map_col, F.map_entries(F.col(map_col)))
+                dfj = dfj.withColumn(map_col, F.explode_outer(F.col(map_col)))
+                dfj = _flatten_struct_once(
+                    dfj, map_col, sep
+                )  # yields <map>_key, <map>_value
+                dfj = _strip_root_prefix(dfj)
+                progressed = True
 
-        # Nothing left to flatten
-        break
+        if not progressed:
+            break
     else:
         raise RuntimeError("Exceeded max_iters during Spark flattening.")
 
-    # Optional prefix all newly created JSON columns
-    json_cols = [c for c in dfj.columns if c not in base_cols and c != column]
+    # Figure out which columns are JSON-derived (exclude base & the temp original)
+    json_cols = [
+        c for c in dfj.columns if c not in base_cols + ["__orig_json__", column]
+    ]
+
+    # Optional prefix for JSON-derived columns (after root stripping)
     if prefix:
         for c in json_cols:
             dfj = dfj.withColumnRenamed(c, f"{prefix}{c}")
+        json_cols = [f"{prefix}{c}" for c in json_cols]
 
-    # Keep or drop the original JSON column
-    final_cols = (
-        base_cols
-        + ([column] if keep_original else [])
-        + [c for c in dfj.columns if c not in base_cols + [column]]
-    )
-    return dfj.select(*final_cols)
+    # Build final projection
+    select_cols = base_cols[:]  # always keep base
+    if keep_original:
+        # restore original JSON as the original column name
+        dfj = dfj.withColumnRenamed("__orig_json__", column)
+        select_cols.append(column)
+    else:
+        # drop the temp original
+        dfj = dfj.drop("__orig_json__")
+
+    # add JSON columns to the end
+    select_cols.extend([c for c in dfj.columns if c not in select_cols])
+
+    return dfj.select(*select_cols)

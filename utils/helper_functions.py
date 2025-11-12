@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import os
 import sys
 import traceback
+from datetime import date
 from logging import Logger
 from pathlib import Path
 from typing import Any, Dict
@@ -72,3 +75,27 @@ def retrieve_oauth_token(
             return x
 
         return repl(cfg)
+
+
+def format_clz_s3_prefix(writer_config: Dict[str, Any]) -> str:
+    """
+    Build an S3 prefix with y/m/d partitions and a file-like suffix:
+    s3a://<bucket>/<vendor>/<dataset_id>[/<table>]/year=YYYY/month=MM/day=DD/<output_name>.<ext>
+    """
+    today = date.today()
+
+    bucket = writer_config["s3_bucket"]
+    vendor = writer_config["vendor"]
+    dataset_id = writer_config["dataset_id"]
+    output_name = writer_config["output_name"]
+    ext = writer_config["file_type"].lower()
+
+    base = f"s3a://{bucket}/{vendor}/{dataset_id}"
+    table = writer_config.get("table")
+    if table:
+        base = f"{base}/{table}"
+
+    return (
+        f"{base}/year={today.year}/month={today.month:02d}/day={today.day:02d}/"
+        f"{output_name}.{ext}"
+    )

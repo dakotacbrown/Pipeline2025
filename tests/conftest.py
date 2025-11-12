@@ -2,6 +2,7 @@ import types
 from logging import Logger
 
 import pytest
+from pyspark.sql import SparkSession
 
 from utils.basic_logger import setup_logger
 
@@ -116,3 +117,30 @@ def to_dataframe(monkeypatch):
 def log() -> Logger:
     log = setup_logger()
     return log
+
+
+@pytest.fixture(scope="session")
+def spark():
+    spark = (
+        SparkSession.builder.master("local[1]")
+        .appName("base-reader-tests")
+        .getOrCreate()
+    )
+    yield spark
+    spark.stop()
+
+
+class _Log:
+    def __init__(self):
+        self.messages = []
+
+    def info(self, msg):
+        self.messages.append(("INFO", msg))
+
+    def error(self, msg):
+        self.messages.append(("ERROR", msg))
+
+
+@pytest.fixture
+def log():
+    return _Log()

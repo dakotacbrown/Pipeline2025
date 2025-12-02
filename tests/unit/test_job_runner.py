@@ -153,6 +153,8 @@ def test_parse_args_with_extra_env_and_unknown(monkeypatch, capsys):
 # ------------------------
 def test_main_calls_run_ingester_and_prints_json(monkeypatch, capsys):
     # Fake args returned by _parse_args
+    from types import SimpleNamespace
+
     fake_args = SimpleNamespace(
         yaml_path="config/ingester.yml",
         table="accounts",
@@ -165,6 +167,15 @@ def test_main_calls_run_ingester_and_prints_json(monkeypatch, capsys):
         event={"foo": "bar"},
     )
     monkeypatch.setattr(run_step, "_parse_args", lambda: fake_args)
+
+    # Stub logger to avoid any % formatting issues
+    class DummyLogger:
+        def info(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(
+        run_step.logging, "getLogger", lambda name=None: DummyLogger()
+    )
 
     # Fake src.api_wrapper.run_ingester
     called = {}

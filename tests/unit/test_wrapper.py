@@ -202,15 +202,9 @@ def test_run_ingester_once_sets_env_and_calls_run_once(monkeypatch):
     dummy_log = _DummyLog()
     monkeypatch.setattr(api_wrapper, "log", dummy_log)
 
-    # stub YAML loader
     loaded_cfg: Dict[str, Any] = {"apis": {"foo": "bar"}}
-    monkeypatch.setattr(
-        api_wrapper,
-        "_load_yaml_from_anywhere",
-        lambda path: loaded_cfg,
-    )
+    monkeypatch.setattr(api_wrapper, "_load_yaml_from_anywhere", lambda path: loaded_cfg)
 
-    # capture env_vars passed in
     env_vars_seen: Dict[str, str] = {}
 
     def fake_set_env_vars(env_vars):
@@ -218,7 +212,6 @@ def test_run_ingester_once_sets_env_and_calls_run_once(monkeypatch):
 
     monkeypatch.setattr(api_wrapper, "set_env_vars_from_dict", fake_set_env_vars)
 
-    # stub OAuth: just return a token; we'll be called at least once
     calls_retrieve = {"count": 0}
 
     def fake_retrieve(*args, **kwargs):
@@ -227,7 +220,6 @@ def test_run_ingester_once_sets_env_and_calls_run_once(monkeypatch):
 
     monkeypatch.setattr(api_wrapper, "retrieve_oauth_token", fake_retrieve)
 
-    # stub ApiIngester
     calls_ingester: Dict[str, Any] = {}
 
     class DummyIngester:
@@ -248,6 +240,9 @@ def test_run_ingester_once_sets_env_and_calls_run_once(monkeypatch):
     try:
         event = {
             "env_vars": {"foo": "bar"},
+            "cl_oauth_url": "https://cl-token.example.com",
+            "exchange_headers": {"ex": "hdr"},
+            "exchange_data": {"ex": "data"},
             "data_auth": {"oauth_url": "https://token.example.com"},
             "data_headers": {"hdr": "val"},
         }
@@ -262,25 +257,17 @@ def test_run_ingester_once_sets_env_and_calls_run_once(monkeypatch):
             end=None,
         )
 
-        # meta from DummyIngester.run_once
         assert meta == {"rows": 5}
-
-        # env vars from dict were passed through
         assert env_vars_seen == {"foo": "bar"}
-
-        # core envs set
         assert os.environ["ENV"] == "dev"
         assert os.environ["TABLE"] == "accounts"
-
-        # oauth token was written
         assert os.environ["DATA_AUTH_TOKEN"] == "tok123"
-
-        # correct ingester method called
         assert calls_ingester["run_once"] == ("accounts", "dev")
         assert "run_backfill" not in calls_ingester
     finally:
         os.environ.clear()
         os.environ.update(old_environ)
+
 
 
 def test_run_ingester_backfill_calls_run_backfill(monkeypatch):
@@ -317,11 +304,12 @@ def test_run_ingester_backfill_calls_run_backfill(monkeypatch):
             table="events",
             env_name="prod",
             yaml_path="config.yml",
-            event={},
+            event={"cl_oauth_url": "https://cl-token.example.com"},
             run_mode="backfill",
             start="2024-01-01",
             end="2024-01-10",
         )
+
 
         assert meta == {"mode": "backfill"}
         assert "run_backfill" in calls
@@ -341,7 +329,7 @@ def test_run_ingester_backfill_requires_start_and_end(monkeypatch):
             table="t",
             env_name="dev",
             yaml_path="cfg.yml",
-            event={},
+            event={"cl_oauth_url": "https://cl-token.example.com"},
             run_mode="backfill",
             start="2024-01-01",
             end=None,

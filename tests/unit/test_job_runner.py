@@ -1,7 +1,7 @@
 import json
 import os
 import sys
-from types import SimpleNamespace
+from pathlib import Path
 import types
 
 import pytest
@@ -105,7 +105,6 @@ def test_parse_args_minimal(monkeypatch):
     assert args.end_date is None
     assert args.log_level == "INFO"
     assert args.extra_env == []
-    # do NOT assume args.event exists – your real parser doesn’t define it
 
 
 def test_parse_args_with_extra_env_and_unknown(monkeypatch, capsys):
@@ -152,9 +151,9 @@ def test_parse_args_with_extra_env_and_unknown(monkeypatch, capsys):
 # main() tests
 # ------------------------
 def test_main_calls_run_ingester_and_prints_json(monkeypatch, capsys):
-    # Fake args returned by _parse_args
     from types import SimpleNamespace
 
+    # Fake args returned by _parse_args
     fake_args = SimpleNamespace(
         yaml_path="config/ingester.yml",
         table="accounts",
@@ -168,14 +167,8 @@ def test_main_calls_run_ingester_and_prints_json(monkeypatch, capsys):
     )
     monkeypatch.setattr(run_step, "_parse_args", lambda: fake_args)
 
-    # Stub logger to avoid any % formatting issues
-    class DummyLogger:
-        def info(self, *args, **kwargs):
-            pass
-
-    monkeypatch.setattr(
-        run_step.logging, "getLogger", lambda name=None: DummyLogger()
-    )
+    # Don't let tests reconfigure global logging
+    monkeypatch.setattr(run_step.logging, "basicConfig", lambda *a, **k: None)
 
     # Fake src.api_wrapper.run_ingester
     called = {}

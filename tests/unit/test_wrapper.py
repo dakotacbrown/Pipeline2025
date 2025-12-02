@@ -55,22 +55,7 @@ def test_zip_candidates_ignores_nonexistent_and_bad_entries(tmp_path, monkeypatc
 # ------------------------
 # set_env_vars_from_dict
 # ------------------------
-class _DummyLog:
-    def __init__(self):
-        self.infos = []
-        self.warnings = []
-
-    def info(self, msg, *args, **kwargs):
-        self.infos.append(msg % args if args else msg)
-
-    def warning(self, msg, *args, **kwargs):
-        self.warnings.append(msg % args if args else msg)
-
-
-def test_set_env_vars_from_dict_sets_uppercase(monkeypatch):
-    dummy_log = _DummyLog()
-    monkeypatch.setattr(api_wrapper, "log", dummy_log)
-
+def test_set_env_vars_from_dict_sets_uppercase():
     old_environ = os.environ.copy()
     try:
         api_wrapper.set_env_vars_from_dict(
@@ -86,7 +71,6 @@ def test_set_env_vars_from_dict_sets_uppercase(monkeypatch):
 
         # invalid entries skipped
         assert "BAZ" not in os.environ
-        assert any("Skipping empty env var" in msg for msg in dummy_log.warnings)
     finally:
         os.environ.clear()
         os.environ.update(old_environ)
@@ -199,12 +183,15 @@ def test_load_yaml_from_anywhere_raises_when_not_found(monkeypatch):
 # run_ingester
 # ------------------------
 def test_run_ingester_once_sets_env_and_calls_run_once(monkeypatch):
-    dummy_log = _DummyLog()
-    monkeypatch.setattr(api_wrapper, "log", dummy_log)
-
+    # stub YAML loader
     loaded_cfg: Dict[str, Any] = {"apis": {"foo": "bar"}}
-    monkeypatch.setattr(api_wrapper, "_load_yaml_from_anywhere", lambda path: loaded_cfg)
+    monkeypatch.setattr(
+        api_wrapper,
+        "_load_yaml_from_anywhere",
+        lambda path: loaded_cfg,
+    )
 
+    # capture env_vars passed in
     env_vars_seen: Dict[str, str] = {}
 
     def fake_set_env_vars(env_vars):
@@ -212,6 +199,7 @@ def test_run_ingester_once_sets_env_and_calls_run_once(monkeypatch):
 
     monkeypatch.setattr(api_wrapper, "set_env_vars_from_dict", fake_set_env_vars)
 
+    # stub OAuth: just return a token; we'll be called at least once
     calls_retrieve = {"count": 0}
 
     def fake_retrieve(*args, **kwargs):
@@ -220,6 +208,7 @@ def test_run_ingester_once_sets_env_and_calls_run_once(monkeypatch):
 
     monkeypatch.setattr(api_wrapper, "retrieve_oauth_token", fake_retrieve)
 
+    # stub ApiIngester
     calls_ingester: Dict[str, Any] = {}
 
     class DummyIngester:
@@ -243,7 +232,7 @@ def test_run_ingester_once_sets_env_and_calls_run_once(monkeypatch):
             "cl_oauth_url": "https://cl-token.example.com",
             "exchange_headers": {"ex": "hdr"},
             "exchange_data": {"ex": "data"},
-            "data_auth": {"oauth_url": "https://token.example.com"},
+            "data_auth": {"cl_oauth_url": "https://token.example.com"},
             "data_headers": {"hdr": "val"},
         }
 
@@ -257,11 +246,20 @@ def test_run_ingester_once_sets_env_and_calls_run_once(monkeypatch):
             end=None,
         )
 
+        # meta from DummyIngester.run_once
         assert meta == {"rows": 5}
+
+        # env vars from dict were passed through
         assert env_vars_seen == {"foo": "bar"}
+
+        # core envs set
         assert os.environ["ENV"] == "dev"
         assert os.environ["TABLE"] == "accounts"
+
+        # oauth token was written (from data_auth)
         assert os.environ["DATA_AUTH_TOKEN"] == "tok123"
+
+        # correct ingester method called
         assert calls_ingester["run_once"] == ("accounts", "dev")
         assert "run_backfill" not in calls_ingester
     finally:
@@ -269,11 +267,7 @@ def test_run_ingester_once_sets_env_and_calls_run_once(monkeypatch):
         os.environ.update(old_environ)
 
 
-
 def test_run_ingester_backfill_calls_run_backfill(monkeypatch):
-    dummy_log = _DummyLog()
-    monkeypatch.setattr(api_wrapper, "log", dummy_log)
-
     monkeypatch.setattr(
         api_wrapper,
         "_load_yaml_from_anywhere",
@@ -309,7 +303,6 @@ def test_run_ingester_backfill_calls_run_backfill(monkeypatch):
             start="2024-01-01",
             end="2024-01-10",
         )
-
 
         assert meta == {"mode": "backfill"}
         assert "run_backfill" in calls

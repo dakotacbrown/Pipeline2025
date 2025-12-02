@@ -105,7 +105,7 @@ def test_parse_args_minimal(monkeypatch):
     assert args.end_date is None
     assert args.log_level == "INFO"
     assert args.extra_env == []
-    assert args.event is None
+    # do NOT assume args.event exists – your real parser doesn’t define it
 
 
 def test_parse_args_with_extra_env_and_unknown(monkeypatch, capsys):
@@ -132,8 +132,6 @@ def test_parse_args_with_extra_env_and_unknown(monkeypatch, capsys):
             "FOO=bar",
             "--extra_env",
             "BAZ=qux",
-            "--event",
-            '{"foo": "bar"}',
             "--job-language",  # unknown / Glue noise
             "python",
         ],
@@ -147,7 +145,6 @@ def test_parse_args_with_extra_env_and_unknown(monkeypatch, capsys):
     assert args.end_date == "2024-01-31"
     assert args.log_level == "DEBUG"
     assert args.extra_env == ["FOO=bar", "BAZ=qux"]
-    assert args.event == '{"foo": "bar"}'
     assert "Ignoring unknown args" in out
 
 
@@ -183,6 +180,10 @@ def test_main_calls_run_ingester_and_prints_json(monkeypatch, capsys):
     old_environ = os.environ.copy()
     try:
         run_step.main()
+
+        # Check env var export *before* restoring old environ
+        assert os.environ["FOO"] == "bar"
+        assert "NO_EQUALS" not in os.environ
     finally:
         os.environ.clear()
         os.environ.update(old_environ)
@@ -201,7 +202,3 @@ def test_main_calls_run_ingester_and_prints_json(monkeypatch, capsys):
     # Check printed JSON
     out = capsys.readouterr().out.strip()
     assert json.loads(out) == {"status": "ok", "meta": {"rows": 42}}
-
-    # Check env var export (only ones with '=')
-    assert os.environ["FOO"] == "bar"
-    assert "NO_EQUALS" not in os.environ

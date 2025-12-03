@@ -1,11 +1,12 @@
 import json
 import os
 import sys
+from pathlib import Path
 import types
 
 import pytest
 
-from src import run_step
+import run_step
 
 
 # ------------------------
@@ -33,6 +34,7 @@ def test_setup_path_single_zip_adds_paths(tmp_path, monkeypatch):
 
     try:
         monkeypatch.chdir(tmp_path)
+        # create a fake bundle
         zip_file = tmp_path / "ingester_bundle_test.zip"
         zip_file.write_text("dummy")
 
@@ -40,11 +42,12 @@ def test_setup_path_single_zip_adds_paths(tmp_path, monkeypatch):
 
         run_step.setup_path()
 
-        zip_name = zip_file.name
-        zip_stem = zip_file.stem
+        zip_name = zip_file.name           # "ingester_bundle_test.zip"
+        zip_stem = zip_file.stem           # "ingester_bundle_test"
         expected_1 = f"{zip_name}/{zip_stem}/"
         expected_2 = f"{zip_name}/"
 
+        # inserted with sys.path.insert(0, ...)
         assert sys.path[0] == expected_2
         assert sys.path[1] == expected_1
     finally:
@@ -66,6 +69,7 @@ def test_setup_path_multiple_zips_raises(tmp_path, monkeypatch):
         with pytest.raises(ValueError):
             run_step.setup_path()
 
+        # sys.path should not have been modified on error
         assert sys.path == original_sys_path
     finally:
         os.chdir(original_cwd)
@@ -76,6 +80,7 @@ def test_setup_path_multiple_zips_raises(tmp_path, monkeypatch):
 # _parse_args tests
 # ------------------------
 def test_parse_args_minimal(monkeypatch):
+    # Only required args
     monkeypatch.setattr(
         sys,
         "argv",
@@ -100,6 +105,7 @@ def test_parse_args_minimal(monkeypatch):
     assert args.end_date is None
     assert args.log_level == "INFO"
     assert args.extra_env == []
+    # don't assume args.event exists; parser may not define it
 
 
 def test_parse_args_with_extra_env_and_unknown(monkeypatch, capsys):
@@ -126,7 +132,7 @@ def test_parse_args_with_extra_env_and_unknown(monkeypatch, capsys):
             "FOO=bar",
             "--extra_env",
             "BAZ=qux",
-            "--job-language",
+            "--job-language",  # unknown / Glue noise
             "python",
         ],
     )
@@ -146,6 +152,7 @@ def test_parse_args_with_extra_env_and_unknown(monkeypatch, capsys):
 # main() tests
 # ------------------------
 def test_main_calls_run_ingester_and_prints_json(monkeypatch, capsys):
+    # Fake args returned by _parse_args
     from types import SimpleNamespace
 
     fake_args = SimpleNamespace(
@@ -164,20 +171,6 @@ def test_main_calls_run_ingester_and_prints_json(monkeypatch, capsys):
     # Don't let tests reconfigure global logging
     monkeypatch.setattr(run_step.logging, "basicConfig", lambda *a, **k: None)
 
-    # Return a dummy logger whenever getLogger is called inside main()
-    class DummyLogger:
-        def debug(self, *a, **k): ...
-        def info(self, *a, **k): ...
-        def warning(self, *a, **k): ...
-        def error(self, *a, **k): ...
-        def exception(self, *a, **k): ...
-
-    monkeypatch.setattr(
-        run_step.logging,
-        "getLogger",
-        lambda name=None: DummyLogger(),
-    )
-
     # Fake src.api_wrapper.run_ingester
     called = {}
 
@@ -188,15 +181,19 @@ def test_main_calls_run_ingester_and_prints_json(monkeypatch, capsys):
     dummy_module = types.SimpleNamespace(run_ingester=fake_run_ingester)
     monkeypatch.setitem(sys.modules, "src.api_wrapper", dummy_module)
 
+    # Preserve environment
     old_environ = os.environ.copy()
     try:
         run_step.main()
+
+        # Check env var export *before* restoring old environ
         assert os.environ["FOO"] == "bar"
         assert "NO_EQUALS" not in os.environ
     finally:
         os.environ.clear()
         os.environ.update(old_environ)
 
+    # Check the ingester call
     assert called["kwargs"] == {
         "table": "accounts",
         "env_name": "dev",
@@ -207,5 +204,6 @@ def test_main_calls_run_ingester_and_prints_json(monkeypatch, capsys):
         "end": "2024-01-31",
     }
 
+    # Check printed JSON
     out = capsys.readouterr().out.strip()
     assert json.loads(out) == {"status": "ok", "meta": {"rows": 42}}

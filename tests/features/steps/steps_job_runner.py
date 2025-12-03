@@ -1,3 +1,5 @@
+# tests/features/steps/step_job_runner.py
+
 import io
 import json
 import os
@@ -7,7 +9,6 @@ from unittest.mock import MagicMock, patch
 
 from behave import given, when, then
 
-# run_step is in src/
 from src import run_step
 
 
@@ -26,12 +27,9 @@ def step_basic_glue_event(context):
 
 @when('I run the job runner in "once" mode')
 def step_run_job_runner_once(context):
-    # --- patch logging so main() doesn't reconfigure global logging ---
-    p_basic = patch("src.run_step.logging.basicConfig", lambda *a, **k: None)
-    p_logger = patch("src.run_step.logging.getLogger", return_value=DummyLogger())
-    context.patches.extend([p_basic, p_logger])
-    for p in context.patches:
-        p.start()
+    # If you really want to silence logs, you *could* do:
+    # patch("src.run_step.log", DummyLogger()), but it's optional.
+    # For now, we won't patch logging at all to avoid import issues.
 
     # --- patch run_ingester used inside run_step ---
     fake_run_ingester = MagicMock(return_value={"rows": 42})
@@ -102,7 +100,6 @@ def step_check_run_ingester_call(context):
         "end": "2024-01-31",
     }
 
-    # env vars from extra_env
     assert os.environ["FOO"] == "bar"
     assert "NO_EQUALS" not in os.environ
 

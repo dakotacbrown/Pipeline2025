@@ -2,17 +2,13 @@ import io
 import json
 import os
 import sys
-from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from behave import given, when, then
 
-# --- ensure project root is importable ---
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-import run_step  # now this should work
+# run_step is in src/
+from src import run_step
 
 
 class DummyLogger:
@@ -30,21 +26,21 @@ def step_basic_glue_event(context):
 
 @when('I run the job runner in "once" mode')
 def step_run_job_runner_once(context):
-    # --- patch logging ---
-    p_basic = patch("run_step.logging.basicConfig", lambda *a, **k: None)
-    p_logger = patch("run_step.logging.getLogger", return_value=DummyLogger())
+    # --- patch logging so main() doesn't reconfigure global logging ---
+    p_basic = patch("src.run_step.logging.basicConfig", lambda *a, **k: None)
+    p_logger = patch("src.run_step.logging.getLogger", return_value=DummyLogger())
     context.patches.extend([p_basic, p_logger])
     for p in context.patches:
         p.start()
 
-    # --- patch run_ingester imported inside run_step ---
+    # --- patch run_ingester used inside run_step ---
     fake_run_ingester = MagicMock(return_value={"rows": 42})
-    p_ingester = patch("run_step.run_ingester", fake_run_ingester)
+    p_ingester = patch("src.run_step.run_ingester", fake_run_ingester)
     context.patches.append(p_ingester)
     p_ingester.start()
     context.fake_run_ingester = fake_run_ingester
 
-    # --- set CLI args so _parse_args() has something to chew on ---
+    # --- supply CLI args for _parse_args() ---
     argv = [
         "prog",
         "-y",
@@ -63,9 +59,7 @@ def step_run_job_runner_once(context):
     context._old_argv = sys.argv
     sys.argv = argv
 
-    # --- override _parse_args to inject event ---
-    from types import SimpleNamespace
-
+    # --- override _parse_args so we can inject event ---
     fake_args = SimpleNamespace(
         yaml_path="config/ingester.yml",
         table="accounts",
@@ -77,7 +71,7 @@ def step_run_job_runner_once(context):
         extra_env=["FOO=bar", "NO_EQUALS"],
         event=context.event,
     )
-    p_args = patch("run_step._parse_args", lambda: fake_args)
+    p_args = patch("src.run_step._parse_args", lambda: fake_args)
     context.patches.append(p_args)
     p_args.start()
 
@@ -89,7 +83,7 @@ def step_run_job_runner_once(context):
     context._old_environ = os.environ.copy()
     os.environ.clear()
 
-    # --- run the system under test ---
+    # --- run system under test ---
     run_step.main()
 
 
@@ -108,6 +102,7 @@ def step_check_run_ingester_call(context):
         "end": "2024-01-31",
     }
 
+    # env vars from extra_env
     assert os.environ["FOO"] == "bar"
     assert "NO_EQUALS" not in os.environ
 

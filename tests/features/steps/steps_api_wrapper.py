@@ -1,21 +1,20 @@
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from behave import given, when, then
 
-import sys
-
+# make sure project root is on sys.path (if you need it)
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src import api_wrapper
+from src import api_wrapper  # noqa: E402
 
 
 @given("a basic API config and event")
 def step_basic_api_config_event(context):
-    # Shared event with c1_* keys
     context.event = {
         "env_vars": {"foo": "bar"},
         "c1_oauth_url": "https://c1-token.example.com",
@@ -25,13 +24,13 @@ def step_basic_api_config_event(context):
         "data_headers": {"hdr": "val"},
     }
 
-    # Patch YAML loader to avoid real disk I/O
+    # patch YAML loader
     p_yaml = patch(
         "src.api_wrapper._load_yaml_from_anywhere",
         return_value={"apis": {"accounts": {}}},
     )
 
-    # Capture env vars passed into helper
+    # capture env vars
     env_vars_seen = {}
 
     def fake_set_env_vars(env_vars):
@@ -39,14 +38,17 @@ def step_basic_api_config_event(context):
 
     p_env_vars = patch("src.api_wrapper.set_env_vars_from_dict", fake_set_env_vars)
 
-    # Never hit real network for OAuth
+    # no real HTTP
     p_oauth = patch(
         "src.api_wrapper.retrieve_oauth_token",
         MagicMock(return_value="tok123"),
     )
 
-    # MagicMock ApiIngester and its instance
+    # MagicMock ApiIngester instance with REAL dict return values
     ingester_instance = MagicMock()
+    ingester_instance.run_once.return_value = {"rows": 5}
+    ingester_instance.run_backfill.return_value = {"mode": "backfill"}
+
     p_ingester = patch("src.api_wrapper.ApiIngester", return_value=ingester_instance)
 
     context.patches.extend([p_yaml, p_env_vars, p_oauth, p_ingester])
@@ -56,7 +58,6 @@ def step_basic_api_config_event(context):
     context.env_vars_seen = env_vars_seen
     context.ingester_instance = ingester_instance
 
-    # Isolate environ
     context._old_environ = os.environ.copy()
     os.environ.clear()
 
@@ -101,7 +102,7 @@ def step_call_run_ingester_backfill_no_dates(context):
             start="2024-01-01",
             end=None,
         )
-    except Exception as exc:  # we expect ValueError
+    except Exception as exc:
         context.error = exc
 
 
@@ -114,10 +115,7 @@ def step_check_run_once_called(context):
     )
     inst.run_backfill.assert_not_called()
 
-    # env vars from dict helper
     assert context.env_vars_seen == {"foo": "bar"}
-
-    # core envs set
     assert os.environ["ENV"] == "dev"
     assert os.environ["TABLE"] == "accounts"
     assert os.environ["DATA_AUTH_TOKEN"] == "tok123"
@@ -133,7 +131,6 @@ def step_check_run_backfill_called(context):
     inst = context.ingester_instance
     inst.run_backfill.assert_called_once()
     inst.run_once.assert_not_called()
-    # basic sanity that env is set for backfill too
     assert os.environ["ENV"] == "prod"
 
 

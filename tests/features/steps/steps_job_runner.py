@@ -2,11 +2,17 @@ import io
 import json
 import os
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from behave import given, when, then
 
-from src import run_step
+# --- ensure project root is importable ---
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import run_step  # now this should work
 
 
 class DummyLogger:
@@ -19,27 +25,26 @@ class DummyLogger:
 
 @given("a basic Glue event")
 def step_basic_glue_event(context):
-    # You can add real fields later if needed.
     context.event = {"foo": "bar"}
 
 
 @when('I run the job runner in "once" mode')
 def step_run_job_runner_once(context):
-    # --- patch logging so tests don't reconfigure global logging ---
+    # --- patch logging ---
     p_basic = patch("run_step.logging.basicConfig", lambda *a, **k: None)
     p_logger = patch("run_step.logging.getLogger", return_value=DummyLogger())
     context.patches.extend([p_basic, p_logger])
     for p in context.patches:
         p.start()
 
-    # --- patch run_ingester imported by run_step (component boundary) ---
+    # --- patch run_ingester imported inside run_step ---
     fake_run_ingester = MagicMock(return_value={"rows": 42})
     p_ingester = patch("run_step.run_ingester", fake_run_ingester)
     context.patches.append(p_ingester)
     p_ingester.start()
     context.fake_run_ingester = fake_run_ingester
 
-    # --- set CLI args for _parse_args() ---
+    # --- set CLI args so _parse_args() has something to chew on ---
     argv = [
         "prog",
         "-y",
@@ -58,7 +63,7 @@ def step_run_job_runner_once(context):
     context._old_argv = sys.argv
     sys.argv = argv
 
-    # --- patch _parse_args so we can inject the event directly ---
+    # --- override _parse_args to inject event ---
     from types import SimpleNamespace
 
     fake_args = SimpleNamespace(
@@ -76,7 +81,7 @@ def step_run_job_runner_once(context):
     context.patches.append(p_args)
     p_args.start()
 
-    # --- capture stdout & isolate environment ---
+    # --- capture stdout & env ---
     context._old_stdout = sys.stdout
     context.stdout = io.StringIO()
     sys.stdout = context.stdout
@@ -84,7 +89,7 @@ def step_run_job_runner_once(context):
     context._old_environ = os.environ.copy()
     os.environ.clear()
 
-    # --- run main (system under test) ---
+    # --- run the system under test ---
     run_step.main()
 
 
@@ -103,7 +108,6 @@ def step_check_run_ingester_call(context):
         "end": "2024-01-31",
     }
 
-    # env vars from extra_env
     assert os.environ["FOO"] == "bar"
     assert "NO_EQUALS" not in os.environ
 

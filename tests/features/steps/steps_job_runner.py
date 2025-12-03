@@ -33,7 +33,8 @@ def step_run_job_runner_once(context):
 
     # --- patch run_ingester used inside run_step ---
     fake_run_ingester = MagicMock(return_value={"rows": 42})
-    p_ingester = patch("src.run_step.run_ingester", fake_run_ingester)
+    # run_ingester is imported from src.api_wrapper inside run_step.main
+    p_ingester = patch("src.api_wrapper.run_ingester", fake_run_ingester)
     context.patches.append(p_ingester)
     p_ingester.start()
     context.fake_run_ingester = fake_run_ingester

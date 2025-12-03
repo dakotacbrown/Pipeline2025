@@ -1,12 +1,11 @@
 import json
 import os
 import sys
-from pathlib import Path
 import types
 
 import pytest
 
-import run_step
+from src import run_step
 
 
 # ------------------------
@@ -167,8 +166,21 @@ def test_main_calls_run_ingester_and_prints_json(monkeypatch, capsys):
     )
     monkeypatch.setattr(run_step, "_parse_args", lambda: fake_args)
 
-    # Don't let tests reconfigure global logging
+    # Block global logging configuration + logger formatting
     monkeypatch.setattr(run_step.logging, "basicConfig", lambda *a, **k: None)
+
+    class DummyLogger:
+        def debug(self, *a, **k): pass
+        def info(self, *a, **k): pass
+        def warning(self, *a, **k): pass
+        def error(self, *a, **k): pass
+        def exception(self, *a, **k): pass
+
+    monkeypatch.setattr(
+        run_step.logging,
+        "getLogger",
+        lambda name=None: DummyLogger(),
+    )
 
     # Fake src.api_wrapper.run_ingester
     called = {}
@@ -178,6 +190,7 @@ def test_main_calls_run_ingester_and_prints_json(monkeypatch, capsys):
         return {"rows": 42}
 
     dummy_module = types.SimpleNamespace(run_ingester=fake_run_ingester)
+    # run_step imports from src.api_wrapper, so patch that name
     monkeypatch.setitem(sys.modules, "src.api_wrapper", dummy_module)
 
     # Preserve environment

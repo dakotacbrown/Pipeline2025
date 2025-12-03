@@ -182,6 +182,19 @@ def test_load_yaml_from_anywhere_raises_when_not_found(monkeypatch):
 # ------------------------
 # run_ingester
 # ------------------------
+def _patch_api_ingester_to_dummy(monkeypatch, DummyIngester):
+    """
+    Patch both the alias in src.api_wrapper and the original
+    library path so no real HTTP/database work happens.
+    """
+    monkeypatch.setattr(api_wrapper, "ApiIngester", DummyIngester)
+    monkeypatch.setattr(
+        "asvclscoresdataservices_common.ingester.api_ingester.ApiIngester",
+        DummyIngester,
+        raising=False,
+    )
+
+
 def test_run_ingester_once_sets_env_and_calls_run_once(monkeypatch):
     # stub YAML loader
     loaded_cfg: Dict[str, Any] = {"apis": {"foo": "bar"}}
@@ -223,16 +236,16 @@ def test_run_ingester_once_sets_env_and_calls_run_once(monkeypatch):
             calls_ingester["run_backfill"] = (args, kwargs)
             return {"rows": 99}
 
-    monkeypatch.setattr(api_wrapper, "ApiIngester", DummyIngester)
+    _patch_api_ingester_to_dummy(monkeypatch, DummyIngester)
 
     old_environ = os.environ.copy()
     try:
         event = {
             "env_vars": {"foo": "bar"},
-            "cl_oauth_url": "https://cl-token.example.com",
+            "c1_oauth_url": "https://c1-token.example.com",
             "exchange_headers": {"ex": "hdr"},
             "exchange_data": {"ex": "data"},
-            "data_auth": {"cl_oauth_url": "https://token.example.com"},
+            "data_auth": {"c1_oauth_url": "https://c1-token.example.com"},
             "data_headers": {"hdr": "val"},
         }
 
@@ -290,7 +303,7 @@ def test_run_ingester_backfill_calls_run_backfill(monkeypatch):
             calls["run_backfill"] = (args, kwargs)
             return {"mode": "backfill"}
 
-    monkeypatch.setattr(api_wrapper, "ApiIngester", DummyIngester)
+    _patch_api_ingester_to_dummy(monkeypatch, DummyIngester)
 
     old_environ = os.environ.copy()
     try:
@@ -298,7 +311,7 @@ def test_run_ingester_backfill_calls_run_backfill(monkeypatch):
             table="events",
             env_name="prod",
             yaml_path="config.yml",
-            event={"cl_oauth_url": "https://cl-token.example.com"},
+            event={"c1_oauth_url": "https://c1-token.example.com"},
             run_mode="backfill",
             start="2024-01-01",
             end="2024-01-10",
@@ -315,14 +328,19 @@ def test_run_ingester_backfill_calls_run_backfill(monkeypatch):
 def test_run_ingester_backfill_requires_start_and_end(monkeypatch):
     monkeypatch.setattr(api_wrapper, "_load_yaml_from_anywhere", lambda p: {})
     monkeypatch.setattr(api_wrapper, "set_env_vars_from_dict", lambda env: None)
-    monkeypatch.setattr(api_wrapper, "ApiIngester", lambda *a, **k: object())
+
+    class DummyIngester:
+        def __init__(self, *a, **k):
+            pass
+
+    _patch_api_ingester_to_dummy(monkeypatch, DummyIngester)
 
     with pytest.raises(ValueError):
         api_wrapper.run_ingester(
             table="t",
             env_name="dev",
             yaml_path="cfg.yml",
-            event={"cl_oauth_url": "https://cl-token.example.com"},
+            event={"c1_oauth_url": "https://c1-token.example.com"},
             run_mode="backfill",
             start="2024-01-01",
             end=None,

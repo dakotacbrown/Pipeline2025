@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from behave import given, when, then
+from behave import given, then, when
 
 # make sure project root is on sys.path (if you need it)
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -36,7 +36,9 @@ def step_basic_api_config_event(context):
     def fake_set_env_vars(env_vars):
         env_vars_seen.update(env_vars)
 
-    p_env_vars = patch("src.api_wrapper.set_env_vars_from_dict", fake_set_env_vars)
+    p_env_vars = patch(
+        "src.api_wrapper.set_env_vars_from_dict", fake_set_env_vars
+    )
 
     # no real HTTP
     p_oauth = patch(
@@ -49,7 +51,9 @@ def step_basic_api_config_event(context):
     ingester_instance.run_once.return_value = {"rows": 5}
     ingester_instance.run_backfill.return_value = {"mode": "backfill"}
 
-    p_ingester = patch("src.api_wrapper.ApiIngester", return_value=ingester_instance)
+    p_ingester = patch(
+        "src.api_wrapper.ApiIngester", return_value=ingester_instance
+    )
 
     context.patches.extend([p_yaml, p_env_vars, p_oauth, p_ingester])
     for p in context.patches:

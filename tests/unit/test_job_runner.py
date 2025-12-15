@@ -1,11 +1,10 @@
 import json
 import os
 import sys
-from pathlib import Path
 import types
+from pathlib import Path
 
 import pytest
-
 import run_step
 
 
@@ -42,8 +41,8 @@ def test_setup_path_single_zip_adds_paths(tmp_path, monkeypatch):
 
         run_step.setup_path()
 
-        zip_name = zip_file.name           # "ingester_bundle_test.zip"
-        zip_stem = zip_file.stem           # "ingester_bundle_test"
+        zip_name = zip_file.name  # "ingester_bundle_test.zip"
+        zip_stem = zip_file.stem  # "ingester_bundle_test"
         expected_1 = f"{zip_name}/{zip_stem}/"
         expected_2 = f"{zip_name}/"
 

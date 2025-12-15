@@ -7,8 +7,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from behave import given, when, then
-
+from behave import given, then, when
 from src import run_step
 
 

@@ -1,146 +1,145 @@
-# ingestor_wrapper.py
 from __future__ import annotations
 
 import json
-import logging
-import sys
-from datetime import date, datetime
-from pathlib import Path
+import os
+from datetime import datetime
 from typing import Any, Dict, Optional
-from zipfile import ZipFile
 
-import yaml  # pyyaml must be available in the job/bundle
+import requests
 
-# Your ingestor implementation
-from api_ingestor import ApiIngestor
+from api_ingestor.api_ingestor import ApiIngestor
+from utils.basic_logger import setup_logger
 
-LOG = logging.getLogger("ingestor_wrapper")
-if not LOG.handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
-    )
+log = setup_logger()
 
 
-# ---------------------------------------------------------------------
-# Helpers: load YAML from disk or from any .zip found on sys.path
-# ---------------------------------------------------------------------
-def _zip_candidates_from_sys_path() -> list[Path]:
-    """Find any .zip files referenced by sys.path entries.
-
-    Handles entries like:
-      '<zip>.zip', '<zip>.zip/', '<zip>.zip/Python', etc.
-    Returns unique, existing Paths to the .zip files.
-    """
-    cands: list[Path] = []
-    seen: set[Path] = set()
-    for p in sys.path:
-        low = p.lower()
-        if ".zip" not in low:
+def set_env_vars_from_dict(env_vars: Dict[str, str]) -> None:
+    """Set environment variables from a dictionary."""
+    for key, value in env_vars.items():
+        if not key or not value:
+            log.warning("Skipping empty env var %s=%s", key, value)
             continue
-        try:
-            # normalize to the actual .zip
-            idx = low.find(".zip")
-            zp = Path(p[: idx + 4]).resolve()
-            if zp.suffix.lower() == ".zip" and zp.exists() and zp not in seen:
-                cands.append(zp)
-                seen.add(zp)
-        except Exception:
-            # ignore malformed path entries
-            continue
-    return cands
+
+        os.environ[key.upper()] = value
+        log.info("Set env %s=%s", key, value)
 
 
-def _read_text_from_zip(zip_path: Path, inner_path: str) -> Optional[str]:
-    """Try to read a file from a zip, considering common subpath layouts:
-
-    inner_path   Python/inner_path   <zip_stem>/inner_path <zip_stem>/Python/inner_path
-    Returns the text or None if not found.
-    """
-    inner = inner_path.lstrip("/")
-    variants = [inner, f"Python/{inner}"]
-    stem = zip_path.stem
-    variants += [f"{stem}/{inner}", f"{stem}/Python/{inner}"]
-
-    try:
-        with ZipFile(zip_path, "r") as zf:
-            for candidate in variants:
-                try:
-                    with zf.open(candidate) as fh:
-                        return fh.read().decode("utf-8")
-                except KeyError:
-                    continue
-    except Exception:
-        # don't let a single bad zip abort the search
-        return None
-    return None
-
-
-def _load_yaml_from_anywhere(yaml_path: str) -> Dict[str, Any]:
-    """Load YAML from disk (if present) or from any zip on sys.path (Glue job style)."""
-    p = Path(yaml_path)
-    if p.exists():
-        LOG.info("Loading YAML from filesystem: %s", p)
-        return yaml.safe_load(p.read_text())
-
-    for z in _zip_candidates_from_sys_path():
-        text = _read_text_from_zip(z, yaml_path)
-        if text is not None:
-            LOG.info("Loaded YAML from zip: %s :: %s", z, yaml_path)
-            return yaml.safe_load(text)
-
-    raise FileNotFoundError(
-        f"Could not locate YAML '{yaml_path}' on disk or in any sys.path zip."
+def retrieve_oauth_token(
+    oauth_link: str,
+    headers: dict,
+    data: dict,
+) -> str:
+    """Call the OAuth endpoint and return the access token."""
+    response = requests.post(
+        oauth_link,
+        headers=headers,
+        data=data,
+        verify=False,
     )
+    response.raise_for_status()
+
+    json_data = response.json()
+    access_token = json_data["access_token"]
+    return access_token
 
 
-# ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Public entrypoint used by the runner
-# ---------------------------------------------------------------------
-def run_ingestor(
+# ---------------------------------------------------------------------------
+
+
+def run_ingester(
     table: str,
-    env_name: str,
-    yaml_path: str,
+    env: str,
+    event: Dict[str, Any],
+    config: Dict[str, Any],
     run_mode: str = "once",
     start: Optional[str] = None,
     end: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Execute the ApiIngestor and return the metadata dict.
+    """
+    Execute the ApiIngester and return the metadata dict.
 
     Args:
-        table:     Table key under 'apis' in the YAML (e.g. 'events_api').
-        env_name:  Environment key under 'envs' (e.g. 'dev', 'prod').
-        yaml_path: Path to the YAML within the bundle or local FS (e.g. 'config/ingestor.yml').
-        run_mode:  'once' or 'backfill'.
-        start:     (backfill) 'YYYY-MM-DD'.
-        end:       (backfill) 'YYYY-MM-DD'.
+        table: Table key under 'apis' in the YAML (e.g., 'events_api').
+        env: Environment key under 'envs' (e.g., 'dev', 'prod').
+        event: Glue event dict containing headers/auth config.
+        config: Loaded YAML configuration dictionary.
+        run_mode: 'once' or 'backfill'.
+        start: (backfill) 'YYYY-MM-DD'.
+        end: (backfill) 'YYYY-MM-DD'.
     """
+    # env-specific vars from the YAML
+    env_vars_all = config.get("env_vars", {})
+    env_vars = env_vars_all.get(env, {})
+    set_env_vars_from_dict(env_vars)
+
     if not table:
         raise ValueError("Parameter 'table' is required.")
-    if not env_name:
-        raise ValueError("Parameter 'env_name' is required.")
+    if not env:
+        raise ValueError("Parameter 'env' is required.")
 
-    config = _load_yaml_from_anywhere(yaml_path)
-    ing = ApiIngestor(config=config, log=LOG)
+    # Exchange OAuth
+    exchange_headers = event.get("exchange_headers", {})
+    exchange_data = event.get("exchange_data", {})
 
-    if (run_mode or "once").lower() == "backfill":
+    c1_oauth_token = retrieve_oauth_token(
+        event.get("c1_oauth_url", ""),
+        exchange_headers,
+        exchange_data,
+    )
+
+    # Optional data OAuth
+    data_headers = event.get("data_headers", {})
+    data_auth = event.get("data_auth", {})
+
+    if "data_headers" in event and "data_auth" in event:
+        data_oauth_token = retrieve_oauth_token(
+            event.get("data_auth_url", ""),
+            data_headers,
+            data_auth,
+        )
+        os.environ["DATA_OAUTH_TOKEN"] = data_oauth_token
+
+    # Fixed proxy + job-wide env vars
+    os.environ["C1_OAUTH_TOKEN"] = c1_oauth_token
+    os.environ["HTTPS_PROXY"] = "http://aws-proxy-qa.cloud.capitalone.com:8099"
+    os.environ["HTTP_PROXY"] = "http://aws-proxy-qa.cloud.capitalone.com:8099"
+    os.environ["NO_PROXY"] = (
+        "169.254.169.254,170.2.0.1,localhost,s3.amazonaws.com,"
+        "s3.amazonaws.com,kdc.capitalone.com,cloud.capitalone.com,"
+        "cloudgdt.capitalone.com"
+    )  # noqa
+
+    os.environ["ENV"] = env
+    os.environ["TABLE"] = table
+    if start:
+        os.environ["START_DATE"] = start
+    if end:
+        os.environ["END_DATE"] = end
+
+    api = ApiIngestor(config=config, log=log)
+
+    if run_mode.lower() == "backfill":
         if not start or not end:
             raise ValueError(
                 "Backfill requires both 'start' and 'end' (YYYY-MM-DD)."
             )
+
         try:
-            d0: date = datetime.strptime(start, "%Y-%m-%d").date()
-            d1: date = datetime.strptime(end, "%Y-%m-%d").date()
-        except Exception as e:
+            d1 = datetime.strptime(start, "%Y-%m-%d").date()
+            d2 = datetime.strptime(end, "%Y-%m-%d").date()
+        except Exception as e:  # noqa: BLE001
             raise ValueError(
-                f"Invalid start/end; expected YYYY-MM-DD. Got start={start!r}, end={end!r}"
+                f"Invalid start/end; expected 'YYYY-MM-DD'. "
+                f"Got start={start!r}, end={end!r}"
             ) from e
 
-        meta = ing.run_backfill(
-            table_name=table, env_name=env_name, start=d0, end=d1
+        meta = api.run_backfill(
+            table_name=table, env_name=env, start=d1, end=d2
         )
     else:
-        meta = ing.run_once(table_name=table, env_name=env_name)
+        meta = api.run_once(table_name=table, env_name=env)
 
-    LOG.info("Ingestor metadata: %s", json.dumps(meta))
+    log.info("Ingester metadata: %s", json.dumps(meta))
     return meta

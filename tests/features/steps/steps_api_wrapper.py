@@ -1,114 +1,150 @@
 import os
+from datetime import date
 from unittest.mock import MagicMock, patch
+
 from behave import given, when, then
+
+# Import the function under test
+from src.api_wrapper import run_ingester
+
+
+def _mock_requests_post(token: str = "fake_token"):
+    """
+    Build a fake requests.post response object with:
+      - raise_for_status()
+      - json() -> {"access_token": token}
+    """
+    resp = MagicMock()
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = {"access_token": token}
+    return resp
 
 
 @given("a valid wrapper config and event")
 def step_valid_wrapper_inputs(context):
-    context.config = {
+    # IMPORTANT: Behave reserves context.config internally.
+    # Use a different attribute name to store your wrapper configuration.
+    context.wrapper_config = {
         "env_vars": {
-            "dev": {"FOO": "bar"}
+            "dev": {
+                "FOO": "bar",
+                # you can add anything else you expect to set into env here
+            }
         }
     }
 
+    # event keys based on what your wrapper reads in the screenshots
     context.event = {
-        "c1_oauth_url": "https://oauth",
-        "exchange_headers": {},
-        "exchange_data": {},
-        "data_headers": {},
-        "data_auth": {},
-        "data_auth_url": "https://oauth2",
+        "c1_oauth_url": "https://example.com/c1/oauth",
+        "exchange_headers": {"h": "v"},
+        "exchange_data": {"grant_type": "client_credentials"},
+        # optional path: if present, wrapper will fetch a 2nd token
+        "data_headers": {"h2": "v2"},
+        "data_auth": {"client_id": "abc", "client_secret": "xyz"},
+        "data_auth_url": "https://example.com/data/oauth",
     }
 
-
-@when('run_ingester is called in "{mode}" mode')
-def step_run_ingester_once(context, mode):
-    fake_resp = MagicMock()
-    fake_resp.raise_for_status.return_value = None
-    fake_resp.json.return_value = {"access_token": "TOKEN"}
-
-    fake_api = MagicMock()
-    fake_api.run_once.return_value = {"rows": 1}
-
-    with patch.dict(os.environ, {}, clear=True), \
-         patch("src.api_wrapper.requests.post", return_value=fake_resp), \
-         patch("src.api_wrapper.ApiIngester", return_value=fake_api):
-
-        from src.api_wrapper import run_ingester
-
-        context.result = run_ingester(
-            table="table1",
-            env="dev",
-            event=context.event,
-            config=context.config,
-            run_mode=mode,
-        )
-
-        context.api = fake_api
+    # defaults the scenarios can use
+    context.table = "events_api"
+    context.env = "dev"
+    context.start = "2025-01-01"
+    context.end = "2025-01-02"
 
 
-@when('run_ingester is called in "backfill" mode with dates')
-def step_run_backfill(context):
-    fake_resp = MagicMock()
-    fake_resp.raise_for_status.return_value = None
-    fake_resp.json.return_value = {"access_token": "TOKEN"}
+@when('I call run_ingester in "{mode}" mode')
+def step_call_run_ingester(context, mode):
+    # isolate env mutations so tests don't leak across scenarios
+    with patch.dict(os.environ, {}, clear=True):
+        # Patch the ApiIngester constructor in the module where it's used (src.api_wrapper)
+        # and patch requests.post (also used inside src.api_wrapper.retrieve_oauth_token).
+        with patch("src.api_wrapper.ApiIngester") as MockIngester, patch(
+            "src.api_wrapper.requests.post",
+            return_value=_mock_requests_post("token123"),
+        ):
+            # configure ApiIngester instance behavior
+            ingester_instance = MockIngester.return_value
+            ingester_instance.run_once.return_value = {"meta_rows": 1}
+            ingester_instance.run_backfill.return_value = {"meta_rows": 2}
 
-    fake_api = MagicMock()
-    fake_api.run_backfill.return_value = {"rows": 2}
+            context._MockIngester = MockIngester
+            context._ingester_instance = ingester_instance
 
-    with patch.dict(os.environ, {}, clear=True), \
-         patch("src.api_wrapper.requests.post", return_value=fake_resp), \
-         patch("src.api_wrapper.ApiIngester", return_value=fake_api):
-
-        from src.api_wrapper import run_ingester
-
-        run_ingester(
-            table="table1",
-            env="dev",
-            event=context.event,
-            config=context.config,
-            run_mode="backfill",
-            start="2024-01-01",
-            end="2024-01-02",
-        )
-
-        context.api = fake_api
-
-
-@when('run_ingester is called in "backfill" mode without dates')
-def step_run_backfill_no_dates(context):
-    context.error = None
-
-    with patch("src.api_wrapper.ApiIngester"):
-        from src.api_wrapper import run_ingester
-
-        try:
-            run_ingester(
-                table="table1",
-                env="dev",
+            context.result = run_ingester(
+                table=context.table,
+                env=context.env,
                 event=context.event,
-                config=context.config,
-                run_mode="backfill",
+                config=context.wrapper_config,
+                run_mode=mode,
+                start=context.start,
+                end=context.end,
             )
-        except Exception as e:
-            context.error = e
 
 
-@then("ApiIngester.run_once is invoked")
-def step_assert_run_once(context):
-    context.api.run_once.assert_called_once()
+@when('I call run_ingester in "{mode}" mode with dates')
+def step_call_run_ingester_with_dates(context, mode):
+    # just an explicit alias for readability in the feature file
+    step_call_run_ingester(context, mode)
 
 
-@then("ApiIngester.run_backfill is invoked")
-def step_assert_run_backfill(context):
-    context.api.run_backfill.assert_called_once()
+@when('I call run_ingester in "{mode}" mode without dates')
+def step_call_run_ingester_without_dates(context, mode):
+    with patch.dict(os.environ, {}, clear=True):
+        with patch("src.api_wrapper.ApiIngester") as MockIngester, patch(
+            "src.api_wrapper.requests.post",
+            return_value=_mock_requests_post("token123"),
+        ):
+            context._MockIngester = MockIngester
+            context._ingester_instance = MockIngester.return_value
+
+            context.raised = None
+            try:
+                run_ingester(
+                    table=context.table,
+                    env=context.env,
+                    event=context.event,
+                    config=context.wrapper_config,
+                    run_mode=mode,
+                    start=None,
+                    end=None,
+                )
+            except Exception as exc:  # behave-style capture
+                context.raised = exc
 
 
-@then("the wrapper returns metadata")
-def step_assert_meta(context):
-    assert context.result["rows"] == 1
+@then("ApiIngester run_once is called")
+def step_assert_run_once_called(context):
+    context._MockIngester.assert_called_once()
+    context._ingester_instance.run_once.assert_called_once_with(
+        table=context.table,
+        env_name=context.env,
+    )
 
 
-@then("a ValueError is raised")
-def step_assert_value_error(context):
-    assert isinstance(context.error, ValueError)
+@then("ApiIngester run_backfill is called")
+def step_assert_run_backfill_called(context):
+    context._MockIngester.assert_called_once()
+
+    # your wrapper parses YYYY-MM-DD into date objects
+    expected_start = date.fromisoformat(context.start)
+    expected_end = date.fromisoformat(context.end)
+
+    context._ingester_instance.run_backfill.assert_called_once_with(
+        table=context.table,
+        env_name=context.env,
+        start=expected_start,
+        end=expected_end,
+    )
+
+
+@then("run_ingester returns the meta rows")
+def step_assert_returns_meta(context):
+    # We don't know your exact meta structure; we assert it returns whatever the ingester returns.
+    # For once-mode in this file, we set run_once.return_value = {"meta_rows": 1}
+    assert isinstance(context.result, dict)
+    assert "meta_rows" in context.result
+
+
+@then("run_ingester raises a ValueError")
+def step_assert_raises_value_error(context):
+    assert context.raised is not None, "Expected an exception but none was raised."
+    assert isinstance(context.raised, ValueError), f"Expected ValueError, got {type(context.raised)}: {context.raised}"

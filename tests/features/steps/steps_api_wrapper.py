@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from behave import given, when, then
 from unittest.mock import patch
+
+from behave import given, then, when
 
 
 # -------------------------
@@ -149,13 +150,17 @@ def step_assert_run_once_called(context):
 def step_assert_run_backfill_called(context):
     assert context.raised is None, f"Unexpected exception: {context.raised}"
     inst = context.MockIngester.return_value
-    assert inst.run_backfill.called, "Expected ApiIngester.run_backfill to be called"
+    assert (
+        inst.run_backfill.called
+    ), "Expected ApiIngester.run_backfill to be called"
 
 
 @then("run_ingester returns the meta rows")
 def step_assert_returns_meta_rows(context):
     assert context.raised is None, f"Unexpected exception: {context.raised}"
-    assert context.result is not None, "Expected run_ingester to return a result"
+    assert (
+        context.result is not None
+    ), "Expected run_ingester to return a result"
     # keep this flexible: just ensure it looks like metadata came back
     assert isinstance(context.result, dict), "Expected metadata dict"
     assert len(context.result) > 0, "Expected non-empty metadata dict"
@@ -163,7 +168,9 @@ def step_assert_returns_meta_rows(context):
 
 @then("run_ingester raises a ValueError")
 def step_assert_value_error(context):
-    assert context.raised is not None, "Expected an exception but none was raised"
+    assert (
+        context.raised is not None
+    ), "Expected an exception but none was raised"
     assert isinstance(
         context.raised, ValueError
     ), f"Expected ValueError, got {type(context.raised)}: {context.raised}"

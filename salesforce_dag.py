@@ -1,37 +1,45 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
+from typing import Any, Dict, List
 
 from airflow import DAG
+from airflow.decorators import task
 from airflow.models import Variable
-from airflow.operators.python import PythonOperator
-from airflow.providers.amazon.aws.operators.glue import AwsGlueJobOperator
+from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
+
+from dags.common.dag_utilities import get_shairflow_environment, get_shairflow_region
 
 
-def build_event_json(**context) -> str:
-    """
-    Build the `--event` payload your run_step.py expects.
-    You can pass overrides at trigger time via dag_run.conf.
-    """
-    conf = (context.get("dag_run").conf or {}) if context.get("dag_run") else {}
+def _safe_task_id(s: str) -> str:
+    # Airflow task_ids: letters/numbers/_ only
+    s = re.sub(r"[^a-zA-Z0-9_]+", "_", str(s))
+    return s.strip("_").lower()
 
-    # Example shape based on your wrapper screenshots:
-    # event.env_vars[env] -> dict of env vars to export
-    env = conf.get("env", "dev")
-    event = {
-        "env_vars": {env: conf.get("env_vars", {"FOO": "bar"})},
-        # OAuth bits (only include if your wrapper expects them)
-        "c1_oauth_url": conf.get("c1_oauth_url", "https://example/token"),
-        "exchange_headers": conf.get("exchange_headers", {}),
-        "exchange_data": conf.get("exchange_data", {}),
-        # Optional second token flow
-        "data_headers": conf.get("data_headers", {}),
-        "data_auth": conf.get("data_auth", {}),
-        "data_auth_url": conf.get("data_auth_url", ""),
-    }
 
-    return json.dumps(event)
+# Parse-time config (Variables are read when the DAG is parsed)
+env = get_shairflow_environment().lower()
+region = get_shairflow_region().lower()
+
+etl_job_name = Variable.get("INGESTER_GLUE_JOB_NAME", "etl-job")
+etl_conn_name = Variable.get("INGESTER_GLUE_CONN_NAME", "etl-net-conn")
+run_mode = Variable.get("INGESTER_RUN_MODE", "qa")
+
+tables: List[str] = json.loads(Variable.get("INGESTER_TABLES", "[]"))
+vendor = Variable.get("INGESTER_VENDOR", "salesforce")
+config_path = Variable.get("INGESTER_CONFIG_PATH", None)
+repo_name = Variable.get("INGESTER_CONFIG_REPO_NAME", "config_management")
+github_token = Variable.get("CISCOREDATASERVICES_GITHUB_PASSWORD", None)
+
+start_date = Variable.get("INGESTER_START_DATE", "2000-01-01")
+end_date = Variable.get("INGESTER_END_DATE", datetime.now().strftime("%Y-%m-%d"))
+
+# These are dict-shaped in your code (you use .get and **expansion), so default to "{}"
+env_vars: Dict[str, Dict[str, str]] = json.loads(Variable.get("INGESTER_ENV_VARS", "{}"))
+exchange_extras: Dict[str, Any] = json.loads(Variable.get("INGESTER_EXCHANGE_EXTRAS", "{}"))
+data_extras: Dict[str, Any] = json.loads(Variable.get("INGESTER_DATA_EXTRAS", "{}"))
 
 
 with DAG(
@@ -43,42 +51,51 @@ with DAG(
     tags=["glue", "ingestion"],
 ) as dag:
 
-    build_event = PythonOperator(
-        task_id="build_event",
-        python_callable=build_event_json,
-    )
+    @task(task_id="build_event")
+    def build_event_json() -> str:
+        """
+        Build the '--event' payload your run_step.py expects.
+        You said you want to build the event in the DAG (not from dag_run.conf).
+        """
+        base_event: Dict[str, Any] = {
+            "env_vars": (env_vars.get(env, {}) if isinstance(env_vars, dict) else {})
+        }
 
-    run_glue = AwsGlueJobOperator(
-        task_id="run_glue_job",
-        job_name=Variable.get("DEBI_INGESTOR_GLUE_JOB_NAME"),  # or hardcode
-        aws_conn_id="aws_default",
-        region_name=Variable.get("AWS_REGION", default_var="us-east-1"),
-        # If your Glue job is already created and points at run_step.py,
-        # you generally do NOT need to set script_location here.
-        # These become the args your run_step.py parses (argparse).
-        script_args={
-            "--env": "{{ dag_run.conf.get('env', 'dev') }}",
-            "--run_mode": "{{ dag_run.conf.get('run_mode', 'once') }}",
-            "--table": "{{ dag_run.conf.get('table', 'events_api') }}",
-            "--vendor": "{{ dag_run.conf.get('vendor', 'default') }}",
-            # GitHub config fetch (runner uses GithubConnection)
-            "--repo_name": "{{ dag_run.conf.get('repo_name', 'my-repo') }}",
-            "--file_path": "{{ dag_run.conf.get('file_path', 'path/to/config.yml') }}",
-            "--github_token": Variable.get("GITHUB_TOKEN"),
-            # Backfill dates (runner supports these)
-            "--start_date": "{{ dag_run.conf.get('start_date', '') }}",
-            "--end_date": "{{ dag_run.conf.get('end_date', '') }}",
-            # Your runner supports repeatable `--extra_env KEY=VALUE`
-            # (Glue args typically don’t love repeated keys; a common workaround is
-            # to pass one combined string and split inside the runner, but if
-            # yours already supports repeats and you can provide them, great.)
-            # Example single value:
-            "--extra_env": "{{ dag_run.conf.get('extra_env', '') }}",
-            # Pass event as a JSON string
-            "--event": "{{ ti.xcom_pull(task_ids='build_event') }}",
-        },
-        wait_for_completion=True,
-        # You can also set `poll_interval=...` if you want.
-    )
+        if isinstance(exchange_extras, dict):
+            base_event.update(exchange_extras)
 
-    build_event >> run_glue
+        if isinstance(data_extras, dict) and data_extras:
+            base_event.update(data_extras)
+
+        return json.dumps(base_event)
+
+    event_json = build_event_json()
+
+    if not isinstance(tables, list):
+        tables = [tables]
+
+    for table in tables:
+        task_id = f"run_glue_job__{_safe_task_id(table)}"
+
+        run_glue = GlueJobOperator(
+            task_id=task_id,
+            job_name=etl_job_name,
+            aws_conn_id=etl_conn_name,
+            region_name=region,
+            script_args={
+                "--env": env,
+                "--run_mode": run_mode,
+                "--table": table,
+                "--vendor": vendor,
+                "--repo_name": repo_name,
+                "--file_path": config_path,
+                "--github_token": github_token,
+                "--start_date": start_date,
+                "--end_date": end_date,
+                # Pull the JSON string built by build_event
+                "--event": "{{ ti.xcom_pull(task_ids='build_event') }}",
+            },
+            wait_for_completion=True,
+        )
+
+        event_json >> run_glue

@@ -4,9 +4,10 @@ import os
 import sys
 import types
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
-import requests  # <-- add this
+import requests
 
 
 @pytest.fixture()
@@ -102,14 +103,19 @@ def test_parse_args_parses_event_json_and_extra_env(run_step_module, capsys):
 def test_main_happy_path_no_network(run_step_module, monkeypatch, capsys):
     mod = run_step_module
 
-    # ---- block ALL requests network calls (post/get/etc)
-    def _no_http(*args, **kwargs):
-        raise AssertionError(
-            "Network call attempted via requests during unit test"
-        )
+    # ---- patch ALL requests network calls to return a fake response
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.raise_for_status.return_value = None
+    fake_resp.json.return_value = {"mock": True}
+    fake_resp.text = "{}"
+    fake_resp.content = b"{}"
 
+    mock_request = MagicMock(return_value=fake_resp)
+
+    # This catches requests.get/post/etc, including deep calls in libraries
     monkeypatch.setattr(
-        requests.sessions.Session, "request", _no_http, raising=True
+        requests.sessions.Session, "request", mock_request, raising=True
     )
 
     # prevent filesystem/path scanning affecting test
@@ -125,7 +131,7 @@ def test_main_happy_path_no_network(run_step_module, monkeypatch, capsys):
     )
     basic_logger_mod.setup_logger = lambda: DummyLog()
 
-    # ---- stub GithubConnection so it never calls requests
+    # ---- stub GithubConnection (still preferred — avoids relying on mocked HTTP)
     class DummyGithubConnection:
         def __init__(self, log, token, repo_name):
             self.log = log
@@ -216,3 +222,7 @@ def test_main_happy_path_no_network(run_step_module, monkeypatch, capsys):
     payload = json.loads(out)
     assert payload["status"] == "ok"
     assert payload["meta"] == {"ok": True}
+
+    # Optional: assert no unexpected outbound HTTP was attempted
+    # (If DummyGithubConnection is used, this should remain 0)
+    assert mock_request.call_count == 0

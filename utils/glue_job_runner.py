@@ -1,45 +1,97 @@
+# src/run_step.py
 import argparse
 import json
-import logging
 import os
 import sys
 from pathlib import Path
-
-# -------------------------------
-# Prepare: add job ZIP to sys.path
-# -------------------------------
-# NOTE: This intentionally mirrors the old implementation (your screenshot):
-#  - rglob a fixed pattern
-#  - error if >1 match
-#  - add "<zip>/<zip_name>/" and "<zip>/<zip_name>/Python" to sys.path
-#  - also add "<zip>/" and "<zip>/Python"
-# Keep the pattern the same as your bundle name.
-files = list(Path.cwd().rglob("ingestor_bundle*.zip"))
+from fnmatch import fnmatch
 
 
-def setup_path():
-    """Set up sys.path like the old Glue 4 runner."""
-    files = list(Path.cwd().rglob("ingestor_bundle*.zip"))
-    if len(files) > 1:
-        raise ValueError(f"More than one ingestor_bundle zip found: {files}")
-    elif len(files) == 1:
-        zip_file_with_zip = files[0].name
-        zip_file_without_zip = zip_file_with_zip.split(".zip")[0]
+def setup_path(
+    pattern: str = "debi-etl-framework-glue*.zip",
+    search_dirs: list[Path] | None = None,
+    sys_path: list[str] | None = None,
+) -> None:
+    """
+    Add the job zip (and common 'src/' locations inside it) to sys.path.
 
-        # 1) <zip>/<zip_name>/
-        base_path = f"{zip_file_with_zip}/{zip_file_without_zip}/"
-        sys.path.insert(0, base_path)
+    Why:
+      - In AWS Glue, the zip is often not in Path.cwd(), so we:
+          1) first look for the zip already present on sys.path
+          2) otherwise search common directories (/tmp, cwd) using rglob
 
-        # 2) <zip>/ and <zip>/Python
-        base_path = f"{zip_file_with_zip}/"
-        sys.path.insert(0, base_path)
-    else:
-        # 0 files: do nothing (kept identical to screenshot behavior)
-        pass
+      - For Python imports to work, sys.path must include:
+          - the zip file itself (best), and/or
+          - zip + "/src" if your modules live under src/ inside the zip
+
+    This function is written to be unit-testable by injecting sys_path/search_dirs.
+    """
+    sp = sys_path if sys_path is not None else sys.path
+    dirs = (
+        search_dirs if search_dirs is not None else [Path("/tmp"), Path.cwd()]
+    )
+
+    # 1) Prefer: the zip already on sys.path (Glue commonly adds --extra-py-files)
+    zip_entry = next(
+        (
+            p
+            for p in sp
+            if p.endswith(".zip") and fnmatch(Path(p).name, pattern)
+        ),
+        None,
+    )
+
+    # 2) Otherwise search filesystem
+    if not zip_entry:
+        matches: list[Path] = []
+        for d in dirs:
+            try:
+                matches.extend(list(d.rglob(pattern)))
+            except Exception:
+                # ignore unreadable dirs in Glue
+                continue
+
+        if len(matches) > 1:
+            raise ValueError(f"More than one {pattern} zip found: {matches}")
+        if len(matches) == 0:
+            # Nothing to do (tests may run without the zip present)
+            return
+
+        zip_entry = str(matches[0])
+
+    zip_name = Path(zip_entry).name
+    zip_without = zip_name[:-4] if zip_name.endswith(".zip") else zip_name
+
+    # These cover common layouts:
+    #   <zip>/<zip_name_without_zip>/src
+    #   <zip>/src
+    # And we also add the zip itself so top-level packages resolve.
+    candidates = [
+        zip_entry,  # best: add the zip itself
+        f"{zip_entry}/src",
+        f"{zip_name}/{zip_without}/src",
+        f"{zip_name}/{zip_without}/",
+        f"{zip_name}/src",
+        f"{zip_name}/",
+    ]
+
+    # Insert in reverse so the first candidate ends up highest priority.
+    for p in reversed(candidates):
+        if p and p not in sp:
+            sp.insert(0, p)
 
 
-# Call the prepare step
+# Call the prepare step BEFORE importing packages that live in the zip
 setup_path()
+
+from asvc1scoredataservices_common.github.common import (
+    GithubConnection,
+)  # noqa: E402
+from asvc1scoredataservices_common.logger.basic_logger import (
+    setup_logger,
+)  # noqa: E402
+
+log = setup_logger()
 
 
 # --------------------------------

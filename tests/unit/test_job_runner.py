@@ -9,19 +9,16 @@ import pytest
 
 
 @pytest.fixture()
-def run_step_module(monkeypatch):
+def run_step_module():
     """
-    Import src.run_step normally (it has delayed imports inside main),
-    then return the module.
+    Import src.run_step. It delays heavy imports until main(), so importing is safe.
     """
     mod = importlib.import_module("src.run_step")
     importlib.reload(mod)
     return mod
 
 
-def test_setup_path_prefers_existing_zip_in_sys_path(
-    run_step_module, monkeypatch
-):
+def test_setup_path_prefers_existing_zip_in_sys_path(run_step_module):
     mod = run_step_module
 
     fake_zip = "/tmp/debi-etl-framework-glue-1.0.zip"
@@ -33,25 +30,22 @@ def test_setup_path_prefers_existing_zip_in_sys_path(
         search_dirs=[Path("/tmp")],
     )
 
-    # candidates should be promoted so the zip itself is first
     assert sp[0] == fake_zip
-    # and include common layouts (zip/src) somewhere near the front
     assert f"{fake_zip}/src" in sp
 
 
 def test_setup_path_returns_when_no_zip_found(run_step_module):
     mod = run_step_module
     sp = ["/a", "/b"]
+
     mod.setup_path(
         pattern="does-not-exist-*.zip", sys_path=sp, search_dirs=[Path("/tmp")]
     )
-    assert sp == ["/a", "/b"]  # unchanged
+    assert sp == ["/a", "/b"]
 
 
 def test_setup_path_raises_if_multiple_matches(run_step_module, tmp_path):
     mod = run_step_module
-
-    # create multiple matching zips
     (tmp_path / "debi-etl-framework-glue-a.zip").write_text("x")
     (tmp_path / "debi-etl-framework-glue-b.zip").write_text("y")
 
@@ -76,7 +70,7 @@ def test_parse_args_parses_event_json_and_extra_env(run_step_module, capsys):
         "-t",
         "events_api",
         "--event",
-        '{"cl_oauth_url":"x","exchange_headers":{},"exchange_data":{}}',
+        '{"k":"v"}',
         "-f",
         "path/to/config.yml",
         "-r",
@@ -97,25 +91,30 @@ def test_parse_args_parses_event_json_and_extra_env(run_step_module, capsys):
     assert args.run_mode == "once"
     assert args.vendor == "vendor1"
     assert args.table == "events_api"
-    assert isinstance(args.event, dict)
-    assert args.event["cl_oauth_url"] == "x"
+    assert args.event == {"k": "v"}
     assert args.extra_env == ["K1=V1", "K2=V2"]
 
-    # parse_known_args prints about unknowns
     out = capsys.readouterr().out
     assert "Ignoring unknown args" in out
 
 
-def test_main_happy_path_calls_github_and_wrapper_and_prints_json(
-    run_step_module, monkeypatch, capsys
-):
+def test_main_happy_path_no_network(run_step_module, monkeypatch, capsys):
     mod = run_step_module
 
-    # 1) avoid touching real sys.path logic
+    # prevent filesystem/path scanning affecting test
     monkeypatch.setattr(mod, "setup_path", lambda *a, **k: None)
 
-    # 2) stub delayed-import modules used inside main:
-    #    asvclscoredataservices_common.github.common.GithubConnection
+    # ---- stub logger setup
+    class DummyLog:
+        def info(self, *a, **k):
+            return None
+
+    basic_logger_mod = types.ModuleType(
+        "asvclscoredataservices_common.logger.basic_logger"
+    )
+    basic_logger_mod.setup_logger = lambda: DummyLog()
+
+    # ---- stub GithubConnection so it never calls requests
     class DummyGithubConnection:
         def __init__(self, log, token, repo_name):
             self.log = log
@@ -131,34 +130,11 @@ def test_main_happy_path_calls_github_and_wrapper_and_prints_json(
     )
     github_common_mod.GithubConnection = DummyGithubConnection
 
-    #    asvclscoredataservices_common.logger.basic_logger.setup_logger
-    class DummyLog:
-        def __init__(self):
-            self.infos = []
-
-        def info(self, msg, *args, **kwargs):
-            self.infos.append((msg, args, kwargs))
-
-    dummy_log = DummyLog()
-    basic_logger_mod = types.ModuleType(
-        "asvclscoredataservices_common.logger.basic_logger"
-    )
-    basic_logger_mod.setup_logger = lambda: dummy_log
-
+    # install stubs BEFORE main() imports them
     monkeypatch.setitem(
         sys.modules,
         "asvclscoredataservices_common",
         types.ModuleType("asvclscoredataservices_common"),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "asvclscoredataservices_common.github",
-        types.ModuleType("asvclscoredataservices_common.github"),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "asvclscoredataservices_common.github.common",
-        github_common_mod,
     )
     monkeypatch.setitem(
         sys.modules,
@@ -170,8 +146,18 @@ def test_main_happy_path_calls_github_and_wrapper_and_prints_json(
         "asvclscoredataservices_common.logger.basic_logger",
         basic_logger_mod,
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "asvclscoredataservices_common.github",
+        types.ModuleType("asvclscoredataservices_common.github"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "asvclscoredataservices_common.github.common",
+        github_common_mod,
+    )
 
-    # 3) stub src.api_wrapper.run_ingester (imported inside main)
+    # stub src.api_wrapper.run_ingester imported inside main
     api_wrapper_stub = types.ModuleType("src.api_wrapper")
 
     def fake_run_ingester(*, table, env, event, config, run_mode, start, end):
@@ -187,7 +173,9 @@ def test_main_happy_path_calls_github_and_wrapper_and_prints_json(
     api_wrapper_stub.run_ingester = fake_run_ingester
     monkeypatch.setitem(sys.modules, "src.api_wrapper", api_wrapper_stub)
 
-    # 4) run main
+    # clean env
+    monkeypatch.delenv("X", raising=False)
+
     argv = [
         "--env",
         "dev",
@@ -208,9 +196,9 @@ def test_main_happy_path_calls_github_and_wrapper_and_prints_json(
         "--extra_env",
         "X=1",
     ]
+
     mod.main(argv)
 
-    # extra env set
     assert os.environ["X"] == "1"
 
     out = capsys.readouterr().out.strip()

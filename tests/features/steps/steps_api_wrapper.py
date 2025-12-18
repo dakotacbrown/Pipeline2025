@@ -1,176 +1,272 @@
-from __future__ import annotations
+import importlib
+import json
+import os
+import sys
+import types
+from datetime import date
+from behave import given, when, then
 
-from unittest.mock import patch
 
-from behave import given, then, when
+# -----------------------
+# Fakes / helpers
+# -----------------------
+
+class FakeLogger:
+    def __init__(self):
+        self.infos = []
+        self.warnings = []
+
+    def info(self, msg, *args):
+        self.infos.append(msg % args if args else msg)
+
+    def warning(self, msg, *args):
+        self.warnings.append(msg % args if args else msg)
 
 
-# -------------------------
-# Shared helpers
-# -------------------------
-def _start_patches(context):
+class FakeResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise Exception(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._payload
+
+
+class FakeRequests:
+    def __init__(self):
+        self.calls = []
+        # default tokens
+        self.c1_token = "C1_TOKEN"
+        self.data_token = "DATA_TOKEN"
+
+    def post(self, url, headers=None, data=None, verify=None):
+        self.calls.append(
+            {"url": url, "headers": headers or {}, "data": data or {}, "verify": verify}
+        )
+        # return token based on url (simple heuristic)
+        if "data" in (url or ""):
+            return FakeResponse({"access_token": self.data_token})
+        return FakeResponse({"access_token": self.c1_token})
+
+
+class FakeApiIngester:
+    def __init__(self, config, log):
+        self.config = config
+        self.log = log
+        self.once_calls = []
+        self.backfill_calls = []
+
+    def run_once(self, table_name, env_name):
+        self.once_calls.append({"table_name": table_name, "env_name": env_name})
+        return {"mode": "once", "table": table_name, "env": env_name}
+
+    def run_backfill(self, table_name, env_name, start, end):
+        assert isinstance(start, date)
+        assert isinstance(end, date)
+        self.backfill_calls.append(
+            {
+                "table_name": table_name,
+                "env_name": env_name,
+                "start": start,
+                "end": end,
+            }
+        )
+        return {
+            "mode": "backfill",
+            "table": table_name,
+            "env": env_name,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+        }
+
+
+def _install_module(context, name: str, mod: types.ModuleType):
+    sys.modules[name] = mod
+    context._inserted_modules.append(name)
+
+
+def install_fake_common_modules_for_wrapper(context):
     """
-    Patch where the wrapper *uses* these symbols: src.api_wrapper.*
+    Provides import targets for wrapper module import-time dependencies:
+      - asvc1scoredataservices_common.ingester.api_ingester.ApiIngester
+      - asvc1scoredataservices_common.logger.basic_logger.setup_logger
     """
-    context._patches = []
+    fake_log = FakeLogger()
+    context.fake_logger = fake_log
 
-    p_ingester = patch("src.api_wrapper.ApiIngester", autospec=True)
-    MockIngester = p_ingester.start()
-    context._patches.append(p_ingester)
-
-    # Prevent requests.post from ever being hit via retrieve_oauth_token
-    p_oauth = patch(
-        "src.api_wrapper.retrieve_oauth_token",
-        autospec=True,
-        return_value="fake-token",
+    # packages
+    root = types.ModuleType("asvc1scoredataservices_common")
+    ingester_pkg = types.ModuleType("asvc1scoredataservices_common.ingester")
+    api_ingester_mod = types.ModuleType(
+        "asvc1scoredataservices_common.ingester.api_ingester"
     )
-    p_oauth.start()
-    context._patches.append(p_oauth)
+    logger_pkg = types.ModuleType("asvc1scoredataservices_common.logger")
+    basic_logger_mod = types.ModuleType(
+        "asvc1scoredataservices_common.logger.basic_logger"
+    )
 
-    return MockIngester
+    # factory: when wrapper constructs ApiIngester(config=..., log=...)
+    def ApiIngester(config, log):
+        inst = FakeApiIngester(config=config, log=log)
+        context.fake_ingester = inst
+        return inst
+
+    def setup_logger():
+        return fake_log
+
+    api_ingester_mod.ApiIngester = ApiIngester
+    basic_logger_mod.setup_logger = setup_logger
+
+    _install_module(context, "asvc1scoredataservices_common", root)
+    _install_module(context, "asvc1scoredataservices_common.ingester", ingester_pkg)
+    _install_module(
+        context,
+        "asvc1scoredataservices_common.ingester.api_ingester",
+        api_ingester_mod,
+    )
+    _install_module(context, "asvc1scoredataservices_common.logger", logger_pkg)
+    _install_module(
+        context,
+        "asvc1scoredataservices_common.logger.basic_logger",
+        basic_logger_mod,
+    )
 
 
-def _stop_patches(context):
-    for p in reversed(getattr(context, "_patches", [])):
-        try:
-            p.stop()
-        except Exception:
-            pass
-    context._patches = []
+def _clean_env(keys_prefixes=("C1_OAUTH_TOKEN", "DATA_OAUTH_TOKEN", "ENV", "TABLE", "START_DATE", "END_DATE", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")):
+    # don't blast all env; only clear keys we set or keys used in tests
+    for k in list(os.environ.keys()):
+        if k in keys_prefixes or k in ("FOO", "HELLO"):
+            os.environ.pop(k, None)
 
 
-# -------------------------
-# GIVEN
-# -------------------------
-@given("a basic API config and event")
-def step_basic_api_config_and_event(context):
-    # Avoid `context.table` (Behave can mask it). Use distinct names.
-    context.table_key = "events_api"
-    context.env_name = "dev"
+# -----------------------
+# Steps
+# -----------------------
 
-    # Your wrapper expects: env_vars = event.get("env_vars", {}); env_vars[env]
-    context.event = {
-        "env_vars": {"dev": {"FOO": "bar"}},
-        "exchange_headers": {},
-        "exchange_data": {},
-        "c1_oauth_url": "https://example.com/oauth",
-        # Optional keys, only needed if your wrapper checks them:
-        # "data_headers": {},
-        # "data_auth": {},
-        # "data_auth_url": "https://example.com/data-oauth",
+@given('the wrapper module is "{module_path}"')
+def step_set_wrapper_module(context, module_path):
+    context.wrapper_module = module_path
+
+
+@given("I install fake common modules for the wrapper")
+def step_install_common(context):
+    # track inserted modules for cleanup
+    if not hasattr(context, "_inserted_modules"):
+        context._inserted_modules = []
+    install_fake_common_modules_for_wrapper(context)
+
+    # Make sure a fresh import of wrapper uses fakes (it calls setup_logger at import time)
+    sys.modules.pop(context.wrapper_module, None)
+    context.wrapper = importlib.import_module(context.wrapper_module)
+
+
+@given("I patch requests.post for oauth to return tokens")
+def step_patch_requests(context):
+    fake_requests = FakeRequests()
+    context.fake_requests = fake_requests
+    # patch module-level requests reference in wrapper
+    context.wrapper.requests = fake_requests
+
+
+@when("I call run_ingester with parameters")
+def step_call_run_ingester(context):
+    row = context.table[0]
+
+    table = row.get("table") or ""
+    env = row.get("env") or ""
+    run_mode = row.get("run_mode") or "once"
+    start = row.get("start") or None
+    end = row.get("end") or None
+
+    context._pending_args = {
+        "table": table,
+        "env": env,
+        "run_mode": run_mode,
+        "start": start if start != "" else None,
+        "end": end if end != "" else None,
     }
 
-    context.config = {"some": "yaml-config"}
-    context.result = None
-    context.raised = None
-    context.MockIngester = None
+
+@when("I call run_ingester expecting ValueError with parameters")
+def step_call_run_ingester_expect_error(context):
+    step_call_run_ingester(context)
+    context.expect_value_error = True
 
 
-# -------------------------
-# WHEN
-# -------------------------
-@when('I call run_ingester in "once" mode')
-def step_call_run_ingester_once(context):
-    context.MockIngester = _start_patches(context)
-    inst = context.MockIngester.return_value
-    inst.run_once.return_value = {"meta_rows": 123}
-
-    from src.api_wrapper import run_ingester
-
-    try:
-        context.result = run_ingester(
-            table=context.table_key,
-            env=context.env_name,
-            event=context.event,
-            config=context.config,
-            run_mode="once",
-        )
-    except Exception as e:
-        context.raised = e
-    finally:
-        _stop_patches(context)
+@when("the wrapper event is")
+def step_set_event(context):
+    context.event = json.loads(context.text)
 
 
-@when('I call run_ingester in "backfill" mode')
-def step_call_run_ingester_backfill(context):
-    context.MockIngester = _start_patches(context)
-    inst = context.MockIngester.return_value
-    inst.run_backfill.return_value = {"meta_rows": 999}
+@when("the wrapper config is")
+def step_set_config(context):
+    context.config = json.loads(context.text)
 
-    from src.api_wrapper import run_ingester
+    # clear env keys before execution (keeps tests isolated)
+    _clean_env()
 
     try:
-        context.result = run_ingester(
-            table=context.table_key,
-            env=context.env_name,
+        context.meta = context.wrapper.run_ingester(
+            table=context._pending_args["table"],
+            env=context._pending_args["env"],
             event=context.event,
             config=context.config,
-            run_mode="backfill",
-            start="2025-01-01",
-            end="2025-01-02",
+            run_mode=context._pending_args["run_mode"],
+            start=context._pending_args["start"],
+            end=context._pending_args["end"],
         )
+        context.raised = None
     except Exception as e:
         context.raised = e
-    finally:
-        _stop_patches(context)
+        context.meta = None
 
 
-@when('I call run_ingester in "backfill" mode without dates')
-def step_call_run_ingester_backfill_without_dates(context):
-    context.MockIngester = _start_patches(context)
-
-    from src.api_wrapper import run_ingester
-
-    try:
-        context.result = run_ingester(
-            table=context.table_key,
-            env=context.env_name,
-            event=context.event,
-            config=context.config,
-            run_mode="backfill",
-            # no start/end on purpose
-        )
-    except Exception as e:
-        context.raised = e
-    finally:
-        _stop_patches(context)
+@then('C1_OAUTH_TOKEN should equal "{token}"')
+def step_c1_token(context, token):
+    assert os.environ.get("C1_OAUTH_TOKEN") == token
 
 
-# -------------------------
-# THEN / AND
-# -------------------------
-@then("ApiIngester run_once is called")
-def step_assert_run_once_called(context):
-    assert context.raised is None, f"Unexpected exception: {context.raised}"
-    inst = context.MockIngester.return_value
-    assert inst.run_once.called, "Expected ApiIngester.run_once to be called"
+@then('DATA_OAUTH_TOKEN should equal "{token}"')
+def step_data_token(context, token):
+    assert os.environ.get("DATA_OAUTH_TOKEN") == token
 
 
-@then("ApiIngester run_backfill is called")
-def step_assert_run_backfill_called(context):
-    assert context.raised is None, f"Unexpected exception: {context.raised}"
-    inst = context.MockIngester.return_value
-    assert (
-        inst.run_backfill.called
-    ), "Expected ApiIngester.run_backfill to be called"
+@then('environment variable "{key}" should equal "{value}"')
+def step_env_equals(context, key, value):
+    assert os.environ.get(key) == value, f"Expected {key}={value}, got {os.environ.get(key)!r}"
 
 
-@then("run_ingester returns the meta rows")
-def step_assert_returns_meta_rows(context):
-    assert context.raised is None, f"Unexpected exception: {context.raised}"
-    assert (
-        context.result is not None
-    ), "Expected run_ingester to return a result"
-    # keep this flexible: just ensure it looks like metadata came back
-    assert isinstance(context.result, dict), "Expected metadata dict"
-    assert len(context.result) > 0, "Expected non-empty metadata dict"
+@then('ApiIngester should run_once with table "{table}" env "{env}"')
+def step_ingester_run_once(context, table, env):
+    inst = context.fake_ingester
+    assert inst.once_calls, "Expected run_once to be called"
+    last = inst.once_calls[-1]
+    assert last["table_name"] == table
+    assert last["env_name"] == env
+    assert (inst.backfill_calls == []), "Expected run_backfill not to be called"
 
 
-@then("run_ingester raises a ValueError")
-def step_assert_value_error(context):
-    assert (
-        context.raised is not None
-    ), "Expected an exception but none was raised"
-    assert isinstance(
-        context.raised, ValueError
-    ), f"Expected ValueError, got {type(context.raised)}: {context.raised}"
+@then('ApiIngester should run_backfill with table "{table}" env "{env}" start "{start}" end "{end}"')
+def step_ingester_backfill(context, table, env, start, end):
+    inst = context.fake_ingester
+    assert inst.backfill_calls, "Expected run_backfill to be called"
+    last = inst.backfill_calls[-1]
+    assert last["table_name"] == table
+    assert last["env_name"] == env
+    assert last["start"].isoformat() == start
+    assert last["end"].isoformat() == end
+
+
+@then("requests.post should be called {n:d} times")
+def step_requests_called(context, n):
+    assert len(context.fake_requests.calls) == n, context.fake_requests.calls
+
+
+@then("a ValueError should have been raised")
+def step_value_error(context):
+    assert context.raised is not None, "Expected an exception but none was raised"
+    assert isinstance(context.raised, ValueError), f"Expected ValueError, got {type(context.raised)}"

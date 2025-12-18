@@ -95,8 +95,8 @@ def run_ingester(
     exchange_headers = event.get("exchange_headers", {})
     exchange_data = event.get("exchange_data", {})
 
-    cl_oauth_token = retrieve_oauth_token(
-        event["cl_oauth_url"],
+    c1_oauth_token = retrieve_oauth_token(
+        event["c1_oauth_url"],
         exchange_headers,
         exchange_data,
     )
@@ -115,7 +115,7 @@ def run_ingester(
     # ------------------------------------------------------------------
     # Common env vars
     # ------------------------------------------------------------------
-    os.environ["CL_OAUTH_TOKEN"] = cl_oauth_token
+    os.environ["C1_OAUTH_TOKEN"] = c1_oauth_token
     os.environ["HTTPS_PROXY"] = "http://aws-proxy-qa.cloud.capitalone.com:8099"
     os.environ["HTTP_PROXY"] = "http://aws-proxy-qa.cloud.capitalone.com:8099"
     os.environ["NO_PROXY"] = (

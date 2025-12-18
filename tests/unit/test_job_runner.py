@@ -6,6 +6,7 @@ import types
 from pathlib import Path
 
 import pytest
+import requests  # <-- add this
 
 
 @pytest.fixture()
@@ -100,6 +101,16 @@ def test_parse_args_parses_event_json_and_extra_env(run_step_module, capsys):
 
 def test_main_happy_path_no_network(run_step_module, monkeypatch, capsys):
     mod = run_step_module
+
+    # ---- block ALL requests network calls (post/get/etc)
+    def _no_http(*args, **kwargs):
+        raise AssertionError(
+            "Network call attempted via requests during unit test"
+        )
+
+    monkeypatch.setattr(
+        requests.sessions.Session, "request", _no_http, raising=True
+    )
 
     # prevent filesystem/path scanning affecting test
     monkeypatch.setattr(mod, "setup_path", lambda *a, **k: None)

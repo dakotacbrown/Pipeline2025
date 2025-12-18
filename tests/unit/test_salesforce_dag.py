@@ -7,9 +7,7 @@ import types
 from typing import Any, Dict, List
 
 import pytest
-
 from airflow.models import Variable
-
 
 # Update if your module path differs
 DAG_MODULE = "dags.salesforce.salesforce_ingester"
@@ -26,6 +24,7 @@ class DummyGlueJobOperator:
     But in TaskFlow DAGs, chaining is done on real BaseOperator objects.
     So we implement as a real BaseOperator subclass.
     """
+
     pass
 
 
@@ -54,8 +53,12 @@ def dag_mod(monkeypatch, _airflow_baseoperator):
     # ----- Stub internal imports used by the DAG -----
     dag_utils = types.ModuleType("dags.common.dag_utilities")
     dag_utils.failover_managed_dag_tag = lambda: "failover-managed"
-    dag_utils.get_bucket_name = lambda env, truncated_region: f"bucket-{env}-{truncated_region}"
-    dag_utils.get_c1s_oauth_endpoint = lambda env: "https://example.invalid/oauth"
+    dag_utils.get_bucket_name = (
+        lambda env, truncated_region: f"bucket-{env}-{truncated_region}"
+    )
+    dag_utils.get_c1s_oauth_endpoint = (
+        lambda env: "https://example.invalid/oauth"
+    )
     dag_utils.get_shairflow_environment = lambda: "dev"
     dag_utils.get_shairflow_region = lambda: "us-east-1"
     dag_utils.get_truncated_shairflow_region = lambda: "use1"
@@ -106,7 +109,9 @@ def dag_mod(monkeypatch, _airflow_baseoperator):
         "INGESTER_GLUE_JOB_NAME": "etl-job",
         "INGESTER_GLUE_CONN_NAME": "etl-net-conn",
         "INGESTER_RUN_MODE": "qa",
-        "INGESTER_ENV_VARS": json.dumps({"dev": {"FOO": "bar"}, "qa": {"FOO": "baz"}}),
+        "INGESTER_ENV_VARS": json.dumps(
+            {"dev": {"FOO": "bar"}, "qa": {"FOO": "baz"}}
+        ),
         "C1SCOREDATASERVICES_EXCHANGE_ID": "ex_id",
         "C1SCOREDATASERVICES_EXCHANGE_SECRET": "ex_secret",
         "C1S_SALESFORCE_USERNAME": "sf_user",

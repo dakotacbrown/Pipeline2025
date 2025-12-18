@@ -9,8 +9,10 @@ from airflow import DAG
 from airflow.decorators import task
 from airflow.models import Variable
 from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
-
-from dags.common.dag_utilities import get_shairflow_environment, get_shairflow_region
+from dags.common.dag_utilities import (
+    get_shairflow_environment,
+    get_shairflow_region,
+)
 
 
 def _safe_task_id(s: str) -> str:
@@ -34,12 +36,20 @@ repo_name = Variable.get("INGESTER_CONFIG_REPO_NAME", "config_management")
 github_token = Variable.get("CISCOREDATASERVICES_GITHUB_PASSWORD", None)
 
 start_date = Variable.get("INGESTER_START_DATE", "2000-01-01")
-end_date = Variable.get("INGESTER_END_DATE", datetime.now().strftime("%Y-%m-%d"))
+end_date = Variable.get(
+    "INGESTER_END_DATE", datetime.now().strftime("%Y-%m-%d")
+)
 
 # These are dict-shaped in your code (you use .get and **expansion), so default to "{}"
-env_vars: Dict[str, Dict[str, str]] = json.loads(Variable.get("INGESTER_ENV_VARS", "{}"))
-exchange_extras: Dict[str, Any] = json.loads(Variable.get("INGESTER_EXCHANGE_EXTRAS", "{}"))
-data_extras: Dict[str, Any] = json.loads(Variable.get("INGESTER_DATA_EXTRAS", "{}"))
+env_vars: Dict[str, Dict[str, str]] = json.loads(
+    Variable.get("INGESTER_ENV_VARS", "{}")
+)
+exchange_extras: Dict[str, Any] = json.loads(
+    Variable.get("INGESTER_EXCHANGE_EXTRAS", "{}")
+)
+data_extras: Dict[str, Any] = json.loads(
+    Variable.get("INGESTER_DATA_EXTRAS", "{}")
+)
 
 
 with DAG(
@@ -58,7 +68,9 @@ with DAG(
         You said you want to build the event in the DAG (not from dag_run.conf).
         """
         base_event: Dict[str, Any] = {
-            "env_vars": (env_vars.get(env, {}) if isinstance(env_vars, dict) else {})
+            "env_vars": (
+                env_vars.get(env, {}) if isinstance(env_vars, dict) else {}
+            )
         }
 
         if isinstance(exchange_extras, dict):

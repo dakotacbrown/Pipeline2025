@@ -7,10 +7,6 @@ from datetime import date
 
 from behave import given, then, when
 
-# -----------------------
-# Fakes / helpers
-# -----------------------
-
 
 class FakeLogger:
     def __init__(self):
@@ -52,7 +48,6 @@ class FakeRequests:
                 "verify": verify,
             }
         )
-        # Return DATA token if the URL contains "data", otherwise C1 token
         if "data" in (url or ""):
             return FakeResponse({"access_token": self.data_token})
         return FakeResponse({"access_token": self.c1_token})
@@ -90,12 +85,8 @@ class FakeApiIngester:
 
 
 def _make_pkg(name: str) -> types.ModuleType:
-    """
-    Behave tests often need to fake dotted imports.
-    Setting __path__ makes ModuleType behave like a package.
-    """
     m = types.ModuleType(name)
-    m.__path__ = []
+    m.__path__ = []  # make it a package
     return m
 
 
@@ -105,21 +96,13 @@ def _install_module(context, name: str, mod: types.ModuleType):
 
 
 def install_fake_common_modules_for_wrapper(context):
-    """
-    Provides import targets used by src.api_wrapper at import-time:
-
-      from asvc1scoredataservices_common.ingester.api_ingester import ApiIngester
-      from asvc1scoredataservices_common.logger.basic_logger import setup_logger
-    """
     fake_log = FakeLogger()
     context.fake_logger = fake_log
 
-    # Package hierarchy
     root = _make_pkg("asvc1scoredataservices_common")
     ingester_pkg = _make_pkg("asvc1scoredataservices_common.ingester")
     logger_pkg = _make_pkg("asvc1scoredataservices_common.logger")
 
-    # Leaf modules
     api_ingester_mod = types.ModuleType(
         "asvc1scoredataservices_common.ingester.api_ingester"
     )
@@ -138,7 +121,6 @@ def install_fake_common_modules_for_wrapper(context):
     api_ingester_mod.ApiIngester = ApiIngester
     basic_logger_mod.setup_logger = setup_logger
 
-    # Install into sys.modules
     _install_module(context, "asvc1scoredataservices_common", root)
     _install_module(
         context, "asvc1scoredataservices_common.ingester", ingester_pkg
@@ -155,7 +137,7 @@ def install_fake_common_modules_for_wrapper(context):
         basic_logger_mod,
     )
 
-    # Link hierarchy (helps attribute-based traversal)
+    # Link hierarchy
     root.ingester = ingester_pkg
     root.logger = logger_pkg
     ingester_pkg.api_ingester = api_ingester_mod
@@ -173,18 +155,12 @@ def _clean_wrapper_env():
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "NO_PROXY",
-        # keys used in tests
         "FOO",
         "HELLO",
     }
     for k in list(os.environ.keys()):
         if k in keys:
             os.environ.pop(k, None)
-
-
-# -----------------------
-# Steps
-# -----------------------
 
 
 @given('the wrapper module is "{module_path}"')
@@ -196,7 +172,7 @@ def step_set_wrapper_module(context, module_path):
 def step_install_common(context):
     install_fake_common_modules_for_wrapper(context)
 
-    # Force wrapper to import fresh so it uses our faked setup_logger/ApiIngester
+    # Force fresh import so wrapper uses our fake setup_logger + ApiIngester
     sys.modules.pop(context.wrapper_module, None)
     context.wrapper = importlib.import_module(context.wrapper_module)
 
@@ -204,14 +180,12 @@ def step_install_common(context):
 @given("I patch requests.post for oauth to return tokens")
 def step_patch_requests(context):
     context.fake_requests = FakeRequests()
-    # Patch the module-level requests ref in src.api_wrapper
     context.wrapper.requests = context.fake_requests
 
 
 @when("I call run_ingester with parameters")
 def step_set_params(context):
     row = context.table[0]
-
     context.params = {
         "table": (row.get("table") or "").strip(),
         "env": (row.get("env") or "").strip(),
@@ -219,7 +193,6 @@ def step_set_params(context):
         "start": (row.get("start") or "").strip() or None,
         "end": (row.get("end") or "").strip() or None,
     }
-    context.expect_value_error = False
 
 
 @when("I call run_ingester expecting ValueError with parameters")
@@ -230,12 +203,13 @@ def step_set_params_expect_error(context):
 
 @when("the wrapper event is")
 def step_set_event(context):
-    context.event = json.loads(context.text)
+    context.wrapper_event = json.loads(context.text)
 
 
 @when("the wrapper config is")
-def step_set_config_and_execute(context):
-    context.config = json.loads(context.text)
+def step_set_wrapper_config_and_execute(context):
+    # IMPORTANT: don't use context.config (reserved by behave)
+    context.wrapper_config = json.loads(context.text)
 
     _clean_wrapper_env()
 
@@ -243,8 +217,8 @@ def step_set_config_and_execute(context):
         context.meta = context.wrapper.run_ingester(
             table=context.params["table"],
             env=context.params["env"],
-            event=context.event,
-            config=context.config,
+            event=context.wrapper_event,
+            config=context.wrapper_config,
             run_mode=context.params["run_mode"],
             start=context.params["start"],
             end=context.params["end"],
@@ -268,11 +242,11 @@ def step_data_token(context, token):
 @then('ApiIngester should run_once with table "{table}" env "{env}"')
 def step_ingester_run_once(context, table, env):
     inst = context.fake_ingester
-    assert inst.once_calls, "Expected ApiIngester.run_once to be called"
+    assert inst.once_calls, "Expected run_once to be called"
     last = inst.once_calls[-1]
     assert last["table_name"] == table
     assert last["env_name"] == env
-    assert inst.backfill_calls == [], "Expected run_backfill NOT to be called"
+    assert inst.backfill_calls == [], "Expected run_backfill not to be called"
 
 
 @then(
@@ -280,7 +254,7 @@ def step_ingester_run_once(context, table, env):
 )
 def step_ingester_run_backfill(context, table, env, start, end):
     inst = context.fake_ingester
-    assert inst.backfill_calls, "Expected ApiIngester.run_backfill to be called"
+    assert inst.backfill_calls, "Expected run_backfill to be called"
     last = inst.backfill_calls[-1]
     assert last["table_name"] == table
     assert last["env_name"] == env
@@ -300,4 +274,4 @@ def step_value_error(context):
     ), "Expected an exception but none was raised"
     assert isinstance(
         context.raised, ValueError
-    ), f"Expected ValueError, got {type(context.raised)}"
+    ), f"Got: {type(context.raised)}"

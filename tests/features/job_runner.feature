@@ -2,7 +2,7 @@ Feature: Job runner component behavior
 
   Scenario: setup_path prefers an existing matching zip already on sys.path
     Given I have a sys.path list containing "/tmp/debi-etl-framework-glue-1.0.zip"
-    When I call setup_path with pattern "debi-etl-framework-glue*.zip"
+    When I call setup_path with pattern "debi-etl-framework-glue*.zip" (capturing errors)
     Then the first sys.path entry should be "/tmp/debi-etl-framework-glue-1.0.zip"
     And sys.path should contain "/tmp/debi-etl-framework-glue-1.0.zip/src"
 

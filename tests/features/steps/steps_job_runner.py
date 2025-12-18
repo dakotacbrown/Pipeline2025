@@ -6,12 +6,13 @@ import sys
 import tempfile
 import types
 from contextlib import redirect_stdout
+from fnmatch import fnmatch
 from pathlib import Path
 
 from behave import given, then, when
 
 # -----------------------
-# Helpers / fakes
+# Fakes
 # -----------------------
 
 
@@ -20,7 +21,6 @@ class FakeLogger:
         self.infos = []
 
     def info(self, msg, *args):
-        # mimic logger formatting behavior enough for assertions/debugging
         try:
             rendered = msg % args if args else msg
         except Exception:
@@ -34,7 +34,6 @@ class FakeGithubConnection:
         self.token = token
         self.repo = repo
         self.fetched_paths = []
-        # set by test
         self.contents_by_path = {}
 
     def get_github_file_contents(self, file_path):
@@ -51,40 +50,49 @@ class FakeWrapper:
         return {"meta_key": "meta_val"}
 
 
+# -----------------------
+# Module install helpers
+# -----------------------
+
+
+def _make_pkg(name: str) -> types.ModuleType:
+    m = types.ModuleType(name)
+    m.__path__ = []  # make it a package
+    return m
+
+
 def _install_module(context, name: str, module: types.ModuleType):
     sys.modules[name] = module
     context._inserted_modules.append(name)
 
 
-def install_fake_common_and_wrapper(context):
+def install_fake_common_and_api_wrapper(context):
     """
-    Creates these importable targets used by runner.main():
-
-      from asvc1scoredataservices_common.github.common import GithubConnection
-      from asvc1scoredataservices_common.logger.basic_logger import setup_logger
-      from src.api_wrapper import run_ingester
+    Provides import targets used inside runner.main():
+      - asvc1scoredataservices_common.github.common.GithubConnection
+      - asvc1scoredataservices_common.logger.basic_logger.setup_logger
+      - src.api_wrapper.run_ingester
     """
     fake_log = FakeLogger()
-    fake_gh = FakeGithubConnection(fake_log, token=None, repo=None)
     fake_wrapper = FakeWrapper()
 
-    # Root package + subpackages
-    pkg = types.ModuleType("asvc1scoredataservices_common")
-    github_pkg = types.ModuleType("asvc1scoredataservices_common.github")
+    # ---- asvc common packages
+    root = _make_pkg("asvc1scoredataservices_common")
+    github_pkg = _make_pkg("asvc1scoredataservices_common.github")
+    logger_pkg = _make_pkg("asvc1scoredataservices_common.logger")
+
     github_common = types.ModuleType(
         "asvc1scoredataservices_common.github.common"
     )
-    logger_pkg = types.ModuleType("asvc1scoredataservices_common.logger")
     basic_logger = types.ModuleType(
         "asvc1scoredataservices_common.logger.basic_logger"
     )
 
-    # Bind fake classes/functions
+    # GithubConnection factory so we can capture instance per scenario
     def GithubConnection(log, github_token, repo_name):
-        # re-init the fake with actual ctor params so we can assert them if needed
         gh = FakeGithubConnection(log, github_token, repo_name)
-        # share the same contents mapping if test set it earlier
-        gh.contents_by_path.update(fake_gh.contents_by_path)
+        # allow tests to pre-seed yaml contents
+        gh.contents_by_path.update(getattr(context, "yaml_by_path", {}))
         context.fake_github = gh
         return gh
 
@@ -95,8 +103,7 @@ def install_fake_common_and_wrapper(context):
     github_common.GithubConnection = GithubConnection
     basic_logger.setup_logger = setup_logger
 
-    # Install package hierarchy
-    _install_module(context, "asvc1scoredataservices_common", pkg)
+    _install_module(context, "asvc1scoredataservices_common", root)
     _install_module(context, "asvc1scoredataservices_common.github", github_pkg)
     _install_module(
         context, "asvc1scoredataservices_common.github.common", github_common
@@ -108,23 +115,40 @@ def install_fake_common_and_wrapper(context):
         basic_logger,
     )
 
-    # src + src.api_wrapper
-    src_pkg = types.ModuleType("src")
+    # Link hierarchy
+    root.github = github_pkg
+    root.logger = logger_pkg
+    github_pkg.common = github_common
+    logger_pkg.basic_logger = basic_logger
+
+    # ---- src.api_wrapper
+    # IMPORTANT: do NOT blindly overwrite sys.modules["src"].
+    # If the real src package exists, use it. If not, create a package-like one.
+    try:
+        src_pkg = importlib.import_module("src")
+    except ModuleNotFoundError:
+        src_pkg = _make_pkg("src")
+        _install_module(context, "src", src_pkg)
+
     api_wrapper_mod = types.ModuleType("src.api_wrapper")
 
     def run_ingester(**kwargs):
         return fake_wrapper.run_ingester(**kwargs)
 
     api_wrapper_mod.run_ingester = run_ingester
-
-    _install_module(context, "src", src_pkg)
     _install_module(context, "src.api_wrapper", api_wrapper_mod)
+
+    # Attach as attribute if possible
+    try:
+        setattr(src_pkg, "api_wrapper", api_wrapper_mod)
+    except Exception:
+        pass
 
     context.fake_wrapper = fake_wrapper
 
 
 # -----------------------
-# Steps: setup_path tests
+# Steps: setup_path component checks
 # -----------------------
 
 
@@ -135,7 +159,6 @@ def step_sys_path_contains_zip(context, zip_path):
 
 @given("I have a sys.path list {items}")
 def step_sys_path_list_literal(context, items):
-    # items is like ["A","B"]
     context.sys_path = json.loads(items)
 
 
@@ -151,27 +174,43 @@ def step_temp_dir_with_zips(context):
     td = tempfile.TemporaryDirectory()
     context._tmpdir = td
     d = Path(td.name)
-
     for row in context.table:
-        (d / row["name"]).write_bytes(b"")  # just needs to exist
+        (d / row["name"]).write_bytes(b"")  # file just needs to exist
     context.search_dir = d
 
 
 @when('I call setup_path with pattern "{pattern}"')
 def step_call_setup_path(context, pattern):
     runner = importlib.import_module(
-        os.environ.get("RUNNER_MODULE", "src.run_step")
+        getattr(context, "runner_module", "src.run_step")
     )
-    # use an isolated list (not global sys.path)
+    search_dirs = (
+        [context.search_dir]
+        if hasattr(context, "search_dir")
+        else [Path("/tmp")]
+    )
     runner.setup_path(
-        pattern=pattern,
-        search_dirs=(
-            [context.search_dir]
-            if hasattr(context, "search_dir")
-            else [Path("/tmp")]
-        ),
-        sys_path=context.sys_path,
+        pattern=pattern, search_dirs=search_dirs, sys_path=context.sys_path
     )
+
+
+@when('I call setup_path with pattern "{pattern}" (capturing errors)')
+def step_call_setup_path_capture(context, pattern):
+    runner = importlib.import_module(
+        getattr(context, "runner_module", "src.run_step")
+    )
+    search_dirs = (
+        [context.search_dir]
+        if hasattr(context, "search_dir")
+        else [Path("/tmp")]
+    )
+    try:
+        runner.setup_path(
+            pattern=pattern, search_dirs=search_dirs, sys_path=context.sys_path
+        )
+        context.caught_exc = None
+    except Exception as e:
+        context.caught_exc = e
 
 
 @then('the first sys.path entry should be "{expected}"')
@@ -198,7 +237,6 @@ def step_sys_path_unchanged(context, items):
 
 @then("setup_path should raise ValueError")
 def step_setup_path_raises_value_error(context):
-    # This assertion is made by wrapping the call in a try/except in a separate step
     assert (
         getattr(context, "caught_exc", None) is not None
     ), "Expected an exception but none was caught"
@@ -207,23 +245,8 @@ def step_setup_path_raises_value_error(context):
     ), f"Expected ValueError, got {type(context.caught_exc)}"
 
 
-@when('I call setup_path with pattern "{pattern}" (capturing errors)')
-def step_call_setup_path_capture(context, pattern):
-    runner = importlib.import_module(
-        os.environ.get("RUNNER_MODULE", "src.run_step")
-    )
-    try:
-        runner.setup_path(
-            pattern=pattern,
-            search_dirs=[context.search_dir],
-            sys_path=context.sys_path,
-        )
-    except Exception as e:
-        context.caught_exc = e
-
-
 # -----------------------
-# Steps: main() component test
+# Steps: main() end-to-end with fakes
 # -----------------------
 
 
@@ -234,7 +257,7 @@ def step_set_runner_module(context, module_path):
 
 @given("I install fake common modules and fake api_wrapper")
 def step_install_fakes(context):
-    install_fake_common_and_wrapper(context)
+    install_fake_common_and_api_wrapper(context)
 
 
 @given("I patch runner.setup_path to be a no-op")
@@ -251,13 +274,10 @@ def step_run_main_with_argv(context):
     )
 
     argv = []
-    # Build argv from the table rows in order
     for row in context.table:
         argv.append(row["arg"])
-        # behave table puts everything as strings
         argv.append(row["value"])
 
-    # Capture stdout
     buf = io.StringIO()
     with redirect_stdout(buf):
         runner.main(argv)
@@ -279,13 +299,11 @@ def step_stdout_json_status(context, status):
 )
 def step_run_ingester_called(context, table, env, run_mode):
     calls = context.fake_wrapper.calls
-    assert calls, "Expected run_ingester to be called at least once"
+    assert calls, "Expected run_ingester to be called"
     last = calls[-1]
     assert last["table"] == table
     assert last["env"] == env
     assert last["run_mode"] == run_mode
-
-    # event is parsed via argparse type=json.loads -> dict
     assert isinstance(
         last["event"], dict
     ), f"Expected event dict, got {type(last['event'])}"
@@ -303,12 +321,5 @@ def step_github_fetch_path(context, file_path):
     assert hasattr(context, "fake_github"), "Expected fake_github to exist"
     assert (
         context.fake_github.fetched_paths
-    ), "Expected GithubConnection.get_github_file_contents to be called"
+    ), "Expected get_github_file_contents to be called"
     assert context.fake_github.fetched_paths[-1] == file_path
-
-
-@then('environment variable "{key}" should equal "{value}"')
-def step_env_var_equals(context, key, value):
-    assert (
-        os.environ.get(key) == value
-    ), f"Expected {key}={value}, got {os.environ.get(key)!r}"

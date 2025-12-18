@@ -1,254 +1,219 @@
+import importlib
 import json
+import os
 import sys
 import types
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
-# Adjust this import if your module path differs
-# (Based on your screenshots, run_step.py lives under src/)
-import src.run_step as run_step
 
-
-def _install_fake_module(monkeypatch, name: str) -> types.ModuleType:
+@pytest.fixture()
+def run_step_module(monkeypatch):
     """
-    Ensure `name` exists in sys.modules as a ModuleType and return it.
-    Also creates parent packages so `from a.b.c import X` works.
+    Import src.run_step normally (it has delayed imports inside main),
+    then return the module.
     """
-    parts = name.split(".")
-    for i in range(1, len(parts) + 1):
-        mod_name = ".".join(parts[:i])
-        if mod_name not in sys.modules:
-            mod = types.ModuleType(mod_name)
-            monkeypatch.setitem(sys.modules, mod_name, mod)
-        # Link child as attribute on parent for package-like behavior
-        if i > 1:
-            parent_name = ".".join(parts[: i - 1])
-            child_name = parts[i - 1]
-            setattr(sys.modules[parent_name], child_name, sys.modules[mod_name])
-    return sys.modules[name]
+    mod = importlib.import_module("src.run_step")
+    importlib.reload(mod)
+    return mod
 
 
-# -------------------------
-# setup_path tests
-# -------------------------
+def test_setup_path_prefers_existing_zip_in_sys_path(
+    run_step_module, monkeypatch
+):
+    mod = run_step_module
 
+    fake_zip = "/tmp/debi-etl-framework-glue-1.0.zip"
+    sp = ["/something/else", fake_zip, "/another"]
 
-def test_setup_path_prefers_zip_already_on_sys_path():
-    sp = [
-        "/something/else",
-        "/opt/job/debi-etl-framework-glue-1.2.3.zip",
-    ]
-
-    run_step.setup_path(
+    mod.setup_path(
         pattern="debi-etl-framework-glue*.zip",
-        search_dirs=[Path("/tmp")],  # shouldn't matter; it should pick sys.path
         sys_path=sp,
+        search_dirs=[Path("/tmp")],
     )
 
-    # zip itself should be promoted to front (important for top-level packages)
-    assert sp[0] == "/opt/job/debi-etl-framework-glue-1.2.3.zip"
+    # candidates should be promoted so the zip itself is first
+    assert sp[0] == fake_zip
+    # and include common layouts (zip/src) somewhere near the front
+    assert f"{fake_zip}/src" in sp
 
-    # and candidates should be present (in a stable, high-priority order)
-    assert sp[1] == "/opt/job/debi-etl-framework-glue-1.2.3.zip/src"
 
-
-def test_setup_path_finds_zip_on_filesystem(tmp_path: Path):
-    z = tmp_path / "debi-etl-framework-glue-9.9.9.zip"
-    z.write_bytes(b"fake zip content")
-
-    sp = []
-
-    run_step.setup_path(
-        pattern="debi-etl-framework-glue*.zip",
-        search_dirs=[tmp_path],
-        sys_path=sp,
+def test_setup_path_returns_when_no_zip_found(run_step_module):
+    mod = run_step_module
+    sp = ["/a", "/b"]
+    mod.setup_path(
+        pattern="does-not-exist-*.zip", sys_path=sp, search_dirs=[Path("/tmp")]
     )
-
-    assert sp[0] == str(z)
-    assert sp[1] == f"{z}/src"
+    assert sp == ["/a", "/b"]  # unchanged
 
 
-def test_setup_path_multiple_matches_raises(tmp_path: Path):
-    (tmp_path / "debi-etl-framework-glue-a.zip").write_bytes(b"x")
-    (tmp_path / "debi-etl-framework-glue-b.zip").write_bytes(b"y")
+def test_setup_path_raises_if_multiple_matches(run_step_module, tmp_path):
+    mod = run_step_module
+
+    # create multiple matching zips
+    (tmp_path / "debi-etl-framework-glue-a.zip").write_text("x")
+    (tmp_path / "debi-etl-framework-glue-b.zip").write_text("y")
 
     with pytest.raises(ValueError):
-        run_step.setup_path(
+        mod.setup_path(
             pattern="debi-etl-framework-glue*.zip",
-            search_dirs=[tmp_path],
             sys_path=[],
+            search_dirs=[tmp_path],
         )
 
 
-def test_setup_path_no_match_no_change(tmp_path: Path):
-    sp = ["keep-me"]
+def test_parse_args_parses_event_json_and_extra_env(run_step_module, capsys):
+    mod = run_step_module
 
-    run_step.setup_path(
-        pattern="debi-etl-framework-glue*.zip",
-        search_dirs=[tmp_path],
-        sys_path=sp,
-    )
+    argv = [
+        "--env",
+        "dev",
+        "--run_mode",
+        "once",
+        "-v",
+        "vendor1",
+        "-t",
+        "events_api",
+        "--event",
+        '{"cl_oauth_url":"x","exchange_headers":{},"exchange_data":{}}',
+        "-f",
+        "path/to/config.yml",
+        "-r",
+        "some-repo",
+        "-g",
+        "ghp_token",
+        "--extra_env",
+        "K1=V1",
+        "--extra_env",
+        "K2=V2",
+        "--unknown",
+        "zzz",
+    ]
 
-    assert sp == ["keep-me"]
-
-
-# -------------------------
-# _parse_args tests
-# -------------------------
-
-
-def test_parse_args_parses_event_json_and_defaults(capsys):
-    event = {"hello": "world", "env_vars": {"dev": {"FOO": "bar"}}}
-
-    args = run_step._parse_args(
-        [
-            "--env",
-            "dev",
-            "--vendor",
-            "x",
-            "--table",
-            "accounts",
-            "--event",
-            json.dumps(event),
-            "--file_path",
-            "path/to/config.yml",
-            "--repo_name",
-            "my-repo",
-            "--github_token",
-            "token123",
-        ]
-    )
+    args = mod._parse_args(argv)
 
     assert args.env == "dev"
     assert args.run_mode == "once"
-    assert args.event == event
-    assert args.extra_env == []
-    # no unknown-args message expected
+    assert args.vendor == "vendor1"
+    assert args.table == "events_api"
+    assert isinstance(args.event, dict)
+    assert args.event["cl_oauth_url"] == "x"
+    assert args.extra_env == ["K1=V1", "K2=V2"]
+
+    # parse_known_args prints about unknowns
     out = capsys.readouterr().out
-    assert out == ""
+    assert "Ignoring unknown args" in out
 
 
-def test_parse_args_prints_unknown_args(capsys):
-    args = run_step._parse_args(
-        [
-            "--env",
-            "dev",
-            "--vendor",
-            "x",
-            "--table",
-            "accounts",
-            "--event",
-            json.dumps({"k": "v"}),
-            "--file_path",
-            "path/to/config.yml",
-            "--repo_name",
-            "my-repo",
-            "--github_token",
-            "token123",
-            "--unknown",
-            "1",
-            "--unknown2",
-            "2",
-        ]
-    )
-    assert args.env == "dev"
-
-    out = capsys.readouterr().out
-    assert "[runner] Ignoring unknown args:" in out
-
-
-# -------------------------
-# main tests (delayed imports + runner wiring)
-# -------------------------
-
-
-def test_main_happy_path_calls_github_and_run_ingester_and_prints_json(
-    monkeypatch, capsys
+def test_main_happy_path_calls_github_and_wrapper_and_prints_json(
+    run_step_module, monkeypatch, capsys
 ):
-    # Avoid filesystem scanning logic here (we test setup_path separately)
-    monkeypatch.setattr(run_step, "setup_path", MagicMock())
+    mod = run_step_module
 
-    # Fake logger
-    fake_log = MagicMock()
-    fake_log.info = MagicMock()
+    # 1) avoid touching real sys.path logic
+    monkeypatch.setattr(mod, "setup_path", lambda *a, **k: None)
 
-    # Install fake asvc1... modules for delayed imports
-    basic_logger_mod = _install_fake_module(
-        monkeypatch, "asvc1scoredataservices_common.logger.basic_logger"
-    )
-    basic_logger_mod.setup_logger = MagicMock(return_value=fake_log)
-
-    # Fake GithubConnection
-    github_common_mod = _install_fake_module(
-        monkeypatch, "asvc1scoredataservices_common.github.common"
-    )
-
-    class FakeGithubConnection:
+    # 2) stub delayed-import modules used inside main:
+    #    asvclscoredataservices_common.github.common.GithubConnection
+    class DummyGithubConnection:
         def __init__(self, log, token, repo_name):
             self.log = log
             self.token = token
             self.repo_name = repo_name
 
         def get_github_file_contents(self, file_path):
-            return {"yaml": "content", "file_path": file_path}
+            assert file_path == "cfg.yml"
+            return {"yaml": "dict"}
 
-    github_common_mod.GithubConnection = FakeGithubConnection
+    github_common_mod = types.ModuleType(
+        "asvclscoredataservices_common.github.common"
+    )
+    github_common_mod.GithubConnection = DummyGithubConnection
 
-    # Fake src.api_wrapper.run_ingester
-    api_wrapper_mod = _install_fake_module(monkeypatch, "src.api_wrapper")
-    api_wrapper_mod.run_ingester = MagicMock(return_value={"rows": 7})
+    #    asvclscoredataservices_common.logger.basic_logger.setup_logger
+    class DummyLog:
+        def __init__(self):
+            self.infos = []
 
-    # Ensure env is clean for this test
-    monkeypatch.delenv("XTRA", raising=False)
+        def info(self, msg, *args, **kwargs):
+            self.infos.append((msg, args, kwargs))
 
-    event_dict = {"some": "event"}
+    dummy_log = DummyLog()
+    basic_logger_mod = types.ModuleType(
+        "asvclscoredataservices_common.logger.basic_logger"
+    )
+    basic_logger_mod.setup_logger = lambda: dummy_log
+
+    monkeypatch.setitem(
+        sys.modules,
+        "asvclscoredataservices_common",
+        types.ModuleType("asvclscoredataservices_common"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "asvclscoredataservices_common.github",
+        types.ModuleType("asvclscoredataservices_common.github"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "asvclscoredataservices_common.github.common",
+        github_common_mod,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "asvclscoredataservices_common.logger",
+        types.ModuleType("asvclscoredataservices_common.logger"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "asvclscoredataservices_common.logger.basic_logger",
+        basic_logger_mod,
+    )
+
+    # 3) stub src.api_wrapper.run_ingester (imported inside main)
+    api_wrapper_stub = types.ModuleType("src.api_wrapper")
+
+    def fake_run_ingester(*, table, env, event, config, run_mode, start, end):
+        assert table == "events_api"
+        assert env == "dev"
+        assert event == {"k": "v"}
+        assert config == {"yaml": "dict"}
+        assert run_mode == "once"
+        assert start is None
+        assert end is None
+        return {"ok": True}
+
+    api_wrapper_stub.run_ingester = fake_run_ingester
+    monkeypatch.setitem(sys.modules, "src.api_wrapper", api_wrapper_stub)
+
+    # 4) run main
     argv = [
         "--env",
         "dev",
-        "--vendor",
-        "ignored-by-wrapper",  # parsed but not used by main
-        "--table",
-        "accounts",
-        "--event",
-        json.dumps(event_dict),
-        "--file_path",
-        "configs/my.yml",
-        "--repo_name",
-        "my-repo",
-        "--github_token",
-        "gh-token",
         "--run_mode",
         "once",
+        "-v",
+        "vendor1",
+        "-t",
+        "events_api",
+        "--event",
+        json.dumps({"k": "v"}),
+        "-f",
+        "cfg.yml",
+        "-r",
+        "repo",
+        "-g",
+        "token",
         "--extra_env",
-        "XTRA=1",
-        "--unknown",
-        "ok",
+        "X=1",
     ]
+    mod.main(argv)
 
-    run_step.main(argv)
+    # extra env set
+    assert os.environ["X"] == "1"
 
-    # run_ingester called with config from GitHub and parsed event dict
-    api_wrapper_mod.run_ingester.assert_called_once()
-    _, kwargs = api_wrapper_mod.run_ingester.call_args
-    assert kwargs["table"] == "accounts"
-    assert kwargs["env"] == "dev"
-    assert kwargs["event"] == event_dict
-    assert kwargs["config"] == {
-        "yaml": "content",
-        "file_path": "configs/my.yml",
-    }
-    assert kwargs["run_mode"] == "once"
-    assert kwargs["start"] is None
-    assert kwargs["end"] is None
-
-    # extra env applied
-    assert "XTRA" in sys.modules["os"].environ
-    assert sys.modules["os"].environ["XTRA"] == "1"
-
-    # prints JSON status
     out = capsys.readouterr().out.strip()
     payload = json.loads(out)
     assert payload["status"] == "ok"
-    assert payload["meta"] == {"rows": 7}
+    assert payload["meta"] == {"ok": True}

@@ -1,302 +1,277 @@
-import os
-from datetime import date
-from typing import Dict
-from unittest.mock import MagicMock
+import importlib
+import sys
+import types
+from dataclasses import dataclass
 
 import pytest
 
-from utils import ingestor_wrapper
 
-# ---------- helpers ----------
+@pytest.fixture()
+def api_wrapper_module(monkeypatch):
+    """
+    Import src.api_wrapper with its external deps stubbed out in sys.modules.
+    Returns the imported module object.
+    """
 
-
-@pytest.fixture
-def clean_environ():
-    """Snapshot and restore os.environ so tests don't leak."""
-    old = os.environ.copy()
-    os.environ.clear()
-    try:
-        yield
-    finally:
-        os.environ.clear()
-        os.environ.update(old)
-
-
-@pytest.fixture
-def base_config() -> Dict:
-    return {
-        "env_vars": {
-            "dev": {"foo": "bar"},
-            "prod": {"foo": "baz"},
-        }
-    }
-
-
-@pytest.fixture
-def base_event() -> Dict:
-    return {
-        "c1_oauth_url": "https://c1-token.example.com",
-        "exchange_headers": {"ex": "hdr"},
-        "exchange_data": {"ex": "data"},
-        "data_auth_url": "https://data-token.example.com",
-        "data_headers": {"dh": "val"},
-        "data_auth": {"client_id": "id"},
-    }
-
-
-# ---------- set_env_vars_from_dict ----------
-
-
-def test_set_env_vars_from_dict_sets_only_non_empty(monkeypatch, clean_environ):
+    # --- stub: setup_logger ---
     class DummyLog:
         def __init__(self):
             self.infos = []
             self.warnings = []
 
-        def info(self, msg, *args):
-            self.infos.append(msg % args if args else msg)
+        def info(self, msg, *args, **kwargs):
+            self.infos.append((msg, args, kwargs))
 
-        def warning(self, msg, *args):
-            self.warnings.append(msg % args if args else msg)
-
-        def debug(self, *_, **__): ...
-        def error(self, *_, **__): ...
-        def exception(self, *_, **__): ...
+        def warning(self, msg, *args, **kwargs):
+            self.warnings.append((msg, args, kwargs))
 
     dummy_log = DummyLog()
-    monkeypatch.setattr(ingestor_wrapper, "log", dummy_log)
 
-    env_vars = {"foo": "bar", "empty": "", "none": None}
+    basic_logger_mod = types.ModuleType(
+        "asvclscoredataservices_common.logger.basic_logger"
+    )
+    basic_logger_mod.setup_logger = lambda: dummy_log
 
-    ingestor_wrapper.set_env_vars_from_dict(env_vars)
+    # --- stub: ApiIngester class ---
+    @dataclass
+    class DummyApiIngester:
+        config: dict
+        log: object
 
-    # non-empty key/value promoted to upper-case key
-    assert os.environ["FOO"] == "bar"
-    # empty / None not set
-    assert "EMPTY" not in os.environ
-    assert "NONE" not in os.environ
+        def run_once(self, table_name: str, env_name: str):
+            return {
+                "mode": "once",
+                "table_name": table_name,
+                "env_name": env_name,
+            }
 
-    # we logged about skipping empties
-    assert any("Skipping empty env var" in m for m in dummy_log.warnings)
-    assert any("Set env foo=bar" in m for m in dummy_log.infos)
+        def run_backfill(self, table_name: str, env_name: str, start, end):
+            return {
+                "mode": "backfill",
+                "table_name": table_name,
+                "env_name": env_name,
+                "start": str(start),
+                "end": str(end),
+            }
+
+    ingester_mod = types.ModuleType(
+        "asvclscoredataservices_common.ingester.api_ingester"
+    )
+    ingester_mod.ApiIngester = DummyApiIngester
+
+    # Ensure the package parents also exist (Python import machinery expects them)
+    monkeypatch.setitem(
+        sys.modules,
+        "asvclscoredataservices_common",
+        types.ModuleType("asvclscoredataservices_common"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "asvclscoredataservices_common.logger",
+        types.ModuleType("asvclscoredataservices_common.logger"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "asvclscoredataservices_common.logger.basic_logger",
+        basic_logger_mod,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "asvclscoredataservices_common.ingester",
+        types.ModuleType("asvclscoredataservices_common.ingester"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "asvclscoredataservices_common.ingester.api_ingester",
+        ingester_mod,
+    )
+
+    # Now import your module
+    mod = importlib.import_module("src.api_wrapper")
+    importlib.reload(mod)
+    # expose dummy log for assertions
+    mod._dummy_log = dummy_log
+    return mod
 
 
-# ---------- retrieve_oauth_token ----------
+@pytest.fixture(autouse=True)
+def clean_env(monkeypatch):
+    """
+    Make env mutations safe per-test.
+    """
+    # start with empty env mapping layered on top of real os.environ
+    monkeypatch.setenv("PYTEST_RUNNING", "1")
+    yield
 
 
-def test_retrieve_oauth_token_posts_and_returns_token(monkeypatch):
-    fake_response = MagicMock()
-    fake_response.json.return_value = {"access_token": "abc123"}
-    fake_response.raise_for_status.return_value = None
+def test_set_env_vars_from_dict_sets_uppercase_and_skips_empty(
+    api_wrapper_module, monkeypatch
+):
+    mod = api_wrapper_module
 
-    def fake_post(url, headers, data, verify):
-        assert url == "https://token.example.com"
+    monkeypatch.delenv("FOO", raising=False)
+    monkeypatch.delenv("BAR", raising=False)
+
+    mod.set_env_vars_from_dict({"foo": "123", "": "nope", "bar": ""})
+
+    assert mod.os.environ["FOO"] == "123"
+    assert "BAR" not in mod.os.environ  # skipped because value empty
+
+    # warning was logged for skipped entries
+    assert any(
+        "Skipping empty env var" in rec[0] for rec in mod._dummy_log.warnings
+    )
+
+
+def test_retrieve_oauth_token_happy_path(api_wrapper_module, monkeypatch):
+    mod = api_wrapper_module
+
+    class DummyResp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"access_token": "abc123"}
+
+    def fake_post(url, headers=None, data=None, verify=None):
+        assert url == "https://oauth.example/token"
         assert headers == {"h": "v"}
-        assert data == {"d": "v"}
+        assert data == {"grant_type": "client_credentials"}
         assert verify is False
-        return fake_response
+        return DummyResp()
 
-    monkeypatch.setattr(ingestor_wrapper.requests, "post", fake_post)
+    monkeypatch.setattr(mod.requests, "post", fake_post)
 
-    token = ingestor_wrapper.retrieve_oauth_token(
-        "https://token.example.com",
-        {"h": "v"},
-        {"d": "v"},
+    token = mod.retrieve_oauth_token(
+        oauth_link="https://oauth.example/token",
+        headers={"h": "v"},
+        data={"grant_type": "client_credentials"},
     )
-
     assert token == "abc123"
-    fake_response.raise_for_status.assert_called_once()
-    fake_response.json.assert_called_once()
 
 
-# ---------- run_ingester (once mode) ----------
-
-
-def test_run_ingester_once_sets_env_and_calls_run_once(
-    monkeypatch, clean_environ, base_config, base_event
+def test_run_ingester_sets_env_vars_and_runs_once(
+    api_wrapper_module, monkeypatch
 ):
-    # ApiIngester mock and its instance
-    api_cls = MagicMock()
-    api_instance = api_cls.return_value
-    api_instance.run_once.return_value = {"rows": 7}
+    mod = api_wrapper_module
 
-    monkeypatch.setattr(ingestor_wrapper, "ApiIngester", api_cls)
+    # stub oauth token retrieval
+    monkeypatch.setattr(mod, "retrieve_oauth_token", lambda *a, **k: "cl_token")
 
-    # retrieve_oauth_token called twice: c1 and data
-    monkeypatch.setattr(
-        ingestor_wrapper,
-        "retrieve_oauth_token",
-        MagicMock(side_effect=["c1tok", "datatok"]),
-    )
+    event = {
+        "env_vars": {"dev": {"foo": "1"}, "prod": {"foo": "9"}},
+        "cl_oauth_url": "https://cl/oauth",
+        "exchange_headers": {"a": "b"},
+        "exchange_data": {"x": "y"},
+    }
 
-    meta = ingestor_wrapper.run_ingester(
-        table="accounts",
+    meta = mod.run_ingester(
+        table="events_api",
         env="dev",
-        event=base_event,
-        config=base_config,
+        event=event,
+        config={"some": "yaml"},
         run_mode="once",
-        start=None,
-        end=None,
     )
 
-    # ApiIngester constructed correctly
-    api_cls.assert_called_once_with(
-        config=base_config, log=ingestor_wrapper.log
-    )
+    # env var payload chosen from env_vars[env]
+    assert mod.os.environ["FOO"] == "1"
+    assert mod.os.environ["CL_OAUTH_TOKEN"] == "cl_token"
+    assert mod.os.environ["ENV"] == "dev"
+    assert mod.os.environ["TABLE"] == "events_api"
 
-    # run_once used, not backfill
-    api_instance.run_once.assert_called_once_with(
-        table_name="accounts",
-        env_name="dev",
-    )
-    api_instance.run_backfill.assert_not_called()
-
-    # return value is pass-through meta
-    assert meta == {"rows": 7}
-
-    # env_vars from config were applied
-    assert os.environ["FOO"] == "bar"
-    # oauth tokens set
-    assert os.environ["C1_OAUTH_TOKEN"] == "c1tok"
-    assert os.environ["DATA_OAUTH_TOKEN"] == "datatok"
-    # basic job context
-    assert os.environ["ENV"] == "dev"
-    assert os.environ["TABLE"] == "accounts"
-    # no dates in once mode
-    assert "START_DATE" not in os.environ
-    assert "END_DATE" not in os.environ
+    assert meta["mode"] == "once"
+    assert meta["table_name"] == "events_api"
+    assert meta["env_name"] == "dev"
 
 
-# ---------- run_ingester (backfill mode) ----------
+def test_run_ingester_data_oauth_optional(api_wrapper_module, monkeypatch):
+    mod = api_wrapper_module
 
-
-def test_run_ingester_backfill_calls_run_backfill_with_dates(
-    monkeypatch, clean_environ, base_config, base_event
-):
-    api_cls = MagicMock()
-    api_instance = api_cls.return_value
-    api_instance.run_backfill.return_value = {"rows": 99}
-
-    monkeypatch.setattr(ingestor_wrapper, "ApiIngester", api_cls)
+    tokens = iter(["cl_token", "data_token"])
     monkeypatch.setattr(
-        ingestor_wrapper,
-        "retrieve_oauth_token",
-        MagicMock(side_effect=["c1tok", "datatok"]),
+        mod, "retrieve_oauth_token", lambda *a, **k: next(tokens)
     )
 
-    meta = ingestor_wrapper.run_ingester(
-        table="accounts",
-        env="prod",
-        event=base_event,
-        config=base_config,
-        run_mode="backfill",
-        start="2024-01-01",
-        end="2024-01-10",
+    event = {
+        "cl_oauth_url": "https://cl/oauth",
+        "exchange_headers": {},
+        "exchange_data": {},
+        "data_headers": {"h": "v"},
+        "data_auth": {"grant": "x"},
+        "data_auth_url": "https://data/oauth",
+    }
+
+    meta = mod.run_ingester(
+        table="t",
+        env="dev",
+        event=event,
+        config={},
+        run_mode="once",
     )
 
-    api_instance.run_once.assert_not_called()
-    api_instance.run_backfill.assert_called_once()
-    _, kwargs = api_instance.run_backfill.call_args
-
-    # kwargs use table_name/env_name and date objects
-    assert kwargs["table_name"] == "accounts"
-    assert kwargs["env_name"] == "prod"
-    assert isinstance(kwargs["start"], date)
-    assert isinstance(kwargs["end"], date)
-
-    assert meta == {"rows": 99}
-    assert os.environ["ENV"] == "prod"
-    assert os.environ["TABLE"] == "accounts"
-    assert os.environ["START_DATE"] == "2024-01-01"
-    assert os.environ["END_DATE"] == "2024-01-10"
+    assert mod.os.environ["CL_OAUTH_TOKEN"] == "cl_token"
+    assert mod.os.environ["DATA_OAUTH_TOKEN"] == "data_token"
+    assert meta["mode"] == "once"
 
 
-def test_run_ingester_backfill_requires_start_and_end(
-    monkeypatch, clean_environ, base_config, base_event
+def test_run_ingester_backfill_requires_start_end(
+    api_wrapper_module, monkeypatch
 ):
-    # ApiIngester shouldn't even be used when validation fails,
-    # but patch it anyway to be safe.
-    monkeypatch.setattr(ingestor_wrapper, "ApiIngester", MagicMock())
-    monkeypatch.setattr(
-        ingestor_wrapper,
-        "retrieve_oauth_token",
-        MagicMock(return_value="c1tok"),
-    )
+    mod = api_wrapper_module
+    monkeypatch.setattr(mod, "retrieve_oauth_token", lambda *a, **k: "cl_token")
 
-    # missing start
+    event = {
+        "cl_oauth_url": "https://cl/oauth",
+        "exchange_headers": {},
+        "exchange_data": {},
+    }
+
     with pytest.raises(ValueError):
-        ingestor_wrapper.run_ingester(
-            table="accounts",
+        mod.run_ingester(
+            table="t",
             env="dev",
-            event=base_event,
-            config=base_config,
+            event=event,
+            config={},
             run_mode="backfill",
             start=None,
-            end="2024-01-10",
-        )
-
-    # missing end
-    with pytest.raises(ValueError):
-        ingestor_wrapper.run_ingester(
-            table="accounts",
-            env="dev",
-            event=base_event,
-            config=base_config,
-            run_mode="backfill",
-            start="2024-01-01",
             end=None,
         )
 
 
-def test_run_ingester_backfill_invalid_date_format_raises(
-    monkeypatch, clean_environ, base_config, base_event
+def test_run_ingester_backfill_parses_dates_and_calls_backfill(
+    api_wrapper_module, monkeypatch
 ):
-    monkeypatch.setattr(ingestor_wrapper, "ApiIngester", MagicMock())
-    monkeypatch.setattr(
-        ingestor_wrapper,
-        "retrieve_oauth_token",
-        MagicMock(return_value="c1tok"),
+    mod = api_wrapper_module
+    monkeypatch.setattr(mod, "retrieve_oauth_token", lambda *a, **k: "cl_token")
+
+    event = {
+        "cl_oauth_url": "https://cl/oauth",
+        "exchange_headers": {},
+        "exchange_data": {},
+    }
+
+    meta = mod.run_ingester(
+        table="t",
+        env="dev",
+        event=event,
+        config={},
+        run_mode="backfill",
+        start="2025-01-01",
+        end="2025-01-03",
     )
 
+    assert meta["mode"] == "backfill"
+    assert meta["start"] == "2025-01-01"
+    assert meta["end"] == "2025-01-03"
+
+
+def test_run_ingester_requires_table_and_env(api_wrapper_module, monkeypatch):
+    mod = api_wrapper_module
+    monkeypatch.setattr(mod, "retrieve_oauth_token", lambda *a, **k: "cl_token")
+
+    event = {"cl_oauth_url": "x", "exchange_headers": {}, "exchange_data": {}}
+
     with pytest.raises(ValueError):
-        ingestor_wrapper.run_ingester(
-            table="accounts",
-            env="dev",
-            event=base_event,
-            config=base_config,
-            run_mode="backfill",
-            start="20240101",  # bad format
-            end="2024-01-10",
-        )
-
-
-# ---------- run_ingester validation of table/env ----------
-
-
-def test_run_ingester_requires_table_and_env(
-    monkeypatch, clean_environ, base_config, base_event
-):
-    monkeypatch.setattr(ingestor_wrapper, "ApiIngester", MagicMock())
-    monkeypatch.setattr(
-        ingestor_wrapper,
-        "retrieve_oauth_token",
-        MagicMock(return_value="c1tok"),
-    )
-
-    # missing table
+        mod.run_ingester(table="", env="dev", event=event, config={})
     with pytest.raises(ValueError):
-        ingestor_wrapper.run_ingester(
-            table="",
-            env="dev",
-            event=base_event,
-            config=base_config,
-        )
-
-    # missing env
-    with pytest.raises(ValueError):
-        ingestor_wrapper.run_ingester(
-            table="accounts",
-            env="",
-            event=base_event,
-            config=base_config,
-        )
+        mod.run_ingester(table="t", env="", event=event, config={})

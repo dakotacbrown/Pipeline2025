@@ -4,18 +4,18 @@ import os
 import sys
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 
 def setup_path(
     pattern: str = "debi-etl-framework-glue*.zip",
-    search_dirs: Optional[list[Path]] = None,
-    sys_path: Optional[list[str]] = None,
+    search_dirs: Optional[List[Path]] = None,
+    sys_path: Optional[List[str]] = None,
 ) -> None:
     """
     Add the job zip (and common 'src/' locations inside it) to sys.path.
 
-    Important: If 'asvc1scoredataservices_common/' is at the TOP of the zip,
+    Important: if 'asvclscoredataservices_common/' is at the TOP of the zip,
     the zip file ITSELF must be on sys.path.
     """
     sp = sys_path if sys_path is not None else sys.path
@@ -23,7 +23,7 @@ def setup_path(
         search_dirs if search_dirs is not None else [Path("/tmp"), Path.cwd()]
     )
 
-    # 1) Prefer: zip already on sys.path (Glue commonly adds --extra-py-files)
+    # 1) Prefer zip already on sys.path (Glue commonly adds --extra-py-files)
     zip_entry = next(
         (
             p
@@ -37,7 +37,7 @@ def setup_path(
 
     # 2) Otherwise search filesystem
     if not zip_entry:
-        matches: list[Path] = []
+        matches: List[Path] = []
         for d in dirs:
             try:
                 matches.extend(list(d.rglob(pattern)))
@@ -56,21 +56,16 @@ def setup_path(
     zip_name = Path(zip_entry).name
     zip_without = zip_name[:-4] if zip_name.endswith(".zip") else zip_name
 
-    # Common layouts we want to support:
-    #  - (best) add the zip itself so top-level packages resolve
-    #  - <zip>/src
-    #  - <zip_name>/<zip_without>/src  (when extracted into a folder)
-    #  - <zip_name>/src                (alt extracted layout)
+    # Common layouts we want to support
     candidates = [
         zip_entry,  # best: add zip itself
         f"{zip_entry}/src",
         f"{zip_name}/{zip_without}/src",
-        f"{zip_name}/{zip_without}/",
         f"{zip_name}/src",
         f"{zip_name}/",
     ]
 
-    # Promote candidates so the first candidate ends up highest priority
+    # Promote candidates so the first ends up highest priority
     for p in reversed(candidates):
         if not p:
             continue
@@ -79,17 +74,26 @@ def setup_path(
         sp.insert(0, p)
 
 
-def _parse_args(argv: Optional[list[str]] = None):
+def _parse_args(argv: Optional[List[str]] = None):
     parser = argparse.ArgumentParser()
+
     parser.add_argument("--env", required=True, help="Env key under 'envs'")
     parser.add_argument(
-        "--run_mode", choices=["once", "backfill"], default="once"
+        "--run_mode",
+        choices=["once", "backfill"],
+        default="once",
     )
     parser.add_argument(
-        "-v", "--vendor", required=True, help="Vendor being ingested"
+        "-v",
+        "--vendor",
+        required=True,
+        help="Vendor being ingested",
     )
     parser.add_argument(
-        "-t", "--table", required=True, help="Table key under 'apis'"
+        "-t",
+        "--table",
+        required=True,
+        help="Table key under 'apis'",
     )
 
     # IMPORTANT: parse JSON so api_wrapper receives a dict
@@ -109,9 +113,11 @@ def _parse_args(argv: Optional[list[str]] = None):
     parser.add_argument(
         "-g", "--github_token", required=True, help="GitHub token"
     )
+
     parser.add_argument("--start_date")
     parser.add_argument("--end_date")
     parser.add_argument("--log_level", default="INFO")
+
     parser.add_argument(
         "--extra_env",
         action="append",
@@ -120,14 +126,17 @@ def _parse_args(argv: Optional[list[str]] = None):
     )
 
     args, unknown = parser.parse_known_args(argv)
+
     if unknown:
         print(
-            f"[runner] Ignoring unknown args: {unknown[:8]}{' ...' if len(unknown) > 8 else ''}"
+            f"[runner] Ignoring unknown args: {unknown[:8]}"
+            + ("..." if len(unknown) > 8 else "")
         )
+
     return args
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     # Call BEFORE importing packages that live in the zip
     setup_path()
 
@@ -170,6 +179,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         start=args.start_date,
         end=args.end_date,
     )
+
     print(json.dumps({"status": "ok", "meta": meta}))
 
 

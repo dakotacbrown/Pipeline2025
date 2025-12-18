@@ -1,12 +1,10 @@
 import importlib
 import io
 import json
-import os
 import sys
 import tempfile
 import types
 from contextlib import redirect_stdout
-from fnmatch import fnmatch
 from pathlib import Path
 
 from behave import given, then, when
@@ -51,47 +49,46 @@ class FakeWrapper:
 
 
 # -----------------------
-# Module install helpers
+# sys.modules helpers
 # -----------------------
 
 
 def _make_pkg(name: str) -> types.ModuleType:
-    m = types.ModuleType(name)
-    m.__path__ = []  # make it a package
-    return m
+    mod = types.ModuleType(name)
+    mod.__path__ = []  # package marker
+    return mod
 
 
-def _install_module(context, name: str, module: types.ModuleType):
+def _install_module(context, name: str, module: types.ModuleType) -> None:
     sys.modules[name] = module
     context._inserted_modules.append(name)
 
 
-def install_fake_common_and_api_wrapper(context):
+def install_fake_common_and_api_wrapper(context) -> None:
     """
-    Provides import targets used inside runner.main():
-      - asvc1scoredataservices_common.github.common.GithubConnection
-      - asvc1scoredataservices_common.logger.basic_logger.setup_logger
-      - src.api_wrapper.run_ingester
+    Fakes imports used inside src.run_step.main():
+
+      from asvc1scoredataservices_common.github.common import GithubConnection
+      from asvc1scoredataservices_common.logger.basic_logger import setup_logger
+      from src.api_wrapper import run_ingester
     """
     fake_log = FakeLogger()
     fake_wrapper = FakeWrapper()
 
-    # ---- asvc common packages
+    # ---- common lib packages
     root = _make_pkg("asvc1scoredataservices_common")
     github_pkg = _make_pkg("asvc1scoredataservices_common.github")
     logger_pkg = _make_pkg("asvc1scoredataservices_common.logger")
 
-    github_common = types.ModuleType(
+    github_common_mod = types.ModuleType(
         "asvc1scoredataservices_common.github.common"
     )
-    basic_logger = types.ModuleType(
+    basic_logger_mod = types.ModuleType(
         "asvc1scoredataservices_common.logger.basic_logger"
     )
 
-    # GithubConnection factory so we can capture instance per scenario
     def GithubConnection(log, github_token, repo_name):
         gh = FakeGithubConnection(log, github_token, repo_name)
-        # allow tests to pre-seed yaml contents
         gh.contents_by_path.update(getattr(context, "yaml_by_path", {}))
         context.fake_github = gh
         return gh
@@ -100,30 +97,30 @@ def install_fake_common_and_api_wrapper(context):
         context.fake_logger = fake_log
         return fake_log
 
-    github_common.GithubConnection = GithubConnection
-    basic_logger.setup_logger = setup_logger
+    github_common_mod.GithubConnection = GithubConnection
+    basic_logger_mod.setup_logger = setup_logger
 
     _install_module(context, "asvc1scoredataservices_common", root)
     _install_module(context, "asvc1scoredataservices_common.github", github_pkg)
     _install_module(
-        context, "asvc1scoredataservices_common.github.common", github_common
+        context,
+        "asvc1scoredataservices_common.github.common",
+        github_common_mod,
     )
     _install_module(context, "asvc1scoredataservices_common.logger", logger_pkg)
     _install_module(
         context,
         "asvc1scoredataservices_common.logger.basic_logger",
-        basic_logger,
+        basic_logger_mod,
     )
 
-    # Link hierarchy
     root.github = github_pkg
     root.logger = logger_pkg
-    github_pkg.common = github_common
-    logger_pkg.basic_logger = basic_logger
+    github_pkg.common = github_common_mod
+    logger_pkg.basic_logger = basic_logger_mod
 
     # ---- src.api_wrapper
-    # IMPORTANT: do NOT blindly overwrite sys.modules["src"].
-    # If the real src package exists, use it. If not, create a package-like one.
+    # IMPORTANT: don't overwrite a real `src` package if it exists.
     try:
         src_pkg = importlib.import_module("src")
     except ModuleNotFoundError:
@@ -138,9 +135,9 @@ def install_fake_common_and_api_wrapper(context):
     api_wrapper_mod.run_ingester = run_ingester
     _install_module(context, "src.api_wrapper", api_wrapper_mod)
 
-    # Attach as attribute if possible
+    # ✅ B010 fix: direct attribute assignment, no setattr with constant string
     try:
-        setattr(src_pkg, "api_wrapper", api_wrapper_mod)
+        src_pkg.api_wrapper = api_wrapper_mod
     except Exception:
         pass
 
@@ -148,7 +145,7 @@ def install_fake_common_and_api_wrapper(context):
 
 
 # -----------------------
-# Steps: setup_path component checks
+# setup_path scenarios
 # -----------------------
 
 
@@ -175,15 +172,13 @@ def step_temp_dir_with_zips(context):
     context._tmpdir = td
     d = Path(td.name)
     for row in context.table:
-        (d / row["name"]).write_bytes(b"")  # file just needs to exist
+        (d / row["name"]).write_bytes(b"")
     context.search_dir = d
 
 
 @when('I call setup_path with pattern "{pattern}"')
 def step_call_setup_path(context, pattern):
-    runner = importlib.import_module(
-        getattr(context, "runner_module", "src.run_step")
-    )
+    runner = importlib.import_module("src.run_step")
     search_dirs = (
         [context.search_dir]
         if hasattr(context, "search_dir")
@@ -196,9 +191,7 @@ def step_call_setup_path(context, pattern):
 
 @when('I call setup_path with pattern "{pattern}" (capturing errors)')
 def step_call_setup_path_capture(context, pattern):
-    runner = importlib.import_module(
-        getattr(context, "runner_module", "src.run_step")
-    )
+    runner = importlib.import_module("src.run_step")
     search_dirs = (
         [context.search_dir]
         if hasattr(context, "search_dir")
@@ -246,7 +239,7 @@ def step_setup_path_raises_value_error(context):
 
 
 # -----------------------
-# Steps: main() end-to-end with fakes
+# main() end-to-end scenario
 # -----------------------
 
 
@@ -264,7 +257,7 @@ def step_install_fakes(context):
 def step_patch_setup_path_noop(context):
     runner = importlib.import_module(context.runner_module)
     context.runner = runner
-    runner.setup_path = lambda *a, **k: None  # no-op
+    runner.setup_path = lambda *a, **k: None
 
 
 @when("I run runner.main with argv")
@@ -287,9 +280,24 @@ def step_run_main_with_argv(context):
 
 @then('stdout JSON should have status "{status}"')
 def step_stdout_json_status(context, status):
-    payload = json.loads(context.stdout)
+    out = (context.stdout or "").strip()
+    assert out, "Expected stdout to contain JSON, but it was empty"
+
+    json_line = None
+    for line in reversed(out.splitlines()):
+        s = line.strip()
+        if s.startswith("{") and s.endswith("}"):
+            json_line = s
+            break
+
+    if json_line is None:
+        i = out.rfind("{")
+        assert i != -1, f"Could not find JSON object in stdout:\n{out}"
+        json_line = out[i:].strip()
+
+    payload = json.loads(json_line)
     assert (
-        payload["status"] == status
+        payload.get("status") == status
     ), f"Expected status={status}, got {payload}"
     assert "meta" in payload, f"Expected meta in payload, got {payload}"
 

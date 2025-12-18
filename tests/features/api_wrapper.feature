@@ -5,8 +5,8 @@ Feature: API wrapper component behavior
     And I install fake common modules for the wrapper
     And I patch requests.post for oauth to return tokens
     When I call run_ingester with parameters
-      | table    | env | run_mode | start | end |
-      | users    | dev | once     |       |     |
+      | table | env | run_mode | start | end |
+      | users | dev | once     |       |     |
     And the wrapper event is
       """
       {
@@ -79,8 +79,8 @@ Feature: API wrapper component behavior
     And I install fake common modules for the wrapper
     And I patch requests.post for oauth to return tokens
     When I call run_ingester with parameters
-      | table | env | run_mode  | start      | end        |
-      | users | dev | backfill  | 2025-01-01 | 2025-01-31 |
+      | table | env | run_mode | start      | end        |
+      | users | dev | backfill | 2025-01-01 | 2025-01-31 |
     And the wrapper event is
       """
       {

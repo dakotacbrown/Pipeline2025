@@ -103,7 +103,7 @@ def test_parse_args_parses_event_json_and_extra_env(run_step_module, capsys):
 def test_main_happy_path_no_network(run_step_module, monkeypatch, capsys):
     mod = run_step_module
 
-    # ---- patch ALL requests network calls to return a fake response
+    # ---- patch ALL requests calls (no real network)
     fake_resp = MagicMock()
     fake_resp.status_code = 200
     fake_resp.raise_for_status.return_value = None
@@ -112,8 +112,6 @@ def test_main_happy_path_no_network(run_step_module, monkeypatch, capsys):
     fake_resp.content = b"{}"
 
     mock_request = MagicMock(return_value=fake_resp)
-
-    # This catches requests.get/post/etc, including deep calls in libraries
     monkeypatch.setattr(
         requests.sessions.Session, "request", mock_request, raising=True
     )
@@ -121,17 +119,17 @@ def test_main_happy_path_no_network(run_step_module, monkeypatch, capsys):
     # prevent filesystem/path scanning affecting test
     monkeypatch.setattr(mod, "setup_path", lambda *a, **k: None)
 
-    # ---- stub logger setup
+    # ---- stub logger setup (MATCH your real package prefix: asvc1...)
     class DummyLog:
         def info(self, *a, **k):
             return None
 
     basic_logger_mod = types.ModuleType(
-        "asvclscoredataservices_common.logger.basic_logger"
+        "asvc1scoredataservices_common.logger.basic_logger"
     )
     basic_logger_mod.setup_logger = lambda: DummyLog()
 
-    # ---- stub GithubConnection (still preferred — avoids relying on mocked HTTP)
+    # ---- stub GithubConnection (MATCH your real package prefix: asvc1...)
     class DummyGithubConnection:
         def __init__(self, log, token, repo_name):
             self.log = log
@@ -143,34 +141,34 @@ def test_main_happy_path_no_network(run_step_module, monkeypatch, capsys):
             return {"yaml": "dict"}
 
     github_common_mod = types.ModuleType(
-        "asvclscoredataservices_common.github.common"
+        "asvc1scoredataservices_common.github.common"
     )
     github_common_mod.GithubConnection = DummyGithubConnection
 
     # install stubs BEFORE main() imports them
     monkeypatch.setitem(
         sys.modules,
-        "asvclscoredataservices_common",
-        types.ModuleType("asvclscoredataservices_common"),
+        "asvc1scoredataservices_common",
+        types.ModuleType("asvc1scoredataservices_common"),
     )
     monkeypatch.setitem(
         sys.modules,
-        "asvclscoredataservices_common.logger",
-        types.ModuleType("asvclscoredataservices_common.logger"),
+        "asvc1scoredataservices_common.logger",
+        types.ModuleType("asvc1scoredataservices_common.logger"),
     )
     monkeypatch.setitem(
         sys.modules,
-        "asvclscoredataservices_common.logger.basic_logger",
+        "asvc1scoredataservices_common.logger.basic_logger",
         basic_logger_mod,
     )
     monkeypatch.setitem(
         sys.modules,
-        "asvclscoredataservices_common.github",
-        types.ModuleType("asvclscoredataservices_common.github"),
+        "asvc1scoredataservices_common.github",
+        types.ModuleType("asvc1scoredataservices_common.github"),
     )
     monkeypatch.setitem(
         sys.modules,
-        "asvclscoredataservices_common.github.common",
+        "asvc1scoredataservices_common.github.common",
         github_common_mod,
     )
 
@@ -223,6 +221,5 @@ def test_main_happy_path_no_network(run_step_module, monkeypatch, capsys):
     assert payload["status"] == "ok"
     assert payload["meta"] == {"ok": True}
 
-    # Optional: assert no unexpected outbound HTTP was attempted
-    # (If DummyGithubConnection is used, this should remain 0)
+    # With DummyGithubConnection, no HTTP should be needed:
     assert mock_request.call_count == 0

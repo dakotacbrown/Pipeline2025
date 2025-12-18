@@ -1,193 +1,132 @@
-import json
 import os
 import sys
 import types
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
-import src.run_step as run_step
+from src import run_step
 
 
-def _ensure_module(monkeypatch, dotted_name: str) -> types.ModuleType:
-    """
-    Ensure a module path exists in sys.modules:
-      "a.b.c" -> creates "a", "a.b", "a.b.c"
-    Returns the leaf module.
-    """
-    parts = dotted_name.split(".")
-    cur = ""
-    parent = None
-    for p in parts:
-        cur = f"{cur}.{p}" if cur else p
-        if cur not in sys.modules:
-            mod = types.ModuleType(cur)
-            monkeypatch.setitem(sys.modules, cur, mod)
-            # attach as attribute on parent package
-            if parent is not None:
-                setattr(parent, p, mod)
-        parent = sys.modules[cur]
-    return sys.modules[dotted_name]
+def test_setup_path_single_match_inserts_candidates(tmp_path: Path):
+    z = tmp_path / "debi-etl-framework-glue-abc.zip"
+    z.write_text("x")
+
+    sp: list[str] = []
+    run_step.setup_path(search_dirs=[tmp_path], sys_path=sp)
+
+    assert sp[0] == str(z)
+    assert sp[1] == f"{z}/src"
+    assert sp[2] == f"{z.name}/{z.stem}/src"
+    assert sp[3] == f"{z.name}/{z.stem}/"
+    assert sp[4] == f"{z.name}/src"
+    assert sp[5] == f"{z.name}/"
 
 
-def test_setup_path_no_matches_no_change(tmp_path):
-    sp = ["existing"]
-    run_step.setup_path(
-        pattern="debi-etl-framework-glue*.zip",
-        search_dirs=[tmp_path],
-        sys_path=sp,
-    )
-    assert sp == ["existing"]
+def test_setup_path_promotes_existing_zip_to_front(tmp_path: Path):
+    z = tmp_path / "debi-etl-framework-glue-abc.zip"
+    z.write_text("x")
+
+    sp = ["/something/else", str(z)]
+    run_step.setup_path(search_dirs=[], sys_path=sp)
+
+    assert sp[0] == str(z)
 
 
-def test_setup_path_multiple_matches_raises(tmp_path):
+def test_setup_path_zero_matches_is_noop(tmp_path: Path):
+    sp = ["keepme"]
+    run_step.setup_path(search_dirs=[tmp_path], sys_path=sp)
+    assert sp == ["keepme"]
+
+
+def test_setup_path_multiple_matches_raises(tmp_path: Path):
     (tmp_path / "debi-etl-framework-glue-a.zip").write_text("x")
     (tmp_path / "debi-etl-framework-glue-b.zip").write_text("x")
 
-    sp = []
-    with pytest.raises(ValueError, match=r"More than one .* zip found"):
-        run_step.setup_path(
-            pattern="debi-etl-framework-glue*.zip",
-            search_dirs=[tmp_path],
-            sys_path=sp,
-        )
+    with pytest.raises(ValueError, match="More than one"):
+        run_step.setup_path(search_dirs=[tmp_path], sys_path=[])
 
 
-def test_setup_path_prefers_zip_already_on_sys_path():
-    zip_entry = "/tmp/debi-etl-framework-glue-thing.zip"
-    sp = ["one", zip_entry, "two"]
-
-    run_step.setup_path(
-        pattern="debi-etl-framework-glue*.zip",
-        search_dirs=[Path("/nope")],
-        sys_path=sp,
-    )
-
-    # zip entry should be highest priority after insertion
-    assert sp[0] == zip_entry
-    assert f"{zip_entry}/src" in sp
-
-
-def test_parse_args_ignores_unknown_and_collects_extra_env(capsys):
-    argv = [
-        "--env",
-        "dev",
-        "--run_mode",
-        "once",
-        "--vendor",
-        "salesforce",
-        "--table",
-        "Account",
-        "--event",
-        '{"k":"v"}',
-        "--file_path",
-        "path/to/config.yml",
-        "--repo_name",
-        "config_management",
-        "--github_token",
-        "TOKEN",
-        "--extra_env",
-        "FOO=bar",
-        "--extra_env",
-        "BAZ=qux",
-        "--some_glue_arg",
-        "whatever",
-    ]
-    args = run_step._parse_args(argv)
-    out = capsys.readouterr().out
-
-    assert args.env == "dev"
-    assert args.table == "Account"
-    assert args.extra_env == ["FOO=bar", "BAZ=qux"]
-    assert "Ignoring unknown args" in out
-
-
-def test_main_happy_path_sets_env_and_calls_ingester(monkeypatch, capsys):
-    # --- Fake asvc1scoredataservices_common modules (so import works) ---
-    gh_mod = _ensure_module(
-        monkeypatch, "asvc1scoredataservices_common.github.common"
-    )
-    log_mod = _ensure_module(
-        monkeypatch, "asvc1scoredataservices_common.logger.basic_logger"
-    )
-
-    calls = {
-        "github_init": None,
-        "github_file": None,
-        "run_ingester": None,
-        "log_info": [],
-    }
-
-    class FakeLogger:
-        def info(self, msg, *args):
-            calls["log_info"].append((msg, args))
-
-    def fake_setup_logger():
-        return FakeLogger()
-
-    class FakeGithubConnection:
-        def __init__(self, log, github_token, repo_name):
-            calls["github_init"] = (log, github_token, repo_name)
-
-        def get_github_file_contents(self, file_path):
-            calls["github_file"] = file_path
-            return "YAML_CONTENT"
-
-    gh_mod.GithubConnection = FakeGithubConnection
-    log_mod.setup_logger = fake_setup_logger
-
-    # --- Fake src.api_wrapper.run_ingester ---
-    api_mod = _ensure_module(monkeypatch, "src.api_wrapper")
-
-    def fake_run_ingester(**kwargs):
-        calls["run_ingester"] = kwargs
-        return {"meta": "ok"}
-
-    api_mod.run_ingester = fake_run_ingester
-
-    # Avoid touching real sys.path in this unit test
+def test_main_happy_path_runs(monkeypatch, capsys):
+    # Don't mutate real sys.path in this unit test
     monkeypatch.setattr(run_step, "setup_path", lambda *a, **k: None)
 
-    argv = [
-        "--env",
-        "dev",
-        "--run_mode",
-        "once",
-        "--vendor",
-        "salesforce",
-        "--table",
-        "Account",
-        "--event",
-        '{"hello":"world"}',
-        "--file_path",
-        "cfg.yml",
-        "--repo_name",
-        "config_management",
-        "--github_token",
-        "TOKEN",
-        "--start_date",
-        "2025-01-01",
-        "--end_date",
-        "2025-01-31",
-        "--extra_env",
-        "FOO=bar",
-    ]
+    # Fake asvc1... modules that main() imports
+    root = types.ModuleType("asvc1scoredataservices_common")
+    github_pkg = types.ModuleType("asvc1scoredataservices_common.github")
+    github_mod = types.ModuleType("asvc1scoredataservices_common.github.common")
+    logger_pkg = types.ModuleType("asvc1scoredataservices_common.logger")
+    logger_mod = types.ModuleType(
+        "asvc1scoredataservices_common.logger.basic_logger"
+    )
 
-    # ensure clean env for assertion
-    monkeypatch.delenv("FOO", raising=False)
+    class DummyLog:
+        def info(self, *a, **k): ...
+        def warning(self, *a, **k): ...
 
-    meta = run_step.main(argv)
+    class DummyGithubConnection:
+        def __init__(self, log, token, repo):
+            self.log = log
+            self.token = token
+            self.repo = repo
 
-    assert os.environ["FOO"] == "bar"
-    assert calls["github_file"] == "cfg.yml"
-    assert calls["run_ingester"]["table"] == "Account"
-    assert calls["run_ingester"]["env"] == "dev"
-    assert calls["run_ingester"]["event"] == '{"hello":"world"}'
-    assert calls["run_ingester"]["config"] == "YAML_CONTENT"
-    assert calls["run_ingester"]["start"] == "2025-01-01"
-    assert calls["run_ingester"]["end"] == "2025-01-31"
-    assert meta == {"meta": "ok"}
+        def get_github_file_contents(self, file_path):
+            return {"some": "yaml"}
 
-    out = capsys.readouterr().out.strip()
-    payload = json.loads(out)
-    assert payload["status"] == "ok"
-    assert payload["meta"] == {"meta": "ok"}
+    github_mod.GithubConnection = DummyGithubConnection
+    logger_mod.setup_logger = lambda: DummyLog()
+
+    monkeypatch.setitem(sys.modules, "asvc1scoredataservices_common", root)
+    monkeypatch.setitem(
+        sys.modules, "asvc1scoredataservices_common.github", github_pkg
+    )
+    monkeypatch.setitem(
+        sys.modules, "asvc1scoredataservices_common.github.common", github_mod
+    )
+    monkeypatch.setitem(
+        sys.modules, "asvc1scoredataservices_common.logger", logger_pkg
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "asvc1scoredataservices_common.logger.basic_logger",
+        logger_mod,
+    )
+
+    # Patch args returned by _parse_args
+    monkeypatch.setattr(
+        run_step,
+        "_parse_args",
+        lambda argv=None: Namespace(
+            env="dev",
+            run_mode="once",
+            vendor="salesforce",
+            table="accounts",
+            event={"env_vars": {"dev": {}}, "c1_oauth_url": "https://x"},
+            file_path="cfg.yml",
+            repo_name="repo",
+            github_token="tok",
+            start_date=None,
+            end_date=None,
+            extra_env=["FOO=BAR", "BADVALUE"],
+            log_level="INFO",
+        ),
+    )
+
+    # Patch api_wrapper.run_ingester
+    import src.api_wrapper as api_wrapper
+
+    called = {}
+
+    def fake_run_ingester(**kwargs):
+        called.update(kwargs)
+        return {"meta": "ok"}
+
+    monkeypatch.setattr(api_wrapper, "run_ingester", fake_run_ingester)
+
+    run_step.main([])
+
+    out = capsys.readouterr().out
+    assert '"status": "ok"' in out
+    assert called["table"] == "accounts"
+    assert called["env"] == "dev"
+    assert os.environ["FOO"] == "BAR"

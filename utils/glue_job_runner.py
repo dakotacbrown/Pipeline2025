@@ -1,38 +1,36 @@
 import argparse
-import fnmatch
 import json
 import os
 import sys
+from fnmatch import fnmatch
 from pathlib import Path
-from typing import Iterable
+from typing import Optional
 
 
 def setup_path(
     pattern: str = "debi-etl-framework-glue*.zip",
-    search_dirs: list[Path] | None = None,
-    sys_path: list[str] | None = None,
+    search_dirs: Optional[list[Path]] = None,
+    sys_path: Optional[list[str]] = None,
 ) -> None:
     """
     Add the job zip (and common 'src/' locations inside it) to sys.path.
 
-    In AWS Glue, the zip may already be on sys.path (from --extra-py-files).
-    If not, we search common directories (default: /tmp and cwd) to find it.
-
-    Designed to be unit-testable via injection of sys_path/search_dirs.
+    Important: If 'asvc1scoredataservices_common/' is at the TOP of the zip,
+    the zip file ITSELF must be on sys.path.
     """
     sp = sys_path if sys_path is not None else sys.path
     dirs = (
         search_dirs if search_dirs is not None else [Path("/tmp"), Path.cwd()]
     )
 
-    # 1) Prefer: already present on sys.path (Glue commonly adds --extra-py-files)
+    # 1) Prefer: zip already on sys.path (Glue commonly adds --extra-py-files)
     zip_entry = next(
         (
             p
             for p in sp
             if isinstance(p, str)
             and p.endswith(".zip")
-            and fnmatch.fnmatch(Path(p).name, pattern)
+            and fnmatch(Path(p).name, pattern)
         ),
         None,
     )
@@ -48,86 +46,69 @@ def setup_path(
                 continue
 
         if len(matches) > 1:
-            raise ValueError(f"More than one {pattern} zip found: {matches}")
+            raise ValueError(f"More than one ({pattern}) zip found: {matches}")
         if len(matches) == 0:
             # Nothing to do (tests may run without the zip present)
             return
 
         zip_entry = str(matches[0])
 
-    zip_path = Path(zip_entry)
-    zip_name = zip_path.name
+    zip_name = Path(zip_entry).name
     zip_without = zip_name[:-4] if zip_name.endswith(".zip") else zip_name
-    zip_parent = str(zip_path.parent)
 
-    # Candidates cover common layouts:
-    # - zip itself (best for zipimport)
-    # - zip/subdir inside archive (zipimport supports "archive.zip/subdir")
-    # - extracted folder next to the zip (defensive; some runtimes unzip)
+    # Common layouts we want to support:
+    #  - (best) add the zip itself so top-level packages resolve
+    #  - <zip>/src
+    #  - <zip_name>/<zip_without>/src  (when extracted into a folder)
+    #  - <zip_name>/src                (alt extracted layout)
     candidates = [
-        zip_entry,  # best: add the zip itself
+        zip_entry,  # best: add zip itself
         f"{zip_entry}/src",
-        f"{zip_entry}/{zip_without}/src",
-        f"{zip_entry}/{zip_without}/",
-        f"{zip_parent}/{zip_without}/src",
-        f"{zip_parent}/{zip_without}/",
         f"{zip_name}/{zip_without}/src",
         f"{zip_name}/{zip_without}/",
         f"{zip_name}/src",
         f"{zip_name}/",
     ]
 
-    # Insert in reverse so the first candidate ends up highest priority.
+    # Promote candidates so the first candidate ends up highest priority
     for p in reversed(candidates):
-        if p and p not in sp:
-            sp.insert(0, p)
+        if not p:
+            continue
+        if p in sp:
+            sp.remove(p)
+        sp.insert(0, p)
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def _parse_args(argv: Optional[list[str]] = None):
     parser = argparse.ArgumentParser()
-
     parser.add_argument("--env", required=True, help="Env key under 'envs'")
     parser.add_argument(
-        "--run_mode",
-        choices=["once", "backfill"],
-        default="once",
+        "--run_mode", choices=["once", "backfill"], default="once"
     )
     parser.add_argument(
-        "-v",
-        "--vendor",
-        required=True,
-        help="Vendor corresponding to the table being ingested",
+        "-v", "--vendor", required=True, help="Vendor being ingested"
     )
     parser.add_argument(
-        "-t",
-        "--table",
-        required=True,
-        help="Table key under 'apis'",
+        "-t", "--table", required=True, help="Table key under 'apis'"
     )
+
+    # IMPORTANT: parse JSON so api_wrapper receives a dict
     parser.add_argument(
         "--event",
         required=True,
-        help="Secrets and other data passed to the ingester",
-    )
-    parser.add_argument(
-        "-f",
-        "--file_path",
-        required=True,
-        help="Path to the config file in the GitHub repo",
-    )
-    parser.add_argument(
-        "-r",
-        "--repo_name",
-        required=True,
-        help="GitHub repo name for accessing the config file",
-    )
-    parser.add_argument(
-        "-g",
-        "--github_token",
-        required=True,
-        help="GitHub token for accessing the repo",
+        type=json.loads,
+        help="Secrets and other data passed to the ingester (JSON)",
     )
 
+    parser.add_argument(
+        "-f", "--file_path", required=True, help="Path to YAML in repo"
+    )
+    parser.add_argument(
+        "-r", "--repo_name", required=True, help="GitHub repo name"
+    )
+    parser.add_argument(
+        "-g", "--github_token", required=True, help="GitHub token"
+    )
     parser.add_argument("--start_date")
     parser.add_argument("--end_date")
     parser.add_argument("--log_level", default="INFO")
@@ -138,46 +119,40 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="KEY=VALUE; repeatable",
     )
 
-    # Glue often passes extra args; ignore them
     args, unknown = parser.parse_known_args(argv)
     if unknown:
         print(
-            f"[runner] Ignoring unknown args: {unknown[:8]}"
-            + (" ..." if len(unknown) > 8 else "")
+            f"[runner] Ignoring unknown args: {unknown[:8]}{' ...' if len(unknown) > 8 else ''}"
         )
     return args
 
 
-def main(argv: list[str] | None = None) -> dict:
-    # IMPORTANT: ensure the job zip is on sys.path BEFORE importing common libs
+def main(argv: Optional[list[str]] = None) -> None:
+    # Call BEFORE importing packages that live in the zip
     setup_path()
 
-    # Import after setup_path so Glue can resolve it from the zip
+    # Delay imports (keeps unit tests easy, and still works in Glue)
     from asvc1scoredataservices_common.github.common import (  # noqa: E402
         GithubConnection,
     )
     from asvc1scoredataservices_common.logger.basic_logger import (  # noqa: E402
         setup_logger,
     )
-    from src.api_wrapper import run_ingester  # noqa: E402
 
     log = setup_logger()
     args = _parse_args(argv)
 
-    github_conn = GithubConnection(
-        log,
-        args.github_token,
-        args.repo_name,
-    )
-
+    github_conn = GithubConnection(log, args.github_token, args.repo_name)
     full_yaml = github_conn.get_github_file_contents(args.file_path)
 
-    # Optional: export any extra envs
+    # Optional: export extra envs
     for kv in args.extra_env:
         if "=" in kv:
             k, v = kv.split("=", 1)
             os.environ[k] = v
             log.info("Set env %s", k)
+
+    from src.api_wrapper import run_ingester  # noqa: E402
 
     log.info(
         "Starting run: table=%s env=%s mode=%s",
@@ -195,9 +170,7 @@ def main(argv: list[str] | None = None) -> dict:
         start=args.start_date,
         end=args.end_date,
     )
-
     print(json.dumps({"status": "ok", "meta": meta}))
-    return meta
 
 
 if __name__ == "__main__":

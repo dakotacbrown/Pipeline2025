@@ -1,145 +1,118 @@
-from __future__ import annotations
-
-import json
 import os
-from datetime import datetime
-from typing import Any, Dict, Optional
+from types import SimpleNamespace
 
-import requests
-
-from api_ingestor.api_ingestor import ApiIngestor
-from utils.basic_logger import setup_logger
-
-log = setup_logger()
+import pytest
+from src import api_wrapper
 
 
-def set_env_vars_from_dict(env_vars: Dict[str, str]) -> None:
-    """Set environment variables from a dictionary."""
-    for key, value in env_vars.items():
-        if not key or not value:
-            log.warning("Skipping empty env var %s=%s", key, value)
-            continue
+def test_set_env_vars_from_dict_sets_uppercase(monkeypatch):
+    monkeypatch.delenv("FOO", raising=False)
 
-        os.environ[key.upper()] = value
-        log.info("Set env %s=%s", key, value)
+    api_wrapper.set_env_vars_from_dict({"foo": "bar"})
+    assert os.environ["FOO"] == "bar"
 
 
-def retrieve_oauth_token(
-    oauth_link: str,
-    headers: dict,
-    data: dict,
-) -> str:
-    """Call the OAuth endpoint and return the access token."""
-    response = requests.post(
-        oauth_link,
-        headers=headers,
-        data=data,
-        verify=False,
+def test_retrieve_oauth_token_posts_and_returns(monkeypatch):
+    class DummyResp:
+        def raise_for_status(self): ...
+        def json(self):
+            return {"access_token": "TOKEN123"}
+
+    calls = {}
+
+    def fake_post(url, headers=None, data=None, verify=None):
+        calls["url"] = url
+        calls["headers"] = headers
+        calls["data"] = data
+        calls["verify"] = verify
+        return DummyResp()
+
+    monkeypatch.setattr(api_wrapper.requests, "post", fake_post)
+
+    tok = api_wrapper.retrieve_oauth_token(
+        "https://oauth", {"h": "v"}, {"a": "b"}
     )
-    response.raise_for_status()
-
-    json_data = response.json()
-    access_token = json_data["access_token"]
-    return access_token
+    assert tok == "TOKEN123"
+    assert calls["verify"] is False
 
 
-# ---------------------------------------------------------------------------
-# Public entrypoint used by the runner
-# ---------------------------------------------------------------------------
+def test_run_ingester_once_sets_env_and_calls_ingester(monkeypatch):
+    # Fake ApiIngester
+    class DummyIngester:
+        def __init__(self, config, log):
+            self.config = config
+            self.log = log
 
+        def run_once(self, table_name, env_name):
+            return {"mode": "once", "table": table_name, "env": env_name}
 
-def run_ingester(
-    table: str,
-    env: str,
-    event: Dict[str, Any],
-    config: Dict[str, Any],
-    run_mode: str = "once",
-    start: Optional[str] = None,
-    end: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Execute the ApiIngester and return the metadata dict.
+    monkeypatch.setattr(api_wrapper, "ApiIngester", DummyIngester)
 
-    Args:
-        table: Table key under 'apis' in the YAML (e.g., 'events_api').
-        env: Environment key under 'envs' (e.g., 'dev', 'prod').
-        event: Glue event dict containing headers/auth config.
-        config: Loaded YAML configuration dictionary.
-        run_mode: 'once' or 'backfill'.
-        start: (backfill) 'YYYY-MM-DD'.
-        end: (backfill) 'YYYY-MM-DD'.
-    """
-    # env-specific vars from the YAML
-    env_vars_all = config.get("env_vars", {})
-    env_vars = env_vars_all.get(env, {})
-    set_env_vars_from_dict(env_vars)
-
-    if not table:
-        raise ValueError("Parameter 'table' is required.")
-    if not env:
-        raise ValueError("Parameter 'env' is required.")
-
-    # Exchange OAuth
-    exchange_headers = event.get("exchange_headers", {})
-    exchange_data = event.get("exchange_data", {})
-
-    c1_oauth_token = retrieve_oauth_token(
-        event.get("c1_oauth_url", ""),
-        exchange_headers,
-        exchange_data,
+    # Make oauth deterministic
+    monkeypatch.setattr(
+        api_wrapper, "retrieve_oauth_token", lambda *a, **k: "CLTOK"
     )
 
-    # Optional data OAuth
-    data_headers = event.get("data_headers", {})
-    data_auth = event.get("data_auth", {})
+    event = {
+        "env_vars": {"dev": {"x": "y"}},
+        "c1_oauth_url": "https://oauth",
+        "exchange_headers": {"Content-Type": "x"},
+        "exchange_data": {"grant_type": "client_credentials"},
+    }
 
-    if "data_headers" in event and "data_auth" in event:
-        data_oauth_token = retrieve_oauth_token(
-            event.get("data_auth_url", ""),
-            data_headers,
-            data_auth,
+    meta = api_wrapper.run_ingester(
+        table="accounts",
+        env="dev",
+        event=event,
+        config={"cfg": 1},
+        run_mode="once",
+        start=None,
+        end=None,
+    )
+
+    assert meta["mode"] == "once"
+    assert os.environ["ENV"] == "dev"
+    assert os.environ["TABLE"] == "accounts"
+    assert os.environ["CL_OAUTH_TOKEN"] == "CLTOK"
+    assert os.environ["X"] == "y"  # from env_vars (uppercased)
+
+
+def test_run_ingester_backfill_requires_dates(monkeypatch):
+    class DummyIngester:
+        def __init__(self, config, log): ...
+        def run_backfill(self, table_name, env_name, start, end):
+            return {"mode": "backfill"}
+
+    monkeypatch.setattr(api_wrapper, "ApiIngester", DummyIngester)
+    monkeypatch.setattr(
+        api_wrapper, "retrieve_oauth_token", lambda *a, **k: "CLTOK"
+    )
+
+    event = {
+        "env_vars": {"dev": {}},
+        "c1_oauth_url": "https://oauth",
+        "exchange_headers": {},
+        "exchange_data": {},
+    }
+
+    with pytest.raises(ValueError, match="Backfill requires both"):
+        api_wrapper.run_ingester(
+            table="accounts",
+            env="dev",
+            event=event,
+            config={},
+            run_mode="backfill",
+            start=None,
+            end=None,
         )
-        os.environ["DATA_OAUTH_TOKEN"] = data_oauth_token
 
-    # Fixed proxy + job-wide env vars
-    os.environ["C1_OAUTH_TOKEN"] = c1_oauth_token
-    os.environ["HTTPS_PROXY"] = "http://aws-proxy-qa.cloud.capitalone.com:8099"
-    os.environ["HTTP_PROXY"] = "http://aws-proxy-qa.cloud.capitalone.com:8099"
-    os.environ["NO_PROXY"] = (
-        "169.254.169.254,170.2.0.1,localhost,s3.amazonaws.com,"
-        "s3.amazonaws.com,kdc.capitalone.com,cloud.capitalone.com,"
-        "cloudgdt.capitalone.com"
-    )  # noqa
-
-    os.environ["ENV"] = env
-    os.environ["TABLE"] = table
-    if start:
-        os.environ["START_DATE"] = start
-    if end:
-        os.environ["END_DATE"] = end
-
-    api = ApiIngestor(config=config, log=log)
-
-    if run_mode.lower() == "backfill":
-        if not start or not end:
-            raise ValueError(
-                "Backfill requires both 'start' and 'end' (YYYY-MM-DD)."
-            )
-
-        try:
-            d1 = datetime.strptime(start, "%Y-%m-%d").date()
-            d2 = datetime.strptime(end, "%Y-%m-%d").date()
-        except Exception as e:  # noqa: BLE001
-            raise ValueError(
-                f"Invalid start/end; expected 'YYYY-MM-DD'. "
-                f"Got start={start!r}, end={end!r}"
-            ) from e
-
-        meta = api.run_backfill(
-            table_name=table, env_name=env, start=d1, end=d2
+    with pytest.raises(ValueError, match="Invalid start/end"):
+        api_wrapper.run_ingester(
+            table="accounts",
+            env="dev",
+            event=event,
+            config={},
+            run_mode="backfill",
+            start="2025/01/01",
+            end="2025-01-31",
         )
-    else:
-        meta = api.run_once(table_name=table, env_name=env)
-
-    log.info("Ingester metadata: %s", json.dumps(meta))
-    return meta

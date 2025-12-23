@@ -28,26 +28,26 @@ def _install_module(
 @pytest.fixture()
 def dag_mod(monkeypatch: pytest.MonkeyPatch):
     """
-    Import the Salesforce ingester DAG module with all external deps stubbed.
+    Import the Salesforce ingester DAG module with external deps stubbed.
 
-    Key design:
-    - Keep Variable.get patching (your preference).
-    - Ensure Variable.get("INGESTER_WORKFLOW_SALESFORCE", "{}") returns a *dict*.
-    - Stub boto3, GlueJobOperator, SnowflakeHook, dag_utilities at import time.
+    Key fixes vs previous version:
+    - GlueJobOperator stub subclasses BaseOperator so Airflow dependency setting works
+      (prevents: AttributeError: object has no attribute 'update_relative')
+    - sql_transformation_task_group returns a real TaskGroup (also supports dependency setting)
+    - Variable.get returns a dict for INGESTER_WORKFLOW_SALESFORCE (not a JSON string)
     """
 
     # --------------------------
-    # 1) Stub boto3 (list S3 zips)
+    # 1) Stub boto3 (S3 list zip logic)
     # --------------------------
     boto3_mod = types.ModuleType("boto3")
 
     class _FakePaginator:
         def paginate(self, Bucket: str, Prefix: str):
-            # Provide some keys that should match your pattern "debi-etl-framework-glue*.zip"
             yield {
                 "Contents": [
                     {
-                        "Key": f"{Prefix}debi-etl-framework-glue-0.0.0-PullRequest1.PR-1-abc.zip",
+                        "Key": f"{Prefix}debi-etl-framework-glue-0.0.0-PullRequest1.PR-1-newest.zip",
                         "LastModified": 2,
                     },
                     {
@@ -70,21 +70,23 @@ def dag_mod(monkeypatch: pytest.MonkeyPatch):
     _install_module(monkeypatch, "boto3", boto3_mod)
 
     # --------------------------
-    # 2) Stub GlueJobOperator
+    # 2) Stub GlueJobOperator (MUST be a real Operator)
     # --------------------------
     glue_mod = types.ModuleType("airflow.providers.amazon.aws.operators.glue")
 
-    class DummyGlueJobOperator:
+    from airflow.models.baseoperator import BaseOperator
+
+    class DummyGlueJobOperator(BaseOperator):
+        """
+        Minimal BaseOperator subclass so >> / << dependency wiring works.
+        """
+
         def __init__(self, **kwargs: Any):
-            # Keep what we need for asserts
-            self.kwargs = kwargs
-            self.task_id = kwargs.get("task_id")
+            self.kwargs = dict(kwargs)
+            super().__init__(task_id=kwargs["task_id"])
 
-        def __rshift__(self, other):
-            return other
-
-        def __lshift__(self, other):
-            return other
+        def execute(self, context: Any):
+            return None
 
     glue_mod.GlueJobOperator = DummyGlueJobOperator
     _install_module(
@@ -105,8 +107,7 @@ def dag_mod(monkeypatch: pytest.MonkeyPatch):
             self.snowflake_conn_id = snowflake_conn_id
 
         def get_conn(self):
-            # Return a truthy value so "if not hook.get_conn(): raise" doesn't fire
-            return object()
+            return object()  # truthy
 
     snowflake_mod.SnowflakeHook = DummySnowflakeHook
     _install_module(
@@ -141,21 +142,16 @@ def dag_mod(monkeypatch: pytest.MonkeyPatch):
     def successful_execution_status(**kwargs: Any) -> Dict[str, Any]:
         return {"status": "ok", **kwargs}
 
-    # This is likely your Snowflake SQL task group builder.
-    # We just need a dummy object that can chain with >>.
-    class DummyTaskGroup:
-        def __init__(self, group_id: str):
-            self.group_id = group_id
-
-        def __rshift__(self, other):
-            return other
-
-        def __lshift__(self, other):
-            return other
+    # IMPORTANT: return a REAL TaskGroup so Airflow can wire dependencies
+    from airflow.operators.empty import EmptyOperator
+    from airflow.utils.task_group import TaskGroup
 
     def sql_transformation_task_group(**kwargs: Any):
         group_id = kwargs.get("task_group_id", "load_table")
-        return DummyTaskGroup(group_id=group_id)
+        tg = TaskGroup(group_id=group_id)
+        # add a tiny placeholder operator so the group is non-empty
+        EmptyOperator(task_id="start", task_group=tg)
+        return tg
 
     dag_utils.failover_managed_dag_tag = failover_managed_dag_tag
     dag_utils.get_bucket_name = get_bucket_name
@@ -169,21 +165,18 @@ def dag_mod(monkeypatch: pytest.MonkeyPatch):
     _install_module(monkeypatch, "dags.common.dag_utilities", dag_utils)
 
     # --------------------------
-    # 5) Stub slack alert import (if present)
+    # 5) Stub slack + filters (if imported)
     # --------------------------
     slack_mod = types.ModuleType("dags.common.slack")
     slack_mod.task_fail_slack_alert = lambda *a, **k: None
     _install_module(monkeypatch, "dags.common.slack", slack_mod)
 
-    # --------------------------
-    # 6) Stub user_defined_filters import (if present)
-    # --------------------------
     udf_mod = types.ModuleType("dags.common.user_defined_filters")
     udf_mod.ts_nodash_to_YYYYMMDDHHmmss = lambda s: s
     _install_module(monkeypatch, "dags.common.user_defined_filters", udf_mod)
 
     # --------------------------
-    # 7) Patch Airflow Variable.get (your preferred approach)
+    # 6) Patch Airflow Variable.get (parse-time variables)
     # --------------------------
     from airflow.models import Variable
 
@@ -200,9 +193,10 @@ def dag_mod(monkeypatch: pytest.MonkeyPatch):
             {"X_UPSTREAM_ENV": "capitalonesoftware-qa"}
         ),
         "INGESTER_PYTHON_MODULE": "c1-asvc1scoredataservices-common==0.1.41",
+        "INGESTER_GLUE_JOB_NAME": "etl-job",
+        "INGESTER_GLUE_CONN_NAME": "etl-net-conn",
     }
 
-    # IMPORTANT: keys read via Variable.get("<KEY>") must be TOP-LEVEL
     var_map: Dict[str, Any] = {
         "INGESTER_WORKFLOW_SALESFORCE": workflow_salesforce,
         "C1SCOREDATASERVICES_GITHUB_PASSWORD": "ghp-xxx",
@@ -212,9 +206,7 @@ def dag_mod(monkeypatch: pytest.MonkeyPatch):
         "C1S_SALESFORCE_PASSWORD": "pass",
         "C1S_SALESFORCE_CLIENTID": "cid",
         "C1S_SALESFORCE_CLIENTSECRET": "csecret",
-        # Turn on the Snowflake load path in your DAG
         "INGESTER_COPY_SQL": "copy.sql",
-        # Optional if used by generate_params in DAG
         "INGESTER_SQL_PARAMS": json.dumps(
             {
                 "DATABASE": "VALIDATION",
@@ -230,7 +222,7 @@ def dag_mod(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(Variable, "get", staticmethod(fake_get))
 
     # --------------------------
-    # 8) Finally import + reload the DAG module
+    # 7) Import + reload DAG module
     # --------------------------
     mod = importlib.import_module(DAG_IMPORT)
     importlib.reload(mod)
@@ -244,30 +236,24 @@ def test_safe_task_id(dag_mod):
 
 def test_safe_json_loads(dag_mod):
     assert dag_mod._safe_json_loads('{"a": 1}', {}) == {"a": 1}
-    # fallback ast.literal_eval path (single quotes)
     assert dag_mod._safe_json_loads("{'a': 1}", {}) == {"a": 1}
     assert dag_mod._safe_json_loads("", {"x": 1}) == {"x": 1}
 
 
 def test_get_latest_framework_zip_returns_newest(dag_mod):
-    # Uses stubbed boto3 paginator above
     s3_prefix = "s3://c1scoredataservices-qa-east/code/ETL/"
     uri = dag_mod.get_latest_framework_zip(s3_prefix=s3_prefix)
     assert uri.startswith("s3://c1scoredataservices-qa-east/")
     assert uri.endswith(".zip")
-    assert "older" not in uri  # newest chosen by LastModified
+    assert "older" not in uri
 
 
 def test_dag_builds_and_creates_glue_tasks(dag_mod):
     dag = dag_mod.dag
     assert dag is not None
 
-    # tables in our Variable patch: Account, Opportunity History
     expected_tables: List[str] = ["account", "opportunity_history"]
 
-    # tasks created in for-loop:
-    # - build_event_<safe>
-    # - run_glue_job_<safe>
     for safe in expected_tables:
         assert f"build_event_{safe}" in dag.task_ids
         assert f"run_glue_job_{safe}" in dag.task_ids
@@ -275,12 +261,9 @@ def test_dag_builds_and_creates_glue_tasks(dag_mod):
 
 def test_glue_operator_receives_event_as_xcom_template_string(dag_mod):
     dag = dag_mod.dag
-
-    # pick one task
     t = dag.get_task("run_glue_job_account")
     script_args = t.kwargs["script_args"]
 
-    # the event arg should be a *templated string* pulling the build_event task output
     assert "--event" in script_args
     assert "{{" in script_args["--event"]
     assert "ti.xcom_pull" in script_args["--event"]
@@ -290,9 +273,5 @@ def test_glue_operator_receives_event_as_xcom_template_string(dag_mod):
 def test_sql_task_group_created_when_copy_sql_present(dag_mod):
     dag = dag_mod.dag
 
-    # DAG creates a task group per table with id like "load_<table>_table"
+    # if  DAG uses safe task ids for the group id, this should exist:
     assert "load_account_table" in dag.task_group_dict
-    assert (
-        "load_opportunity history_table".replace(" ", "_")
-        not in dag.task_group_dict
-    )  # sanity

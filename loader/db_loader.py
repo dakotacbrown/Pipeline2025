@@ -44,7 +44,9 @@ class LoadConfig:
     def table_name(self) -> str:
         t = self.table.get("table") or self.table.get("name")
         if not t:
-            raise LoaderError("Missing table name: expected table.table or table.name")
+            raise LoaderError(
+                "Missing table name: expected table.table or table.name"
+            )
         return str(t)
 
     @property
@@ -124,7 +126,9 @@ class GenericDatabaseLoader:
     def register(self, db_type: str, loader: AbstractDatabaseLoader) -> None:
         self._registry[db_type.lower()] = loader
 
-    def load(self, payload: Dict[str, Any], df: Optional[pd.DataFrame] = None) -> None:
+    def load(
+        self, payload: Dict[str, Any], df: Optional[pd.DataFrame] = None
+    ) -> None:
         if "db_type" not in payload:
             raise LoaderError("payload must include db_type")
 
@@ -144,7 +148,9 @@ class GenericDatabaseLoader:
 
         if df is not None:
             if not isinstance(df, pd.DataFrame):
-                raise LoaderError(f"df must be a pandas DataFrame, got {type(df)}")
+                raise LoaderError(
+                    f"df must be a pandas DataFrame, got {type(df)}"
+                )
             loader.load_dataframe(cfg, df)
             return
 
@@ -152,12 +158,15 @@ class GenericDatabaseLoader:
             loader.load_from_s3(cfg)
             return
 
-        raise LoaderError("No df provided and no supported source.type found (expected source.type='s3').")
+        raise LoaderError(
+            "No df provided and no supported source.type found (expected source.type='s3')."
+        )
 
 
 # -------------------------
 # SQLAlchemy DataFrame loaders (Postgres/MySQL/SQLite/etc.)
 # -------------------------
+
 
 class SqlAlchemyToSqlLoader(AbstractDatabaseLoader):
     """
@@ -172,10 +181,14 @@ class SqlAlchemyToSqlLoader(AbstractDatabaseLoader):
         try:
             import sqlalchemy as sa
         except ImportError as e:
-            raise LoaderError("sqlalchemy is required for SqlAlchemyToSqlLoader") from e
+            raise LoaderError(
+                "sqlalchemy is required for SqlAlchemyToSqlLoader"
+            ) from e
 
         if cfg.mode not in {"append", "replace", "fail"}:
-            raise LoaderError("Supported modes for dataframe->SQL are append|replace|fail")
+            raise LoaderError(
+                "Supported modes for dataframe->SQL are append|replace|fail"
+            )
 
         url = self.build_sqlalchemy_url(cfg)
         engine = sa.create_engine(url)
@@ -193,10 +206,14 @@ class SqlAlchemyToSqlLoader(AbstractDatabaseLoader):
                     method="multi",
                 )
         except Exception as e:
-            raise LoaderError(f"Failed loading DataFrame to {cfg.db_type} {cfg.fq_table}") from e
+            raise LoaderError(
+                f"Failed loading DataFrame to {cfg.db_type} {cfg.fq_table}"
+            ) from e
 
     def load_from_s3(self, cfg: LoadConfig) -> None:
-        raise LoaderError(f"{cfg.db_type}: S3 load not implemented for this loader.")
+        raise LoaderError(
+            f"{cfg.db_type}: S3 load not implemented for this loader."
+        )
 
 
 class PostgresLoader(SqlAlchemyToSqlLoader):
@@ -232,16 +249,19 @@ class SqliteLoader(SqlAlchemyToSqlLoader):
 # Snowflake loader (DataFrame + S3 COPY)
 # -------------------------
 
+
 class SnowflakeLoader(AbstractDatabaseLoader):
     def load_dataframe(self, cfg: LoadConfig, df: pd.DataFrame) -> None:
         if not cfg.database:
-            raise LoaderError("Snowflake dataframe load requires table.database")
+            raise LoaderError(
+                "Snowflake dataframe load requires table.database"
+            )
         if not cfg.schema:
             raise LoaderError("Snowflake dataframe load requires table.schema")
 
         try:
-            import sqlalchemy as sa  # noqa: F401
             import snowflake.sqlalchemy  # noqa: F401
+            import sqlalchemy as sa  # noqa: F401
         except ImportError as e:
             raise LoaderError(
                 "Snowflake dataframe load requires sqlalchemy + snowflake-sqlalchemy.\n"
@@ -269,10 +289,13 @@ class SnowflakeLoader(AbstractDatabaseLoader):
         url = f"snowflake://{user}:{password}@{account}/{cfg.database}/{cfg.schema}{query}"
 
         if cfg.mode not in {"append", "replace", "fail"}:
-            raise LoaderError("Snowflake dataframe load supports mode: append|replace|fail")
+            raise LoaderError(
+                "Snowflake dataframe load supports mode: append|replace|fail"
+            )
 
         try:
             import sqlalchemy as sa
+
             engine = sa.create_engine(url)
             with engine.begin() as conn:
                 df.to_sql(
@@ -286,11 +309,15 @@ class SnowflakeLoader(AbstractDatabaseLoader):
                     method="multi",
                 )
         except Exception as e:
-            raise LoaderError(f"Failed loading DataFrame to Snowflake {cfg.fq_table}") from e
+            raise LoaderError(
+                f"Failed loading DataFrame to Snowflake {cfg.fq_table}"
+            ) from e
 
     def load_from_s3(self, cfg: LoadConfig) -> None:
         if cfg.source_type != "s3":
-            raise LoaderError(f"SnowflakeLoader only supports source.type='s3', got {cfg.source_type}")
+            raise LoaderError(
+                f"SnowflakeLoader only supports source.type='s3', got {cfg.source_type}"
+            )
 
         if not cfg.database:
             raise LoaderError("Snowflake S3 load requires table.database")
@@ -299,7 +326,9 @@ class SnowflakeLoader(AbstractDatabaseLoader):
 
         stage = cfg.copy.get("stage")
         if not stage:
-            raise LoaderError("Snowflake S3 load requires copy.stage (e.g. '@MY_EXT_STAGE').")
+            raise LoaderError(
+                "Snowflake S3 load requires copy.stage (e.g. '@MY_EXT_STAGE')."
+            )
 
         rel_path = _s3_uri_to_stage_path(cfg.s3_uri)
 
@@ -308,9 +337,13 @@ class SnowflakeLoader(AbstractDatabaseLoader):
         on_error = cfg.copy.get("on_error", "ABORT_STATEMENT")
 
         if file_format_name:
-            file_format_clause = f" FILE_FORMAT = (FORMAT_NAME = {file_format_name})"
+            file_format_clause = (
+                f" FILE_FORMAT = (FORMAT_NAME = {file_format_name})"
+            )
         else:
-            file_format_clause = f" FILE_FORMAT = ({_inline_snowflake_file_format(cfg)})"
+            file_format_clause = (
+                f" FILE_FORMAT = ({_inline_snowflake_file_format(cfg)})"
+            )
 
         pattern_clause = f" PATTERN = '{pattern}'" if pattern else ""
 
@@ -332,24 +365,33 @@ class SnowflakeLoader(AbstractDatabaseLoader):
                 """.strip()
             )
         elif cfg.mode != "append":
-            raise LoaderError("Snowflake S3 load supports mode: append|replace|fail")
+            raise LoaderError(
+                "Snowflake S3 load supports mode: append|replace|fail"
+            )
 
-        copy_sql = f"""
+        copy_sql = (
+            f"""
         COPY INTO {cfg.table_name}
         FROM {stage}/{rel_path}
         {file_format_clause}
         {pattern_clause}
         ON_ERROR = {on_error}
-        """.strip() + ";"
+        """.strip()
+            + ";"
+        )
 
         statements.append(copy_sql)
         self._execute_snowflake_sql(cfg, statements)
 
-    def _execute_snowflake_sql(self, cfg: LoadConfig, statements: list[str]) -> None:
+    def _execute_snowflake_sql(
+        self, cfg: LoadConfig, statements: list[str]
+    ) -> None:
         try:
             import snowflake.connector
         except ImportError as e:
-            raise LoaderError("Snowflake S3 load requires snowflake-connector-python.") from e
+            raise LoaderError(
+                "Snowflake S3 load requires snowflake-connector-python."
+            ) from e
 
         c = cfg.connection
         for k in ("account", "user", "password"):
@@ -372,12 +414,15 @@ class SnowflakeLoader(AbstractDatabaseLoader):
                     for stmt in statements:
                         cur.execute(stmt)
         except Exception as e:
-            raise LoaderError(f"Snowflake S3 COPY failed for {cfg.fq_table} from {cfg.s3_uri}") from e
+            raise LoaderError(
+                f"Snowflake S3 COPY failed for {cfg.fq_table} from {cfg.s3_uri}"
+            ) from e
 
 
 # -------------------------
 # Helpers
 # -------------------------
+
 
 def _s3_uri_to_stage_path(s3_uri: str) -> str:
     no_scheme = s3_uri.replace("s3://", "", 1)
@@ -395,12 +440,15 @@ def _inline_snowflake_file_format(cfg: LoadConfig) -> str:
         return "TYPE = CSV FIELD_OPTIONALLY_ENCLOSED_BY='\"' SKIP_HEADER=1"
     if fmt == "json":
         return "TYPE = JSON STRIP_OUTER_ARRAY=FALSE"
-    raise LoaderError(f"Unsupported source.format='{fmt}' for Snowflake inline FILE_FORMAT")
+    raise LoaderError(
+        f"Unsupported source.format='{fmt}' for Snowflake inline FILE_FORMAT"
+    )
 
 
 # -------------------------
 # Factory
 # -------------------------
+
 
 def build_default_loader(
     *,

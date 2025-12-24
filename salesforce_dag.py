@@ -56,9 +56,6 @@ def get_latest_s3_uri(s3_prefix: str, pattern: Optional[str] = None) -> str:
     """
     Return s3://bucket/key for the newest object under s3_prefix.
     If pattern is provided, filter objects by fnmatch on the *filename*.
-
-    NOTE: This scans recursively under the prefix because S3 list_objects_v2 returns
-    all keys that begin with Prefix (including partitioned folders).
     """
     u = urlparse(s3_prefix)
     if u.scheme != "s3" or not u.netloc:
@@ -121,9 +118,12 @@ def salesforce_ingester_dag():
     truncated_region = get_truncated_shairflow_region()
     bucket_name = get_bucket_name(env, truncated_region)
 
+    # Note: this must exist in dags.common.dag_utilities with this exact name
     c1_oauth_url = get_c1s_oauth_endpoint(env)
+
     vendor = "salesforce"
 
+    # Workflow config
     workflow_dict = Variable.get(
         f"INGESTER_WORKFLOW_{vendor.upper()}",
         default_var={},
@@ -172,7 +172,7 @@ def salesforce_ingester_dag():
         }
         return json.dumps(event)
 
-    # 1) Latest framework zip
+    # 1) Latest framework zip (explicit pattern)
     zip_prefix = f"s3://{bucket_name}/code/ETL/"
     latest_zip = get_latest_s3_uri.override(task_id="latest_framework_zip")(
         s3_prefix=zip_prefix,
@@ -186,6 +186,7 @@ def salesforce_ingester_dag():
             task_id=f"build_event_{safe}"
         )(table)
 
+        # 2) Glue job (pull zip from latest_framework_zip)
         run_glue = GlueJobOperator(
             task_id=f"run_glue_job_{safe}",
             job_name=etl_job_name,
@@ -211,8 +212,7 @@ def salesforce_ingester_dag():
             wait_for_completion=True,
         )
 
-        # 3) Latest parquet for this table
-        # IMPORTANT: keep prefix at table/ so it finds the newest file across partitions
+        # 3) Latest parquet for this table (again using the SAME helper)
         table_prefix = f"s3://{bucket_name}/data/{env}/{truncated_region}/{vendor}/{table}/"
         latest_parquet = get_latest_s3_uri.override(
             task_id=f"latest_parquet_{safe}"
@@ -221,6 +221,7 @@ def salesforce_ingester_dag():
             pattern="*.parquet",
         )
 
+        # 4) Snowflake COPY using params.s3_uri (no Glue XCom meta)
         if copy_sql:
             params = generate_params(
                 sql_params=sql_params,
@@ -235,16 +236,15 @@ def salesforce_ingester_dag():
                 params=params,
             )
 
-            # Dependencies
-            latest_zip >> run_glue
-            build_event >> run_glue
-
-            # COPY waits for Glue AND latest parquet discovery
+            # Order:
+            # - Glue needs zip and event
+            latest_zip >> build_event >> run_glue
+            # - COPY waits for Glue AND for "latest parquet" discovery
             latest_parquet >> load_table
             run_glue >> load_table
         else:
-            latest_zip >> run_glue
-            build_event >> run_glue
+            # still run glue chain if no copy_sql configured
+            latest_zip >> build_event >> run_glue
 
 
 dag = salesforce_ingester_dag()

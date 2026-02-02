@@ -1,4 +1,4 @@
-# generic_ingester.py
+# dags/generic/generic_ingester.py
 from __future__ import annotations
 
 import fnmatch
@@ -6,6 +6,7 @@ import json
 import os
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 from urllib.parse import urlparse
 
@@ -22,7 +23,7 @@ from airflow.providers.snowflake.operators.snowflake import (
 from dags.common.dag_utilities import (
     failover_managed_dag_tag,
     get_bucket_name,
-    get_cls_oauth_endpoint,
+    get_c1s_oauth_endpoint,
     get_shairflow_environment,
     get_shairflow_region,
     get_truncated_shairflow_region,
@@ -32,7 +33,9 @@ from dags.common.user_defined_filters import ts_nodash_to_YYYYMMDDHHmmss
 
 # Needed for standalone to avoid potential deadlock during connection init
 print(f"SnowflakeHook.conn_type: {SnowflakeHook.conn_type!r}")
-CURRENT_DIR = os.environ["AIRFLOW__CORE__DAGS_FOLDER"] + "/dags/generic"
+
+# Robust in pytest + Airflow: no env var required
+CURRENT_DIR = str(Path(__file__).resolve().parent)
 
 
 def _safe_task_id(s: str) -> str:
@@ -102,30 +105,25 @@ def get_latest_s3_uri(s3_prefix: str, pattern: Optional[str] = None) -> str:
         newest = max(matches, key=lambda o: o["LastModified"])
         return f"s3://{bucket}/{newest['Key']}"
 
-    else:
-        # No pattern: return the latest path (prefix) created
-        paths: Dict[str, datetime] = {}
-        for page in paginator.paginate(
-            Bucket=bucket, Prefix=prefix, Delimiter="/"
-        ):
-            for common_prefix in page.get("CommonPrefixes", []) or []:
-                path = common_prefix["Prefix"]
+    # No pattern: return the latest path (prefix) created
+    paths: Dict[str, datetime] = {}
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
+        for common_prefix in page.get("CommonPrefixes", []) or []:
+            path = common_prefix["Prefix"]
 
-                # Get the most recent object in this path to determine path's timestamp
-                path_objs = []
-                for sub_page in paginator.paginate(Bucket=bucket, Prefix=path):
-                    path_objs.extend(sub_page.get("Contents", []) or [])
-                if path_objs:
-                    latest_in_path = max(
-                        path_objs, key=lambda o: o["LastModified"]
-                    )
-                    paths[path] = latest_in_path["LastModified"]
+            # Get the most recent object in this path to determine path's timestamp
+            path_objs = []
+            for sub_page in paginator.paginate(Bucket=bucket, Prefix=path):
+                path_objs.extend(sub_page.get("Contents", []) or [])
+            if path_objs:
+                latest_in_path = max(path_objs, key=lambda o: o["LastModified"])
+                paths[path] = latest_in_path["LastModified"]
 
-        if not paths:
-            raise ValueError(f"No paths found under {s3_prefix!r}")
+    if not paths:
+        raise ValueError(f"No paths found under {s3_prefix!r}")
 
-        latest_path = max(paths.items(), key=lambda x: x[1])[0]
-        return f"s3://{bucket}/{latest_path}"
+    latest_path = max(paths.items(), key=lambda x: x[1])[0]
+    return f"s3://{bucket}/{latest_path}"
 
 
 @dag(
@@ -155,16 +153,14 @@ Generic Ingester Glue DAG orchestrates the following
 """,
 )
 def generic_ingester_dag():
-    # --------------------
     # Parse-time config
-    # --------------------
     env = get_shairflow_environment().lower()
     region = get_shairflow_region().lower()
     truncated_region = get_truncated_shairflow_region()
     bucket_name = get_bucket_name(env, truncated_region)
 
-    # Note: must exist in dags.common.dag_utilities with this exact name
-    cl_oauth_url = get_cls_oauth_endpoint(env)
+    # Correct helper name: c1s
+    c1s_oauth_url = get_c1s_oauth_endpoint(env)
 
     # Extract vendor from triggering DAG ID
     context = get_current_context()
@@ -216,20 +212,21 @@ def generic_ingester_dag():
 
     exchange = workflow_dict.get("INGESTER_EXCHANGE", None)
     if exchange:
-        ciscoredataservices_exchange_id = Variable.get(
-            "CISCOREDATASERVICES_EXCHANGE_ID", None
-        )
-        ciscoredataservices_exchange_secret = Variable.get(
+        exchange_id = Variable.get("CISCOREDATASERVICES_EXCHANGE_ID", None)
+        exchange_secret = Variable.get(
             "CISCOREDATASERVICES_EXCHANGE_SECRET", None
         )
+
+        # Backward compat: keep "cl_oauth_url" but also include explicit c1s key
         exchange_extras: Dict[str, Any] = {
-            "cl_oauth_url": cl_oauth_url,
+            "c1s_oauth_url": c1s_oauth_url,
+            "cl_oauth_url": c1s_oauth_url,
             "exchange_headers": {
                 "Content-Type": "application/x-www-form-urlencoded"
             },
             "exchange_data": {
-                "client_id": ciscoredataservices_exchange_id,
-                "client_secret": ciscoredataservices_exchange_secret,
+                "client_id": exchange_id,
+                "client_secret": exchange_secret,
                 "grant_type": "client_credentials",
             },
         }
@@ -241,9 +238,7 @@ def generic_ingester_dag():
     if data_extras and credentials:
         data_extras = _deep_replace_placeholders(data_extras, credentials)
 
-    # -------------------------
     # Task: build event JSON per table
-    # -------------------------
     @task
     def build_event_json_for_table(table: str, dataset_id: str) -> str:
         base_event: Dict[str, Any] = {
@@ -258,25 +253,24 @@ def generic_ingester_dag():
             base_event.update(data_extras)
         return json.dumps(base_event)
 
-    # -------------------------
     # Task: latest framework zip
-    # -------------------------
     zip_prefix = f"s3://{bucket_name}/code/ETL/"
     latest_zip = get_latest_s3_uri.override(task_id="latest_framework_zip")(
         s3_prefix=zip_prefix,
         pattern="debi-etl-framework-glue*.zip",
     )
 
-    # -------------------------
     # Per-table tasks
-    # -------------------------
     for table in tables:
         dataset_id = tables_dict[table]
         safe = _safe_task_id(table)
 
         build_event = build_event_json_for_table.override(
             task_id=f"build_event_{safe}"
-        )(table=table, dataset_id=dataset_id)
+        )(
+            table=table,
+            dataset_id=dataset_id,
+        )
 
         run_glue = GlueJobOperator(
             task_id=f"run_glue_job_{safe}",

@@ -12,7 +12,7 @@ DAG_MODULE_NAME = "salesforce_triggerer_under_test"
 
 def _project_root() -> Path:
     """
-    Assumes tests live in: <repo>/tests/unit/test_salesforce_ingester_triggerer.py
+    Assumes tests live in: <repo>/tests/.../test_salesforce_ingester_triggerer.py
     """
     return Path(__file__).resolve().parents[2]
 
@@ -40,7 +40,7 @@ def airflow_test_env(monkeypatch, tmp_path):
 @pytest.fixture()
 def loaded_dag_module(monkeypatch):
     """
-    Patch Variable.get and (optionally) stub failover_managed_dag_tag
+    Patch Variable.get and stub failover_managed_dag_tag (if needed)
     BEFORE importing the DAG module (since dag_scheduler() executes at import time).
     """
     repo_root = _project_root()
@@ -62,14 +62,19 @@ def loaded_dag_module(monkeypatch):
         "C1S_SALESFORCE_CLIENTSECRET": "test-client-secret",
     }
 
-    def fake_variable_get(key, default=None):
-        return values.get(key, default)
+    # Airflow calls Variable.get(key, default_var=..., deserialize_json=...)
+    def fake_variable_get(
+        key, default_var=None, deserialize_json=False, **kwargs
+    ):
+        return values.get(key, default_var)
 
     monkeypatch.setattr(
-        airflow.models.Variable, "get", staticmethod(fake_variable_get)
+        airflow.models.Variable,
+        "get",
+        staticmethod(fake_variable_get),
     )
 
-    # ---- Stub dags.common.dag_utilities.failover_managed_dag_tag if needed ----
+    # ---- Stub dags.common.dag_utilities.failover_managed_dag_tag if import fails ----
     util_mod_name = "dags.common.dag_utilities"
     try:
         importlib.import_module(util_mod_name)
@@ -82,14 +87,14 @@ def loaded_dag_module(monkeypatch):
         stub.failover_managed_dag_tag = failover_managed_dag_tag
         monkeypatch.setitem(sys.modules, util_mod_name, stub)
 
-    # Now load the DAG module (it will build the DAG immediately)
+    # Load the DAG module (it will build the DAG immediately)
     module = _load_module_from_path(DAG_MODULE_NAME, dag_file)
     return module
 
 
 def _get_schedule_str(dag) -> str:
     """
-    Airflow may expose schedule via dag.schedule or dag.schedule_interval depending on version.
+    Airflow 2.x can expose schedule via schedule_interval or schedule.
     """
     if hasattr(dag, "schedule") and dag.schedule is not None:
         return str(dag.schedule)
@@ -116,7 +121,6 @@ def test_dag_metadata(loaded_dag_module):
 def test_tasks_exist_and_counts_match(loaded_dag_module):
     dag = loaded_dag_module.dag_scheduler
 
-    # Based on your failure output: start + 2 triggers + join
     assert set(dag.task_ids) == {
         "start",
         "trigger_salesforce_generic_dag",
@@ -137,11 +141,12 @@ def test_trigger_tasks_are_configured(loaded_dag_module):
     assert isinstance(t_salesforce, TriggerDagRunOperator)
     assert isinstance(t_revcloud, TriggerDagRunOperator)
 
-    # Both should wait for completion (per your original pattern)
+    assert t_salesforce.trigger_dag_id == "debi_generic_ingester_glue_runner"
+    assert t_revcloud.trigger_dag_id == "debi_generic_ingester_glue_runner"
+
     assert t_salesforce.wait_for_completion is True
     assert t_revcloud.wait_for_completion is True
 
-    # Conf payload built with Variable.get() values (patched in fixture)
     expected_creds = {
         "username": "test-user",
         "password": "test-pass",
@@ -149,19 +154,15 @@ def test_trigger_tasks_are_configured(loaded_dag_module):
         "client_secret": "test-client-secret",
     }
 
-    # If both triggers share the same conf structure, assert both.
-    # If revcloud uses a different vendor key, adjust accordingly.
-    assert t_salesforce.conf["credentials"] == expected_creds
-    assert t_revcloud.conf["credentials"] == expected_creds
-
-    # Basic sanity checks on trigger targets (you can tighten these if you know exact dag_ids)
-    assert (
-        isinstance(t_salesforce.trigger_dag_id, str)
-        and t_salesforce.trigger_dag_id
-    )
-    assert (
-        isinstance(t_revcloud.trigger_dag_id, str) and t_revcloud.trigger_dag_id
-    )
+    # Verify full conf payloads including vendor
+    assert t_salesforce.conf == {
+        "vendor": "salesforce",
+        "credentials": expected_creds,
+    }
+    assert t_revcloud.conf == {
+        "vendor": "revcloud",
+        "credentials": expected_creds,
+    }
 
 
 def test_parallel_structure_start_to_triggers_and_join(loaded_dag_module):
@@ -172,11 +173,11 @@ def test_parallel_structure_start_to_triggers_and_join(loaded_dag_module):
     t_revcloud = dag.get_task("trigger_revcloud_generic_dag")
     join = dag.get_task("join")
 
-    # Parallel: both triggers depend on start
+    # Both triggers depend on start (parallel fan-out)
     assert t_salesforce.upstream_task_ids == {"start"}
     assert t_revcloud.upstream_task_ids == {"start"}
 
-    # No dependency between triggers (parallel)
+    # No dependency between triggers
     assert "trigger_revcloud_generic_dag" not in t_salesforce.upstream_task_ids
     assert (
         "trigger_revcloud_generic_dag" not in t_salesforce.downstream_task_ids
@@ -186,12 +187,16 @@ def test_parallel_structure_start_to_triggers_and_join(loaded_dag_module):
         "trigger_salesforce_generic_dag" not in t_revcloud.downstream_task_ids
     )
 
-    # Join: both triggers feed into join
+    # Join depends on both triggers (fan-in)
     assert join.upstream_task_ids == {
         "trigger_salesforce_generic_dag",
         "trigger_revcloud_generic_dag",
     }
+
+    # Optional extra checks (nice to have)
     assert start.downstream_task_ids == {
         "trigger_salesforce_generic_dag",
         "trigger_revcloud_generic_dag",
     }
+    assert t_salesforce.downstream_task_ids == {"join"}
+    assert t_revcloud.downstream_task_ids == {"join"}

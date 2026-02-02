@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 
 import pytest
 
-
 MODULE_PATH = "dags.generic.generic_ingester"
 
 
@@ -32,7 +31,14 @@ class _FakeS3Client:
         return self._paginator
 
 
-def _import_module_fresh(monkeypatch, *, workflow_var, copy_sql_template, dag_run_conf=None, s3_pages=None):
+def _import_module_fresh(
+    monkeypatch,
+    *,
+    workflow_var,
+    copy_sql_template,
+    dag_run_conf=None,
+    s3_pages=None,
+):
     """
     Patch all external deps BEFORE importing the DAG module so module-level DAG creation works.
     """
@@ -49,7 +55,11 @@ def _import_module_fresh(monkeypatch, *, workflow_var, copy_sql_template, dag_ru
         @staticmethod
         def get(key, default_var=None, deserialize_json=False):
             if key.startswith("INGESTER_WORKFLOW_"):
-                return workflow_var if deserialize_json else json.dumps(workflow_var)
+                return (
+                    workflow_var
+                    if deserialize_json
+                    else json.dumps(workflow_var)
+                )
             # used by exchange creds + github token
             if key == "CISCOREDATASERVICES_GITHUB_PASSWORD":
                 return "ghp_xxx"
@@ -75,18 +85,34 @@ def _import_module_fresh(monkeypatch, *, workflow_var, copy_sql_template, dag_ru
     def _fake_get_current_context():
         return {"dag_run": type("DR", (), {"conf": dag_run_conf})()}
 
-    monkeypatch.setattr("airflow.operators.python.get_current_context", _fake_get_current_context)
+    monkeypatch.setattr(
+        "airflow.operators.python.get_current_context",
+        _fake_get_current_context,
+    )
 
     # -------------------------
     # Patch your dag_utilities getters
     # -------------------------
-    monkeypatch.setattr("dags.common.dag_utilities.get_shairflow_environment", lambda: "dev")
-    monkeypatch.setattr("dags.common.dag_utilities.get_shairflow_region", lambda: "us-east-1")
-    monkeypatch.setattr("dags.common.dag_utilities.get_truncated_shairflow_region", lambda: "use1")
-    monkeypatch.setattr("dags.common.dag_utilities.get_bucket_name", lambda env, trunc: "my-bucket")
+    monkeypatch.setattr(
+        "dags.common.dag_utilities.get_shairflow_environment", lambda: "dev"
+    )
+    monkeypatch.setattr(
+        "dags.common.dag_utilities.get_shairflow_region", lambda: "us-east-1"
+    )
+    monkeypatch.setattr(
+        "dags.common.dag_utilities.get_truncated_shairflow_region",
+        lambda: "use1",
+    )
+    monkeypatch.setattr(
+        "dags.common.dag_utilities.get_bucket_name",
+        lambda env, trunc: "my-bucket",
+    )
 
     # <-- THE IMPORTANT CHANGE: c1s -->
-    monkeypatch.setattr("dags.common.dag_utilities.get_c1s_oauth_endpoint", lambda env: "https://oauth.c1s.example/token")
+    monkeypatch.setattr(
+        "dags.common.dag_utilities.get_c1s_oauth_endpoint",
+        lambda env: "https://oauth.c1s.example/token",
+    )
 
     # -------------------------
     # Patch open() for copy SQL templates
@@ -206,9 +232,16 @@ def test_get_latest_s3_uri_with_pattern_returns_newest(monkeypatch):
 
 def test_get_latest_s3_uri_with_pattern_no_matches_raises(monkeypatch):
     workflow_var = {"INGESTER_TABLES": {"t": "ds"}}
-    pages = [{"Contents": [{"Key": "x/a.csv", "LastModified": _dt(2024, 1, 1)}]}]
+    pages = [
+        {"Contents": [{"Key": "x/a.csv", "LastModified": _dt(2024, 1, 1)}]}
+    ]
 
-    mod = _import_module_fresh(monkeypatch, workflow_var=workflow_var, copy_sql_template="", s3_pages=pages)
+    mod = _import_module_fresh(
+        monkeypatch,
+        workflow_var=workflow_var,
+        copy_sql_template="",
+        s3_pages=pages,
+    )
     fn = mod.get_latest_s3_uri.python_callable
 
     with pytest.raises(ValueError, match="No objects found"):
@@ -221,12 +254,23 @@ def test_get_latest_s3_uri_no_pattern_returns_latest_prefix(monkeypatch):
     # First paginate call uses Delimiter="/" -> CommonPrefixes
     # Then for each prefix, it paginates again with Prefix=path to find latest object timestamp
     pages = [
-        {"CommonPrefixes": [{"Prefix": "x/p1/"}, {"Prefix": "x/p2/"}]},  # top-level listing
-        {"Contents": [{"Key": "x/p1/f1", "LastModified": _dt(2024, 1, 1)}]},  # p1 listing
-        {"Contents": [{"Key": "x/p2/f2", "LastModified": _dt(2024, 1, 3)}]},  # p2 listing
+        {
+            "CommonPrefixes": [{"Prefix": "x/p1/"}, {"Prefix": "x/p2/"}]
+        },  # top-level listing
+        {
+            "Contents": [{"Key": "x/p1/f1", "LastModified": _dt(2024, 1, 1)}]
+        },  # p1 listing
+        {
+            "Contents": [{"Key": "x/p2/f2", "LastModified": _dt(2024, 1, 3)}]
+        },  # p2 listing
     ]
 
-    mod = _import_module_fresh(monkeypatch, workflow_var=workflow_var, copy_sql_template="", s3_pages=pages)
+    mod = _import_module_fresh(
+        monkeypatch,
+        workflow_var=workflow_var,
+        copy_sql_template="",
+        s3_pages=pages,
+    )
     fn = mod.get_latest_s3_uri.python_callable
     out = fn("s3://my-bucket/x/")
     assert out == "s3://my-bucket/x/p2/"
@@ -234,7 +278,12 @@ def test_get_latest_s3_uri_no_pattern_returns_latest_prefix(monkeypatch):
 
 def test_get_latest_s3_uri_invalid_scheme_raises(monkeypatch):
     workflow_var = {"INGESTER_TABLES": {"t": "ds"}}
-    mod = _import_module_fresh(monkeypatch, workflow_var=workflow_var, copy_sql_template="", s3_pages=[{}])
+    mod = _import_module_fresh(
+        monkeypatch,
+        workflow_var=workflow_var,
+        copy_sql_template="",
+        s3_pages=[{}],
+    )
     fn = mod.get_latest_s3_uri.python_callable
 
     with pytest.raises(ValueError, match="Expected s3://bucket/prefix"):
@@ -258,7 +307,16 @@ def test_dag_builds_expected_tasks_and_dependencies(monkeypatch):
 
     # Make S3 listing return something for zip and jsonl lookups (task callables aren’t executed in this test),
     # but module import creates DAG and tasks referencing those callables.
-    pages = [{"Contents": [{"Key": "code/ETL/debi-etl-framework-glue1.zip", "LastModified": _dt(2024, 1, 1)}]}]
+    pages = [
+        {
+            "Contents": [
+                {
+                    "Key": "code/ETL/debi-etl-framework-glue1.zip",
+                    "LastModified": _dt(2024, 1, 1),
+                }
+            ]
+        }
+    ]
 
     mod = _import_module_fresh(
         monkeypatch,
@@ -303,7 +361,12 @@ def test_latest_jsonl_prefix_changes_in_testing_mode(monkeypatch):
         "INGESTER_TESTING": True,  # <-- key behavior
     }
 
-    mod = _import_module_fresh(monkeypatch, workflow_var=workflow_var, copy_sql_template="", s3_pages=[{}])
+    mod = _import_module_fresh(
+        monkeypatch,
+        workflow_var=workflow_var,
+        copy_sql_template="",
+        s3_pages=[{}],
+    )
     dag = mod.dag
 
     safe = mod._safe_task_id("Account")
@@ -314,11 +377,16 @@ def test_latest_jsonl_prefix_changes_in_testing_mode(monkeypatch):
     assert s3_prefix == "s3://my-bucket/test/generic/account_ds"
 
 
-def test_event_json_includes_exchange_and_data_extras_with_placeholder_replacement(monkeypatch):
+def test_event_json_includes_exchange_and_data_extras_with_placeholder_replacement(
+    monkeypatch,
+):
     workflow_var = {
         "INGESTER_TABLES": {"Account": "account_ds"},
         "INGESTER_EXCHANGE": True,
-        "INGESTER_DATA_EXTRAS": {"extra_foo": "{{bar}}", "nested": {"k": "{{bar}}"}},
+        "INGESTER_DATA_EXTRAS": {
+            "extra_foo": "{{bar}}",
+            "nested": {"k": "{{bar}}"},
+        },
     }
 
     dag_run_conf = {
@@ -339,7 +407,9 @@ def test_event_json_includes_exchange_and_data_extras_with_placeholder_replaceme
     build_task = dag.get_task(f"build_event_{safe}")
 
     # Underlying callable returns JSON string
-    payload = json.loads(build_task.python_callable(table="Account", dataset_id="account_ds"))
+    payload = json.loads(
+        build_task.python_callable(table="Account", dataset_id="account_ds")
+    )
 
     # Base
     assert payload["table"] == "Account"
@@ -350,7 +420,10 @@ def test_event_json_includes_exchange_and_data_extras_with_placeholder_replaceme
     assert payload["cl_oauth_url"] == "https://oauth.c1s.example/token"
 
     # Exchange merged
-    assert payload["exchange_headers"]["Content-Type"] == "application/x-www-form-urlencoded"
+    assert (
+        payload["exchange_headers"]["Content-Type"]
+        == "application/x-www-form-urlencoded"
+    )
     assert payload["exchange_data"]["client_id"] == "ex_id"
     assert payload["exchange_data"]["client_secret"] == "ex_secret"
     assert payload["exchange_data"]["grant_type"] == "client_credentials"

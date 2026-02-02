@@ -1,3 +1,4 @@
+import importlib
 import importlib.util
 import sys
 import types
@@ -28,9 +29,6 @@ def _load_module_from_path(module_name: str, file_path: Path):
 
 @pytest.fixture(autouse=True)
 def airflow_test_env(monkeypatch, tmp_path):
-    """
-    Make Airflow imports calmer in unit tests.
-    """
     monkeypatch.setenv("AIRFLOW__CORE__UNIT_TEST_MODE", "True")
     monkeypatch.setenv("AIRFLOW__CORE__LOAD_EXAMPLES", "False")
     monkeypatch.setenv("AIRFLOW_HOME", str(tmp_path))
@@ -39,7 +37,7 @@ def airflow_test_env(monkeypatch, tmp_path):
 @pytest.fixture()
 def loaded_dag_module(monkeypatch):
     """
-    Patch Variable.get and (optionally) stub failover_managed_dag_tag
+    Patch Variable.get (and stub failover_managed_dag_tag if needed)
     BEFORE importing the DAG module (since dag_scheduler() executes at import time).
     """
     repo_root = _project_root()
@@ -68,64 +66,81 @@ def loaded_dag_module(monkeypatch):
         airflow.models.Variable, "get", staticmethod(fake_variable_get)
     )
 
-    # ---- Optionally stub dags.common.dag_utilities.failover_managed_dag_tag ----
-    # If you prefer to use the real function, delete this block.
+    # ---- Handle dags.common.dag_utilities.failover_managed_dag_tag ----
+    # Prefer real module; only stub if import fails.
     util_mod_name = "dags.common.dag_utilities"
-    if util_mod_name not in sys.modules:
+    try:
+        importlib.import_module(util_mod_name)
+    except Exception:
         stub = types.ModuleType(util_mod_name)
 
         def failover_managed_dag_tag():
             return "failover-managed"
 
         stub.failover_managed_dag_tag = failover_managed_dag_tag
-        sys.modules[util_mod_name] = stub
-    else:
-        # If it exists, you can still patch it to be deterministic:
-        monkeypatch.setattr(
-            sys.modules[util_mod_name],
-            "failover_managed_dag_tag",
-            lambda: "failover-managed",
-        )
+        # setitem is reversible by monkeypatch (won't leak to other tests)
+        monkeypatch.setitem(sys.modules, util_mod_name, stub)
 
     # Now load the DAG module (it will build the DAG immediately)
     module = _load_module_from_path(DAG_MODULE_NAME, dag_file)
     return module
 
 
+def _get_schedule_value(dag):
+    """
+    Airflow versions can expose schedule via dag.schedule or dag.schedule_interval.
+    Keep the assertion stable across 2.x variants.
+    """
+    if hasattr(dag, "schedule") and dag.schedule is not None:
+        return str(dag.schedule)
+    if hasattr(dag, "schedule_interval"):
+        return str(dag.schedule_interval)
+    return None
+
+
 def test_dag_metadata(loaded_dag_module):
     dag = loaded_dag_module.dag_scheduler
 
     assert dag.dag_id == "debi_salesforce_glue_triggerer"
-    assert dag.schedule_interval == "0 11,16,19 * * *"
+    assert _get_schedule_value(dag) == "0 11,16,19 * * *"
     assert dag.catchup is False
     assert dag.max_active_runs == 1
 
-    # start_date is timezone-aware (pendulum tz UTC)
     assert dag.start_date is not None
     assert str(dag.start_date.tzinfo) in ("UTC", "Timezone('UTC')", "UTC+00:00")
 
-    # tags: includes your compatibility tag + failover tag
     assert "airflow-2.x.x-compatible" in dag.tags
+    # If you stubbed the tag helper, this will be present; if your real helper returns a different
+    # string, adjust accordingly.
     assert "failover-managed" in dag.tags
 
 
-def test_trigger_task_exists_and_is_configured(loaded_dag_module):
+def test_parallel_triggers_exist_and_are_configured(loaded_dag_module):
     dag = loaded_dag_module.dag_scheduler
 
-    # Only one active task in your screenshots (transformations is commented out)
-    assert len(dag.tasks) == 1
+    # Expect start + 2 triggers (and optionally join)
+    assert "start" in dag.task_ids
+    assert "trigger_salesforce_generic_dag" in dag.task_ids
+    assert "trigger_salesforce_other_dag" in dag.task_ids
 
-    task = dag.get_task("trigger_salesforce_generic_dag")
-    assert task is not None
-
-    # Operator + trigger config
+    from airflow.operators.empty import EmptyOperator
     from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
-    assert isinstance(task, TriggerDagRunOperator)
-    assert task.trigger_dag_id == "debi_generic_ingester_glue_runner"
-    assert task.wait_for_completion is True
+    start = dag.get_task("start")
+    t1 = dag.get_task("trigger_salesforce_generic_dag")
+    t2 = dag.get_task("trigger_salesforce_other_dag")
 
-    # Conf payload built with Variable.get() values (patched in fixture)
+    assert isinstance(start, EmptyOperator)
+    assert isinstance(t1, TriggerDagRunOperator)
+    assert isinstance(t2, TriggerDagRunOperator)
+
+    assert t1.trigger_dag_id == "debi_generic_ingester_glue_runner"
+    # Update this if your second trigger uses a different DAG id
+    assert isinstance(t2.trigger_dag_id, str) and len(t2.trigger_dag_id) > 0
+
+    assert t1.wait_for_completion is True
+    assert t2.wait_for_completion is True
+
     expected_conf = {
         "vendor": "salesforce",
         "credentials": {
@@ -135,13 +150,43 @@ def test_trigger_task_exists_and_is_configured(loaded_dag_module):
             "client_secret": "test-client-secret",
         },
     }
-    assert task.conf == expected_conf
+    assert t1.conf == expected_conf
+    assert t2.conf == expected_conf
 
 
-def test_task_has_no_upstream_dependencies(loaded_dag_module):
+def test_triggers_run_in_parallel(loaded_dag_module):
+    """
+    Parallel means:
+    - both triggers depend on 'start'
+    - neither trigger depends on the other (no edge between them)
+    """
     dag = loaded_dag_module.dag_scheduler
-    task = dag.get_task("trigger_salesforce_generic_dag")
 
-    assert task.upstream_task_ids == set()
-    # downstream_task_ids empty too because transformations are commented out
-    assert task.downstream_task_ids == set()
+    t1 = dag.get_task("trigger_salesforce_generic_dag")
+    t2 = dag.get_task("trigger_salesforce_other_dag")
+
+    assert t1.upstream_task_ids == {"start"}
+    assert t2.upstream_task_ids == {"start"}
+
+    # No dependency between triggers
+    assert "trigger_salesforce_other_dag" not in t1.upstream_task_ids
+    assert "trigger_salesforce_other_dag" not in t1.downstream_task_ids
+    assert "trigger_salesforce_generic_dag" not in t2.upstream_task_ids
+    assert "trigger_salesforce_generic_dag" not in t2.downstream_task_ids
+
+
+def test_optional_join_if_present(loaded_dag_module):
+    """
+    If you added a join task: start >> [t1, t2] >> join
+    this test will validate it. If you didn't add join, it will just pass.
+    """
+    dag = loaded_dag_module.dag_scheduler
+
+    if "join" not in dag.task_ids:
+        pytest.skip("No join task in this DAG")
+
+    join = dag.get_task("join")
+    assert join.upstream_task_ids == {
+        "trigger_salesforce_generic_dag",
+        "trigger_salesforce_other_dag",
+    }

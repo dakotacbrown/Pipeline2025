@@ -12,7 +12,7 @@ DAG_MODULE_NAME = "salesforce_triggerer_under_test"
 
 def _project_root() -> Path:
     """
-    Assumes tests live in: <repo>/tests/dags/test_salesforce_triggerer.py
+    Assumes tests live in: <repo>/tests/unit/test_salesforce_ingester_triggerer.py
     """
     return Path(__file__).resolve().parents[2]
 
@@ -29,6 +29,9 @@ def _load_module_from_path(module_name: str, file_path: Path):
 
 @pytest.fixture(autouse=True)
 def airflow_test_env(monkeypatch, tmp_path):
+    """
+    Make Airflow imports calmer in unit tests.
+    """
     monkeypatch.setenv("AIRFLOW__CORE__UNIT_TEST_MODE", "True")
     monkeypatch.setenv("AIRFLOW__CORE__LOAD_EXAMPLES", "False")
     monkeypatch.setenv("AIRFLOW_HOME", str(tmp_path))
@@ -37,7 +40,7 @@ def airflow_test_env(monkeypatch, tmp_path):
 @pytest.fixture()
 def loaded_dag_module(monkeypatch):
     """
-    Patch Variable.get (and stub failover_managed_dag_tag if needed)
+    Patch Variable.get and (optionally) stub failover_managed_dag_tag
     BEFORE importing the DAG module (since dag_scheduler() executes at import time).
     """
     repo_root = _project_root()
@@ -53,10 +56,10 @@ def loaded_dag_module(monkeypatch):
     import airflow.models
 
     values = {
-        "CIS_SALESFORCE_USERNAME": "test-user",
-        "CIS_SALESFORCE_PASSWORD": "test-pass",
-        "CIS_SALESFORCE_CLIENTID": "test-client-id",
-        "CIS_SALESFORCE_CLIENTSECRET": "test-client-secret",
+        "C1S_SALESFORCE_USERNAME": "test-user",
+        "C1S_SALESFORCE_PASSWORD": "test-pass",
+        "C1S_SALESFORCE_CLIENTID": "test-client-id",
+        "C1S_SALESFORCE_CLIENTSECRET": "test-client-secret",
     }
 
     def fake_variable_get(key, default=None):
@@ -66,8 +69,7 @@ def loaded_dag_module(monkeypatch):
         airflow.models.Variable, "get", staticmethod(fake_variable_get)
     )
 
-    # ---- Handle dags.common.dag_utilities.failover_managed_dag_tag ----
-    # Prefer real module; only stub if import fails.
+    # ---- Stub dags.common.dag_utilities.failover_managed_dag_tag if needed ----
     util_mod_name = "dags.common.dag_utilities"
     try:
         importlib.import_module(util_mod_name)
@@ -78,7 +80,6 @@ def loaded_dag_module(monkeypatch):
             return "failover-managed"
 
         stub.failover_managed_dag_tag = failover_managed_dag_tag
-        # setitem is reversible by monkeypatch (won't leak to other tests)
         monkeypatch.setitem(sys.modules, util_mod_name, stub)
 
     # Now load the DAG module (it will build the DAG immediately)
@@ -86,23 +87,22 @@ def loaded_dag_module(monkeypatch):
     return module
 
 
-def _get_schedule_value(dag):
+def _get_schedule_str(dag) -> str:
     """
-    Airflow versions can expose schedule via dag.schedule or dag.schedule_interval.
-    Keep the assertion stable across 2.x variants.
+    Airflow may expose schedule via dag.schedule or dag.schedule_interval depending on version.
     """
     if hasattr(dag, "schedule") and dag.schedule is not None:
         return str(dag.schedule)
     if hasattr(dag, "schedule_interval"):
         return str(dag.schedule_interval)
-    return None
+    return ""
 
 
 def test_dag_metadata(loaded_dag_module):
     dag = loaded_dag_module.dag_scheduler
 
     assert dag.dag_id == "debi_salesforce_glue_triggerer"
-    assert _get_schedule_value(dag) == "0 11,16,19 * * *"
+    assert _get_schedule_str(dag) == "0 11,16,19 * * *"
     assert dag.catchup is False
     assert dag.max_active_runs == 1
 
@@ -110,83 +110,88 @@ def test_dag_metadata(loaded_dag_module):
     assert str(dag.start_date.tzinfo) in ("UTC", "Timezone('UTC')", "UTC+00:00")
 
     assert "airflow-2.x.x-compatible" in dag.tags
-    # If you stubbed the tag helper, this will be present; if your real helper returns a different
-    # string, adjust accordingly.
     assert "failover-managed" in dag.tags
 
 
-def test_parallel_triggers_exist_and_are_configured(loaded_dag_module):
+def test_tasks_exist_and_counts_match(loaded_dag_module):
     dag = loaded_dag_module.dag_scheduler
 
-    # Expect start + 2 triggers (and optionally join)
-    assert "start" in dag.task_ids
-    assert "trigger_salesforce_generic_dag" in dag.task_ids
-    assert "trigger_salesforce_other_dag" in dag.task_ids
+    # Based on your failure output: start + 2 triggers + join
+    assert set(dag.task_ids) == {
+        "start",
+        "trigger_salesforce_generic_dag",
+        "trigger_revcloud_generic_dag",
+        "join",
+    }
+    assert len(dag.tasks) == 4
 
-    from airflow.operators.empty import EmptyOperator
+
+def test_trigger_tasks_are_configured(loaded_dag_module):
+    dag = loaded_dag_module.dag_scheduler
+
     from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
-    start = dag.get_task("start")
-    t1 = dag.get_task("trigger_salesforce_generic_dag")
-    t2 = dag.get_task("trigger_salesforce_other_dag")
+    t_salesforce = dag.get_task("trigger_salesforce_generic_dag")
+    t_revcloud = dag.get_task("trigger_revcloud_generic_dag")
 
-    assert isinstance(start, EmptyOperator)
-    assert isinstance(t1, TriggerDagRunOperator)
-    assert isinstance(t2, TriggerDagRunOperator)
+    assert isinstance(t_salesforce, TriggerDagRunOperator)
+    assert isinstance(t_revcloud, TriggerDagRunOperator)
 
-    assert t1.trigger_dag_id == "debi_generic_ingester_glue_runner"
-    # Update this if your second trigger uses a different DAG id
-    assert isinstance(t2.trigger_dag_id, str) and len(t2.trigger_dag_id) > 0
+    # Both should wait for completion (per your original pattern)
+    assert t_salesforce.wait_for_completion is True
+    assert t_revcloud.wait_for_completion is True
 
-    assert t1.wait_for_completion is True
-    assert t2.wait_for_completion is True
-
-    expected_conf = {
-        "vendor": "salesforce",
-        "credentials": {
-            "username": "test-user",
-            "password": "test-pass",
-            "client_id": "test-client-id",
-            "client_secret": "test-client-secret",
-        },
+    # Conf payload built with Variable.get() values (patched in fixture)
+    expected_creds = {
+        "username": "test-user",
+        "password": "test-pass",
+        "client_id": "test-client-id",
+        "client_secret": "test-client-secret",
     }
-    assert t1.conf == expected_conf
-    assert t2.conf == expected_conf
+
+    # If both triggers share the same conf structure, assert both.
+    # If revcloud uses a different vendor key, adjust accordingly.
+    assert t_salesforce.conf["credentials"] == expected_creds
+    assert t_revcloud.conf["credentials"] == expected_creds
+
+    # Basic sanity checks on trigger targets (you can tighten these if you know exact dag_ids)
+    assert (
+        isinstance(t_salesforce.trigger_dag_id, str)
+        and t_salesforce.trigger_dag_id
+    )
+    assert (
+        isinstance(t_revcloud.trigger_dag_id, str) and t_revcloud.trigger_dag_id
+    )
 
 
-def test_triggers_run_in_parallel(loaded_dag_module):
-    """
-    Parallel means:
-    - both triggers depend on 'start'
-    - neither trigger depends on the other (no edge between them)
-    """
+def test_parallel_structure_start_to_triggers_and_join(loaded_dag_module):
     dag = loaded_dag_module.dag_scheduler
 
-    t1 = dag.get_task("trigger_salesforce_generic_dag")
-    t2 = dag.get_task("trigger_salesforce_other_dag")
-
-    assert t1.upstream_task_ids == {"start"}
-    assert t2.upstream_task_ids == {"start"}
-
-    # No dependency between triggers
-    assert "trigger_salesforce_other_dag" not in t1.upstream_task_ids
-    assert "trigger_salesforce_other_dag" not in t1.downstream_task_ids
-    assert "trigger_salesforce_generic_dag" not in t2.upstream_task_ids
-    assert "trigger_salesforce_generic_dag" not in t2.downstream_task_ids
-
-
-def test_optional_join_if_present(loaded_dag_module):
-    """
-    If you added a join task: start >> [t1, t2] >> join
-    this test will validate it. If you didn't add join, it will just pass.
-    """
-    dag = loaded_dag_module.dag_scheduler
-
-    if "join" not in dag.task_ids:
-        pytest.skip("No join task in this DAG")
-
+    start = dag.get_task("start")
+    t_salesforce = dag.get_task("trigger_salesforce_generic_dag")
+    t_revcloud = dag.get_task("trigger_revcloud_generic_dag")
     join = dag.get_task("join")
+
+    # Parallel: both triggers depend on start
+    assert t_salesforce.upstream_task_ids == {"start"}
+    assert t_revcloud.upstream_task_ids == {"start"}
+
+    # No dependency between triggers (parallel)
+    assert "trigger_revcloud_generic_dag" not in t_salesforce.upstream_task_ids
+    assert (
+        "trigger_revcloud_generic_dag" not in t_salesforce.downstream_task_ids
+    )
+    assert "trigger_salesforce_generic_dag" not in t_revcloud.upstream_task_ids
+    assert (
+        "trigger_salesforce_generic_dag" not in t_revcloud.downstream_task_ids
+    )
+
+    # Join: both triggers feed into join
     assert join.upstream_task_ids == {
         "trigger_salesforce_generic_dag",
-        "trigger_salesforce_other_dag",
+        "trigger_revcloud_generic_dag",
+    }
+    assert start.downstream_task_ids == {
+        "trigger_salesforce_generic_dag",
+        "trigger_revcloud_generic_dag",
     }

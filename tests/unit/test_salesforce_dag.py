@@ -1,214 +1,147 @@
-import importlib
-import io
+import importlib.util
+import sys
 import types
-from unittest.mock import MagicMock
+from pathlib import Path
 
 import pytest
 
-DAG_MODULE = "dags.salesforce.salesforce_ingester"
+DAG_FILE_RELATIVE_PATH = Path("dags/generic/salesforce_triggerer.py")
+DAG_MODULE_NAME = "salesforce_triggerer_under_test"
 
 
-def _import_dag_module(monkeypatch, workflow_var_dict, copy_sql_template):
+def _project_root() -> Path:
     """
-    Import/reload the DAG module with patched Airflow Variables and dag_utilities.
+    Assumes tests live in: <repo>/tests/dags/test_salesforce_triggerer.py
     """
-    # Ensure CURRENT_DIR can be computed at import-time
-    monkeypatch.setenv("AIRFLOW__CORE__DAGS_FOLDER", "/tmp")
-
-    # Patch dag_utilities functions used at parse time
-    fake_utils = types.SimpleNamespace(
-        failover_managed_dag_tag=lambda: "failover",
-        get_bucket_name=lambda env, trunc_region: "my-bucket",
-        get_c1s_oauth_endpoint=lambda env: "https://oauth.example",
-        get_shairflow_environment=lambda: "qa",
-        get_shairflow_region=lambda: "us-east-1",
-        get_truncated_shairflow_region=lambda: "us-east-1",
-    )
-
-    monkeypatch.setattr(
-        f"{DAG_MODULE}.failover_managed_dag_tag",
-        fake_utils.failover_managed_dag_tag,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        f"{DAG_MODULE}.get_bucket_name",
-        fake_utils.get_bucket_name,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        f"{DAG_MODULE}.get_c1s_oauth_endpoint",
-        fake_utils.get_c1s_oauth_endpoint,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        f"{DAG_MODULE}.get_shairflow_environment",
-        fake_utils.get_shairflow_environment,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        f"{DAG_MODULE}.get_shairflow_region",
-        fake_utils.get_shairflow_region,
-        raising=False,
-    )
-    monkeypatch.setattr(
-        f"{DAG_MODULE}.get_truncated_shairflow_region",
-        fake_utils.get_truncated_shairflow_region,
-        raising=False,
-    )
-
-    # Patch Variable.get
-    from airflow.models import Variable
-
-    def fake_variable_get(key, default_var=None, deserialize_json=False):
-        if key == "C1SCOREDATASERVICES_GITHUB_PASSWORD":
-            return "gh-token"
-        if key == "C1SCOREDATASERVICES_EXCHANGE_ID":
-            return "ex-id"
-        if key == "C1SCOREDATASERVICES_EXCHANGE_SECRET":
-            return "ex-secret"
-        if key == "C1S_SALESFORCE_USERNAME":
-            return "sf-user"
-        if key == "C1S_SALESFORCE_PASSWORD":
-            return "sf-pass"
-        if key == "C1S_SALESFORCE_CLIENTID":
-            return "sf-client"
-        if key == "C1S_SALESFORCE_CLIENTSECRET":
-            return "sf-client-secret"
-
-        if key == "INGESTER_WORKFLOW_SALESFORCE":
-            if deserialize_json:
-                return workflow_var_dict
-            return workflow_var_dict
-
-        return default_var
-
-    monkeypatch.setattr(Variable, "get", staticmethod(fake_variable_get))
-
-    # Patch SnowflakeHook.get_conn so parse-time validation passes
-    from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
-
-    monkeypatch.setattr(
-        SnowflakeHook, "get_conn", lambda self: object(), raising=True
-    )
-
-    # Patch boto3 in case get_latest_s3_uri is invoked during anything unexpected
-    import boto3
-
-    monkeypatch.setattr(boto3, "client", MagicMock(), raising=True)
-
-    # Patch open() for get_copy_sql (it reads copy/copy_{table}.sql)
-    def fake_open(*args, **kwargs):
-        return io.StringIO(copy_sql_template)
-
-    monkeypatch.setattr("builtins.open", fake_open, raising=True)
-
-    # Now import/reload module
-    mod = importlib.import_module(DAG_MODULE)
-    mod = importlib.reload(mod)
-    return mod
+    return Path(__file__).resolve().parents[2]
 
 
-@pytest.fixture
-def workflow_var_dict():
-    return {
-        "INGESTER_CONFIG_PATH": "ingester/salesforce.yml",
-        "INGESTER_CONFIG_REPO_NAME": "config_management",
-        "INGESTER_END_DATE": "2000-01-31",
-        "INGESTER_ENV_VARS": {"X_UPSTREAM_ENV": "capitalonesoftware-qa"},
-        "INGESTER_TABLES": ["opportunity"],
-        "INGESTER_RUN_MODE": "once",
-        "INGESTER_GLUE_JOB_NAME": "etl-job",
-        "INGESTER_GLUE_CONN_NAME": "etl-net-conn",
-        "INGESTER_SQL_PARAMS": {"DATABASE": "VALIDATION", "SCHEMA": "PUBLIC"},
+def _load_module_from_path(module_name: str, file_path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, str(file_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load module spec from {file_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(autouse=True)
+def airflow_test_env(monkeypatch, tmp_path):
+    """
+    Make Airflow imports calmer in unit tests.
+    """
+    monkeypatch.setenv("AIRFLOW__CORE__UNIT_TEST_MODE", "True")
+    monkeypatch.setenv("AIRFLOW__CORE__LOAD_EXAMPLES", "False")
+    monkeypatch.setenv("AIRFLOW_HOME", str(tmp_path))
+
+
+@pytest.fixture()
+def loaded_dag_module(monkeypatch):
+    """
+    Patch Variable.get and (optionally) stub failover_managed_dag_tag
+    BEFORE importing the DAG module (since dag_scheduler() executes at import time).
+    """
+    repo_root = _project_root()
+    dag_file = repo_root / DAG_FILE_RELATIVE_PATH
+    if not dag_file.exists():
+        raise FileNotFoundError(f"Expected DAG file at: {dag_file}")
+
+    # Ensure repo root is on sys.path so `from dags.common...` imports can work
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    # ---- Patch airflow.models.Variable.get BEFORE module import ----
+    import airflow.models
+
+    values = {
+        "CIS_SALESFORCE_USERNAME": "test-user",
+        "CIS_SALESFORCE_PASSWORD": "test-pass",
+        "CIS_SALESFORCE_CLIENTID": "test-client-id",
+        "CIS_SALESFORCE_CLIENTSECRET": "test-client-secret",
     }
 
+    def fake_variable_get(key, default=None):
+        return values.get(key, default)
 
-@pytest.fixture
-def copy_sql_template():
-    # Template file contents read by get_copy_sql()
-    return (
-        "DELETE FROM {{ params.target_table }};\n"
-        "COPY INTO {{ params.target_table }}\n"
-        "FROM @VALIDATION_STAGE/{{ params.s3_uri }}\n"
-        "FILE_FORMAT = (TYPE = PARQUET)\n"
-        "MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE;\n"
-        "FORCE = TRUE;\n"
+    monkeypatch.setattr(
+        airflow.models.Variable, "get", staticmethod(fake_variable_get)
     )
 
+    # ---- Optionally stub dags.common.dag_utilities.failover_managed_dag_tag ----
+    # If you prefer to use the real function, delete this block.
+    util_mod_name = "dags.common.dag_utilities"
+    if util_mod_name not in sys.modules:
+        stub = types.ModuleType(util_mod_name)
 
-def test_dag_builds_expected_tasks(
-    monkeypatch, workflow_var_dict, copy_sql_template
-):
-    mod = _import_dag_module(monkeypatch, workflow_var_dict, copy_sql_template)
-    dag = mod.dag
+        def failover_managed_dag_tag():
+            return "failover-managed"
 
-    assert dag.dag_id == "debi_ingester_glue_runner"
+        stub.failover_managed_dag_tag = failover_managed_dag_tag
+        sys.modules[util_mod_name] = stub
+    else:
+        # If it exists, you can still patch it to be deterministic:
+        monkeypatch.setattr(
+            sys.modules[util_mod_name],
+            "failover_managed_dag_tag",
+            lambda: "failover-managed",
+        )
 
-    # Shared zip task
-    assert "latest_framework_zip" in dag.task_ids
-
-    # Table-specific tasks (Opportunity -> safe id "opportunity")
-    assert "build_event_opportunity" in dag.task_ids
-    assert "run_glue_job_opportunity" in dag.task_ids
-    assert "latest_parquet_opportunity" in dag.task_ids
-    assert "copy_sql_opportunity" in dag.task_ids
-    assert "load_table_opportunity" in dag.task_ids
-
-
-def test_glue_job_args_reference_xcom(
-    monkeypatch, workflow_var_dict, copy_sql_template
-):
-    mod = _import_dag_module(monkeypatch, workflow_var_dict, copy_sql_template)
-    dag = mod.dag
-
-    run_glue = dag.get_task("run_glue_job_opportunity")
-    script_args = run_glue.script_args
-
-    assert (
-        script_args["--extra-py-files"]
-        == "{{ ti.xcom_pull(task_ids='latest_framework_zip') }}"
-    )
-    assert (
-        script_args["--event"]
-        == "{{ ti.xcom_pull(task_ids='build_event_opportunity') }}"
-    )
+    # Now load the DAG module (it will build the DAG immediately)
+    module = _load_module_from_path(DAG_MODULE_NAME, dag_file)
+    return module
 
 
-def test_load_table_sql_comes_from_copy_sql_xcom(
-    monkeypatch, workflow_var_dict, copy_sql_template
-):
-    """
-    load_table.sql should be an XComArg pointing at copy_sql_<table>,
-    not params["s3_uri"] like the old implementation.
-    """
-    mod = _import_dag_module(monkeypatch, workflow_var_dict, copy_sql_template)
-    dag = mod.dag
+def test_dag_metadata(loaded_dag_module):
+    dag = loaded_dag_module.dag_scheduler
 
-    load = dag.get_task("load_table_opportunity")
+    assert dag.dag_id == "debi_salesforce_glue_triggerer"
+    assert dag.schedule_interval == "0 11,16,19 * * *"
+    assert dag.catchup is False
+    assert dag.max_active_runs == 1
 
-    from airflow.models.xcom_arg import XComArg
+    # start_date is timezone-aware (pendulum tz UTC)
+    assert dag.start_date is not None
+    assert str(dag.start_date.tzinfo) in ("UTC", "Timezone('UTC')", "UTC+00:00")
 
-    assert isinstance(load.sql, XComArg)
-    # XComArg.operator is the upstream task object (copy_sql_opportunity)
-    assert load.sql.operator.task_id == "copy_sql_opportunity"
+    # tags: includes your compatibility tag + failover tag
+    assert "airflow-2.x.x-compatible" in dag.tags
+    assert "failover-managed" in dag.tags
 
 
-def test_dependencies(monkeypatch, workflow_var_dict, copy_sql_template):
-    mod = _import_dag_module(monkeypatch, workflow_var_dict, copy_sql_template)
-    dag = mod.dag
+def test_trigger_task_exists_and_is_configured(loaded_dag_module):
+    dag = loaded_dag_module.dag_scheduler
 
-    latest_zip = dag.get_task("latest_framework_zip")
-    build_event = dag.get_task("build_event_opportunity")
-    run_glue = dag.get_task("run_glue_job_opportunity")
-    latest_parquet = dag.get_task("latest_parquet_opportunity")
-    copy_sql = dag.get_task("copy_sql_opportunity")
-    load = dag.get_task("load_table_opportunity")
+    # Only one active task in your screenshots (transformations is commented out)
+    assert len(dag.tasks) == 1
 
-    # latest_zip -> build_event -> run_glue
-    assert build_event.task_id in latest_zip.downstream_task_ids
-    assert run_glue.task_id in build_event.downstream_task_ids
+    task = dag.get_task("trigger_salesforce_generic_dag")
+    assert task is not None
 
-    # run_glue -> latest_parquet -> copy_sql -> load_table
-    assert latest_parquet.task_id in run_glue.downstream_task_ids
-    assert copy_sql.task_id in latest_parquet.downstream_task_ids
-    assert load.task_id in copy_sql.downstream_task_ids
+    # Operator + trigger config
+    from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+
+    assert isinstance(task, TriggerDagRunOperator)
+    assert task.trigger_dag_id == "debi_generic_ingester_glue_runner"
+    assert task.wait_for_completion is True
+
+    # Conf payload built with Variable.get() values (patched in fixture)
+    expected_conf = {
+        "vendor": "salesforce",
+        "credentials": {
+            "username": "test-user",
+            "password": "test-pass",
+            "client_id": "test-client-id",
+            "client_secret": "test-client-secret",
+        },
+    }
+    assert task.conf == expected_conf
+
+
+def test_task_has_no_upstream_dependencies(loaded_dag_module):
+    dag = loaded_dag_module.dag_scheduler
+    task = dag.get_task("trigger_salesforce_generic_dag")
+
+    assert task.upstream_task_ids == set()
+    # downstream_task_ids empty too because transformations are commented out
+    assert task.downstream_task_ids == set()

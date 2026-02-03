@@ -63,9 +63,11 @@ def resolve_run_config() -> dict:
       {
         "vendor": "salesforce" | "revCloud" | ...,
         "credentials": {...},
-        "start_date": "YYYY-MM-DD" (optional),
-        "end_date": "YYYY-MM-DD" (optional)
+        "start_date": <any string> (optional),
+        "end_date": <any string> (optional)
       }
+
+    NOTE: start_date/end_date are passed through as-is because vendors may vary.
     """
     ctx = get_current_context()
     conf = ctx["dag_run"].conf or {}
@@ -108,7 +110,7 @@ def resolve_run_config() -> dict:
         or datetime.now().strftime("%Y-%m-%d")
     )
 
-    # compute workflow-driven fields here (avoid cfg["workflow_dict"].get(...) in DAG factory)
+    # workflow-driven fields
     testing = bool(workflow_dict.get("INGESTER_TESTING", False))
     dedupe = bool(workflow_dict.get("INGESTER_DEDUPE", False))
     python_modules = workflow_dict.get("INGESTER_PYTHON_MODULE", None)
@@ -131,6 +133,8 @@ def resolve_run_config() -> dict:
 
     data_extras = workflow_dict.get("INGESTER_DATA_EXTRAS", None)
 
+    exchange_enabled = bool(workflow_dict.get("INGESTER_EXCHANGE", False))
+
     return {
         "vendor": vendor,
         "tables": tables,
@@ -148,6 +152,7 @@ def resolve_run_config() -> dict:
         "sql_params": sql_params,
         "ingester_env_vars": ingester_env_vars,
         "data_extras": data_extras,
+        "exchange_enabled": exchange_enabled,
     }
 
 
@@ -344,7 +349,6 @@ def build_glue_operator_kwargs(
 ) -> dict:
     """
     Build a single GlueJobOperator kwargs dict for dynamic mapping via expand_kwargs().
-    This allows job_name/aws_conn_id to be runtime-driven (per vendor/workflow).
     """
     script_args = {
         "--env": env,
@@ -364,7 +368,7 @@ def build_glue_operator_kwargs(
     script_args = {k: v for k, v in script_args.items() if v is not None}
 
     return {
-        "task_id": f"run_glue_job__{table}",  # map-index will still exist, this helps readability
+        "task_id": f"run_glue_job__{table}",
         "job_name": etl_job_name,
         "aws_conn_id": etl_conn_name,
         "region_name": region,
@@ -394,7 +398,6 @@ def build_glue_operator_kwargs(
     start_date=datetime(2023, 12, 23, tzinfo=pendulum.timezone("UTC")),
 )
 def generic_ingester_dag():
-    # ✅ parse-time safe (no runtime context)
     env = get_shairflow_environment().lower()
     region = get_shairflow_region().lower()
     truncated_region = get_truncated_shairflow_region()
@@ -414,7 +417,10 @@ def generic_ingester_dag():
     )
 
     # runtime extras
-    exchange_extras = build_exchange_extras(env)
+    exchange_extras = (
+        build_exchange_extras(env) if cfg["exchange_enabled"] else None
+    )
+
     env_vars = build_env_vars(region, bucket_name, cfg["ingester_env_vars"])
     data_extras = build_data_extras(cfg["data_extras"], cfg["credentials"])
 
@@ -451,8 +457,8 @@ def generic_ingester_dag():
             repo_name=cfg["repo_name"],
             config_path=cfg["config_path"],
             github_token=github_token,
-            start_date=cfg["start_date"],
-            end_date=cfg["end_date"],
+            start_date=cfg["start_date"],  # passed through as-is
+            end_date=cfg["end_date"],  # passed through as-is
             python_modules=cfg["python_modules"],
             index_url="https://artifactory.cloud.capitalone.com/artifactory/api/pypi/pypi-internalfacing/simple",
         )
@@ -470,11 +476,7 @@ def generic_ingester_dag():
     # per-table: latest json in the table prefix (mapped)
     prefixes = (
         build_table_prefix.override(task_id="table_prefix")
-        .partial(
-            bucket_name=bucket_name,
-            vendor=vendor,
-            testing=cfg["testing"],
-        )
+        .partial(bucket_name=bucket_name, vendor=vendor, testing=cfg["testing"])
         .expand(dataset_id=dataset_ids)
     )
 
@@ -487,15 +489,8 @@ def generic_ingester_dag():
     # per-table: COPY sql + execute
     copy_sql = (
         get_sql.override(task_id="copy_sql")
-        .partial(
-            sql_params=cfg["sql_params"],
-            type="copy",
-            enabled=True,
-        )
-        .expand(
-            table_name=table_names,
-            s3_uri=latest_json,
-        )
+        .partial(sql_params=cfg["sql_params"], type="copy", enabled=True)
+        .expand(table_name=table_names, s3_uri=latest_json)
     )
 
     load_table = SQLExecuteQueryOperator.partial(

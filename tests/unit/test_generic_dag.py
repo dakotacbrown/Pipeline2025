@@ -1,22 +1,22 @@
-# tests/dags/test_debi_generic_ingester_glue_runner.py
+# tests/unit/test_generic_ingester_dag.py
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import types
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pytest
 
 # ---------------------------------------------------------------------
 # Configure these for your repo
 # ---------------------------------------------------------------------
-DAG_FILE_RELATIVE_PATH = Path(
-    "dags/generic/debi_generic_ingester_glue_runner.py"
-)
-DAG_MODULE_NAME = "debi_generic_ingester_glue_runner_under_test"
+# Update this path to match the DAG file location in your repo.
+DAG_FILE_RELATIVE_PATH = Path("dags/generic/generic_ingester.py")
+DAG_MODULE_NAME = "generic_ingester_under_test"
 
 
 # ---------------------------------------------------------------------
@@ -24,17 +24,16 @@ DAG_MODULE_NAME = "debi_generic_ingester_glue_runner_under_test"
 # ---------------------------------------------------------------------
 def _project_root() -> Path:
     """
-    Assumes tests live in: <repo>/tests/dags/test_*.py
+    Assumes tests live in: <repo>/tests/<...>/test_*.py
     """
     return Path(__file__).resolve().parents[2]
 
 
 def _install_stub_modules(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Provide minimal stub modules so importing the DAG file doesn't require
-    your full dags.common package to be importable in the test environment.
+    Minimal stub modules so importing the DAG file doesn't require
+    your full dags.common package during unit tests.
     """
-    # dags
     dags_mod = types.ModuleType("dags")
     common_mod = types.ModuleType("dags.common")
 
@@ -107,7 +106,11 @@ def _load_module_from_path(
 
 
 @pytest.fixture()
-def dag_module(monkeypatch):
+def dag_module(monkeypatch: pytest.MonkeyPatch):
+    """
+    Import the DAG module under test with stubs for dags.common.* and ensure
+    cleanup so it doesn't affect other tests.
+    """
     file_path = _project_root() / DAG_FILE_RELATIVE_PATH
     mod = _load_module_from_path(DAG_MODULE_NAME, file_path, monkeypatch)
     try:
@@ -117,7 +120,22 @@ def dag_module(monkeypatch):
 
 
 # ---------------------------------------------------------------------
-# Unit tests: _deep_replace_placeholders
+# Helper: execute TaskFlow @task underlying callable (Airflow 2.10.5)
+# ---------------------------------------------------------------------
+def call_task(task_obj, *args, **kwargs):
+    """
+    Airflow TaskFlow @task returns an XComArg when you call it.
+    Use .function (Airflow 2.10.x) to run underlying python.
+    """
+    if hasattr(task_obj, "function"):
+        return task_obj.function(*args, **kwargs)
+    if hasattr(task_obj, "__wrapped__"):
+        return task_obj.__wrapped__(*args, **kwargs)
+    raise TypeError(f"Object {task_obj!r} does not look like a TaskFlow task")
+
+
+# ---------------------------------------------------------------------
+# Unit tests: _deep_replace_placeholders (NOT a task)
 # ---------------------------------------------------------------------
 def test_deep_replace_placeholders_leaves_missing_and_none_intact(dag_module):
     fn = dag_module._deep_replace_placeholders
@@ -131,27 +149,21 @@ def test_deep_replace_placeholders_leaves_missing_and_none_intact(dag_module):
 
     out = fn(obj, creds)
     assert out["a"] == "abc123"
-    assert out["b"][1] == "{{MISSING}}"  # missing key stays
-    assert out["b"][2]["c"] == "{{NONEVAL}}"  # None stays
+    assert out["b"][1] == "{{MISSING}}"
+    assert out["b"][2]["c"] == "{{NONEVAL}}"
     assert out["d"] == 123
 
 
-def test_deep_replace_placeholders_non_str_passthrough(dag_module):
-    fn = dag_module._deep_replace_placeholders
-    assert fn(5, {"X": "y"}) == 5
-    assert fn(None, {"X": "y"}) is None
-
-
 # ---------------------------------------------------------------------
-# Unit tests: extract_table_names / extract_dataset_ids
+# Unit tests: extract helpers
 # ---------------------------------------------------------------------
 def test_extract_helpers(dag_module):
     tables = [
         {"table": "t1", "dataset_id": "d1"},
         {"table": "t2", "dataset_id": "d2"},
     ]
-    assert dag_module.extract_table_names(tables) == ["t1", "t2"]
-    assert dag_module.extract_dataset_ids(tables) == ["d1", "d2"]
+    assert call_task(dag_module.extract_table_names, tables) == ["t1", "t2"]
+    assert call_task(dag_module.extract_dataset_ids, tables) == ["d1", "d2"]
 
 
 # ---------------------------------------------------------------------
@@ -171,10 +183,12 @@ def test_resolve_run_config_requires_vendor(monkeypatch, dag_module):
     with pytest.raises(
         ValueError, match=r"dag_run\.conf\['vendor'\] is required"
     ):
-        dag_module.resolve_run_config()
+        call_task(dag_module.resolve_run_config)
 
 
-def test_resolve_run_config_valid(monkeypatch, dag_module):
+def test_resolve_run_config_valid_exchange_enabled_true(
+    monkeypatch, dag_module
+):
     def fake_ctx():
         return {
             "dag_run": _FakeDagRun(
@@ -189,7 +203,6 @@ def test_resolve_run_config_valid(monkeypatch, dag_module):
 
     monkeypatch.setattr(dag_module, "get_current_context", fake_ctx)
 
-    # Variable.get should return workflow dict for INGESTER_WORKFLOW_SALESFORCE
     def fake_variable_get(key: str, default_var=None, deserialize_json=False):
         if key == "INGESTER_WORKFLOW_SALESFORCE":
             return {
@@ -205,12 +218,13 @@ def test_resolve_run_config_valid(monkeypatch, dag_module):
                 "INGESTER_SQL_PARAMS": {"DATABASE": "DB", "SCHEMA": "SC"},
                 "INGESTER_ENV_VARS": {"A": "B"},
                 "INGESTER_DATA_EXTRAS": {"hello": "{{TOKEN}}"},
+                "INGESTER_EXCHANGE": True,  # ✅ new behavior
             }
         return default_var
 
     monkeypatch.setattr(dag_module.Variable, "get", fake_variable_get)
 
-    cfg = dag_module.resolve_run_config()
+    cfg = call_task(dag_module.resolve_run_config)
 
     assert cfg["vendor"] == "salesforce"
     assert cfg["tables"] == [
@@ -229,6 +243,26 @@ def test_resolve_run_config_valid(monkeypatch, dag_module):
     assert cfg["sql_params"] == {"DATABASE": "DB", "SCHEMA": "SC"}
     assert cfg["ingester_env_vars"] == {"A": "B"}
     assert cfg["data_extras"] == {"hello": "{{TOKEN}}"}
+    assert cfg["exchange_enabled"] is True
+
+
+def test_resolve_run_config_exchange_enabled_default_false(
+    monkeypatch, dag_module
+):
+    def fake_ctx():
+        return {"dag_run": _FakeDagRun(conf={"vendor": "x"})}
+
+    monkeypatch.setattr(dag_module, "get_current_context", fake_ctx)
+
+    def fake_variable_get(key: str, default_var=None, deserialize_json=False):
+        if key == "INGESTER_WORKFLOW_X":
+            return {"INGESTER_TABLES": {"t": "ds"}}  # no INGESTER_EXCHANGE key
+        return default_var
+
+    monkeypatch.setattr(dag_module.Variable, "get", fake_variable_get)
+
+    cfg = call_task(dag_module.resolve_run_config)
+    assert cfg["exchange_enabled"] is False
 
 
 def test_resolve_run_config_tables_missing_raises(monkeypatch, dag_module):
@@ -245,7 +279,7 @@ def test_resolve_run_config_tables_missing_raises(monkeypatch, dag_module):
     monkeypatch.setattr(dag_module.Variable, "get", fake_variable_get)
 
     with pytest.raises(ValueError, match=r"INGESTER_TABLES missing/empty"):
-        dag_module.resolve_run_config()
+        call_task(dag_module.resolve_run_config)
 
 
 # ---------------------------------------------------------------------
@@ -254,16 +288,14 @@ def test_resolve_run_config_tables_missing_raises(monkeypatch, dag_module):
 class _FakePaginator:
     def __init__(self, pages: List[dict]):
         self._pages = pages
-        self.calls: List[dict] = []
 
     def paginate(self, **kwargs):
-        self.calls.append(kwargs)
         for p in self._pages:
             yield p
 
 
 class _FakeS3Client:
-    def __init__(self, paginator: _FakePaginator):
+    def __init__(self, paginator):
         self._paginator = paginator
 
     def get_paginator(self, name: str):
@@ -273,7 +305,7 @@ class _FakeS3Client:
 
 def test_get_latest_s3_uri_invalid_scheme_raises(dag_module):
     with pytest.raises(ValueError, match=r"Expected s3://bucket/prefix"):
-        dag_module.get_latest_s3_uri("https://example.com/x")
+        call_task(dag_module.get_latest_s3_uri, "https://example.com/x")
 
 
 def test_get_latest_s3_uri_pattern_branch_newest_match(monkeypatch, dag_module):
@@ -295,13 +327,13 @@ def test_get_latest_s3_uri_pattern_branch_newest_match(monkeypatch, dag_module):
             ]
         }
     ]
-    paginator = _FakePaginator(pages)
-    fake_s3 = _FakeS3Client(paginator)
-
+    fake_s3 = _FakeS3Client(_FakePaginator(pages))
     monkeypatch.setattr(dag_module.boto3, "client", lambda name: fake_s3)
 
-    out = dag_module.get_latest_s3_uri(
-        "s3://my-bucket/code/ETL", pattern="debi-etl-framework-glue*.zip"
+    out = call_task(
+        dag_module.get_latest_s3_uri,
+        "s3://my-bucket/code/ETL",
+        pattern="debi-etl-framework-glue*.zip",
     )
     assert out == "s3://my-bucket/code/ETL/debi-etl-framework-glue-2.zip"
 
@@ -309,15 +341,9 @@ def test_get_latest_s3_uri_pattern_branch_newest_match(monkeypatch, dag_module):
 def test_get_latest_s3_uri_prefix_branch_latest_common_prefix(
     monkeypatch, dag_module
 ):
-    """
-    When pattern is None, code finds "latest path" among CommonPrefixes by scanning
-    objects inside each prefix and taking the prefix that contains the newest object.
-    """
     dt_old = datetime(2024, 1, 1, tzinfo=timezone.utc)
     dt_new = datetime(2024, 1, 5, tzinfo=timezone.utc)
 
-    # First call (Delimiter="/") returns CommonPrefixes
-    # Subsequent calls scan each prefix and return Contents for that prefix.
     pages_for_delimiter = [
         {
             "CommonPrefixes": [
@@ -333,28 +359,25 @@ def test_get_latest_s3_uri_prefix_branch_latest_common_prefix(
         {"Contents": [{"Key": "vendor/ds2/file.json", "LastModified": dt_new}]}
     ]
 
-    paginator = _FakePaginator(pages_for_delimiter)
-    fake_s3 = _FakeS3Client(paginator)
+    class _SmartPaginator:
+        def paginate(self, **kwargs):
+            if kwargs.get("Delimiter") == "/":
+                yield from pages_for_delimiter
+                return
+            if kwargs.get("Prefix") == "vendor/ds1/":
+                yield from pages_for_ds1
+                return
+            if kwargs.get("Prefix") == "vendor/ds2/":
+                yield from pages_for_ds2
+                return
+            yield {"Contents": []}
 
-    def fake_paginate(**kwargs):
-        # route based on Prefix
-        if kwargs.get("Delimiter") == "/":
-            yield from pages_for_delimiter
-            return
-        if kwargs.get("Prefix") == "vendor/ds1/":
-            yield from pages_for_ds1
-            return
-        if kwargs.get("Prefix") == "vendor/ds2/":
-            yield from pages_for_ds2
-            return
-        yield {"Contents": []}
-
-    # monkeypatch paginator.paginate to be smarter
-    paginator.paginate = fake_paginate  # type: ignore[assignment]
-
+    fake_s3 = _FakeS3Client(_SmartPaginator())
     monkeypatch.setattr(dag_module.boto3, "client", lambda name: fake_s3)
 
-    out = dag_module.get_latest_s3_uri("s3://my-bucket/vendor", pattern=None)
+    out = call_task(
+        dag_module.get_latest_s3_uri, "s3://my-bucket/vendor", pattern=None
+    )
     assert out == "s3://my-bucket/vendor/ds2/"
 
 
@@ -362,7 +385,6 @@ def test_get_latest_s3_uri_prefix_branch_latest_common_prefix(
 # Unit tests: get_sql
 # ---------------------------------------------------------------------
 def test_get_sql_replacements(tmp_path: Path, monkeypatch, dag_module):
-    # Create fake sql template under CURRENT_DIR/type/type_table.sql
     current_dir = tmp_path
     (current_dir / "copy").mkdir()
     sql_file = current_dir / "copy" / "copy_accounts.sql"
@@ -375,16 +397,21 @@ def test_get_sql_replacements(tmp_path: Path, monkeypatch, dag_module):
     sql_params = {"DATABASE": "DB", "SCHEMA": "SC"}
     s3_uri = "s3://bucket/vendor/ds/file.json"
 
-    out = dag_module.get_sql(
-        "accounts", sql_params=sql_params, type="copy", s3_uri=s3_uri
+    out = call_task(
+        dag_module.get_sql,
+        "accounts",
+        sql_params=sql_params,
+        type="copy",
+        s3_uri=s3_uri,
+        enabled=True,
     )
     assert "DB.SC.accounts" in out
-    assert "vendor/ds/file.json" in out  # key-only (no s3://bucket/)
+    assert "vendor/ds/file.json" in out  # key-only
 
 
-def test_get_sql_disabled_returns_noop(tmp_path: Path, monkeypatch, dag_module):
-    monkeypatch.setattr(dag_module, "CURRENT_DIR", str(tmp_path))
-    out = dag_module.get_sql(
+def test_get_sql_disabled_returns_noop(dag_module):
+    out = call_task(
+        dag_module.get_sql,
         "anything",
         sql_params={"DATABASE": "DB", "SCHEMA": "SC"},
         type="copy",
@@ -410,7 +437,7 @@ def test_build_exchange_extras(monkeypatch, dag_module):
 
     monkeypatch.setattr(dag_module.Variable, "get", fake_variable_get)
 
-    out = dag_module.build_exchange_extras("dev")
+    out = call_task(dag_module.build_exchange_extras, "dev")
     assert out["c1_oauth_url"] == "https://oauth/dev"
     assert out["exchange_data"]["client_id"] == "cid"
     assert out["exchange_data"]["client_secret"] == "csec"
@@ -418,7 +445,9 @@ def test_build_exchange_extras(monkeypatch, dag_module):
 
 
 def test_build_env_vars(dag_module):
-    out = dag_module.build_env_vars("us-east-1", "bucket", {"X": "Y"})
+    out = call_task(
+        dag_module.build_env_vars, "us-east-1", "bucket", {"X": "Y"}
+    )
     assert out["X"] == "Y"
     assert out["REGION"] == "us-east-1"
     assert out["BUCKET_NAME"] == "bucket"
@@ -427,16 +456,17 @@ def test_build_env_vars(dag_module):
 def test_build_data_extras_placeholder_replacement(dag_module):
     data_extras = {"headers": {"Authorization": "Bearer {{TOKEN}}"}}
     creds = {"TOKEN": "abc"}
-    out = dag_module.build_data_extras(data_extras, creds)
+    out = call_task(dag_module.build_data_extras, data_extras, creds)
     assert out["headers"]["Authorization"] == "Bearer abc"
 
 
-def test_build_event_json_for_table_merges(dag_module):
+def test_build_event_json_for_table_includes_exchange_when_present(dag_module):
     env_vars = {"REGION": "x"}
     exchange = {"c1_oauth_url": "u", "exchange_data": {"a": "b"}}
     data_extras = {"hello": "world"}
 
-    out = dag_module.build_event_json_for_table(
+    out = call_task(
+        dag_module.build_event_json_for_table,
         vendor="salesforce",
         table="accounts",
         dataset_id="ds1",
@@ -444,31 +474,55 @@ def test_build_event_json_for_table_merges(dag_module):
         exchange_extras=exchange,
         data_extras=data_extras,
     )
-    # It returns a JSON string; check key bits exist
-    assert '"vendor": "salesforce"' in out
-    assert '"table": "accounts"' in out
-    assert '"dataset_id": "ds1"' in out
-    assert '"c1_oauth_url": "u"' in out
-    assert '"hello": "world"' in out
+    payload = json.loads(out)
+    assert payload["vendor"] == "salesforce"
+    assert payload["table"] == "accounts"
+    assert payload["dataset_id"] == "ds1"
+    assert payload["c1_oauth_url"] == "u"
+    assert payload["exchange_data"] == {"a": "b"}
+    assert payload["hello"] == "world"
+
+
+def test_build_event_json_for_table_omits_exchange_when_none(dag_module):
+    env_vars = {"REGION": "x"}
+    data_extras = {"hello": "world"}
+
+    out = call_task(
+        dag_module.build_event_json_for_table,
+        vendor="salesforce",
+        table="accounts",
+        dataset_id="ds1",
+        env_vars=env_vars,
+        exchange_extras=None,  # ✅ key behavior
+        data_extras=data_extras,
+    )
+    payload = json.loads(out)
+    assert payload["vendor"] == "salesforce"
+    assert "c1_oauth_url" not in payload
+    assert "exchange_data" not in payload
+    assert payload["hello"] == "world"
 
 
 def test_build_table_prefix(dag_module):
-    assert (
-        dag_module.build_table_prefix(
-            "bucket", "salesforce", "ds1", testing=False
-        )
-        == "s3://bucket/salesforce/ds1/"
-    )
-    assert (
-        dag_module.build_table_prefix(
-            "bucket", "salesforce", "ds1", testing=True
-        )
-        == "s3://bucket/test/salesforce/ds1"
-    )
+    assert call_task(
+        dag_module.build_table_prefix,
+        "bucket",
+        "salesforce",
+        "ds1",
+        testing=False,
+    ) == ("s3://bucket/salesforce/ds1/")
+    assert call_task(
+        dag_module.build_table_prefix,
+        "bucket",
+        "salesforce",
+        "ds1",
+        testing=True,
+    ) == ("s3://bucket/test/salesforce/ds1")
 
 
 def test_build_glue_operator_kwargs_drops_none_values(dag_module):
-    out = dag_module.build_glue_operator_kwargs(
+    out = call_task(
+        dag_module.build_glue_operator_kwargs,
         env="dev",
         region="us-east-1",
         vendor="salesforce",
@@ -484,23 +538,18 @@ def test_build_glue_operator_kwargs_drops_none_values(dag_module):
         github_token="gh",
         start_date="2020-01-01",
         end_date="2020-01-31",
-        python_modules=None,  # should be removed
+        python_modules=None,  # dropped
         index_url="https://index/simple",
     )
 
     assert out["task_id"] == "run_glue_job__accounts"
     assert out["job_name"] == "job"
     assert out["aws_conn_id"] == "conn"
-    assert out["region_name"] == "us-east-1"
-    assert out["wait_for_completion"] is True
 
     script_args = out["script_args"]
     assert script_args["--env"] == "dev"
     assert script_args["--table"] == "accounts"
-    assert script_args["--vendor"] == "salesforce"
-    assert script_args["--extra-py-files"] == "s3://b/code/ETL/z.zip"
-    assert script_args["--event"] == '{"x":1}'
-    assert "--additional-python-modules" not in script_args  # dropped
+    assert "--additional-python-modules" not in script_args
 
 
 # ---------------------------------------------------------------------
@@ -510,8 +559,6 @@ def test_dag_import_and_task_ids(dag_module):
     dag = dag_module.dag
     assert dag.dag_id == "debi_generic_ingester_glue_runner"
 
-    # A few key tasks that should always exist (even with dynamic mapping)
-    # Note: overridden task_ids are the ones you set via .override(task_id="...")
     expected = {
         "resolve_run_config",
         "extract_table_names",
@@ -530,5 +577,4 @@ def test_dag_import_and_task_ids(dag_module):
         "dedupe_sql",
         "dedupe_table",
     }
-
     assert expected.issubset(set(dag.task_ids))

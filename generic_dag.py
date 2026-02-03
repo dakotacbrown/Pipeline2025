@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import fnmatch
 import json
-import logging
 import re
 from datetime import datetime
 from pathlib import Path
@@ -29,7 +28,6 @@ from dags.common.dag_utilities import (
 from dags.common.slack import task_fail_slack_alert
 from dags.common.user_defined_filters import ts_nodash_to_YYYYMMDDHHmmss
 
-LOG = logging.getLogger(__name__)
 CURRENT_DIR = str(Path(__file__).resolve().parent)
 
 
@@ -61,19 +59,15 @@ def resolve_run_config() -> dict:
     """
     Resolve everything that depends on dag_run.conf at runtime.
 
-    Expected dag_run.conf shape (matches your scheduler):
+    Expected dag_run.conf shape:
       {
-        "vendor": "salesforce" | "revCloud" | ...,
+        "vendor": "...",
         "credentials": {...},
         "start_date": <any string> (optional),
         "end_date": <any string> (optional)
       }
 
-    NOTE: start_date/end_date are passed through as-is because vendors may vary.
-
-    SECURITY NOTE:
-      - raw credentials are NOT returned in XCom (prevents leaking to logs/XCom UI)
-      - data_extras placeholders are resolved in-task using credentials
+    NOTE: start_date/end_date passed through as-is because vendors may vary.
     """
     ctx = get_current_context()
     conf = ctx["dag_run"].conf or {}
@@ -103,18 +97,6 @@ def resolve_run_config() -> dict:
         {"table": t, "dataset_id": ds} for t, ds in tables_dict.items()
     ]
 
-    # Debug-only counts (no secrets). Helps explain mapped-task explosions.
-    unique_pairs = {
-        (str(x.get("table", "")).lower(), str(x.get("dataset_id", "")).lower())
-        for x in tables
-    }
-    LOG.warning(
-        "resolve_run_config vendor=%s tables_count=%d unique_pairs=%d",
-        vendor,
-        len(tables),
-        len(unique_pairs),
-    )
-
     credentials = conf.get("credentials", {}) or {}
     if not isinstance(credentials, dict):
         credentials = {}
@@ -134,7 +116,6 @@ def resolve_run_config() -> dict:
     etl_job_name = workflow_dict.get("INGESTER_GLUE_JOB_NAME", "etl-job")
     etl_conn_name = workflow_dict.get("INGESTER_GLUE_CONN_NAME", "etl-net-conn")
     run_mode = workflow_dict.get("INGESTER_RUN_MODE", "once")
-
     config_path = workflow_dict.get("INGESTER_CONFIG_PATH", None)
     repo_name = workflow_dict.get(
         "INGESTER_CONFIG_REPO_NAME", "config_management"
@@ -148,17 +129,13 @@ def resolve_run_config() -> dict:
     if not isinstance(ingester_env_vars, dict):
         ingester_env_vars = {}
 
-    # Resolve data extras placeholders *here* so we don't push credentials into XCom.
     data_extras = workflow_dict.get("INGESTER_DATA_EXTRAS", None)
-    if data_extras and credentials:
-        data_extras = _deep_replace_placeholders(data_extras, credentials)
-
     exchange_enabled = bool(workflow_dict.get("INGESTER_EXCHANGE", False))
 
     return {
         "vendor": vendor,
         "tables": tables,
-        # "credentials": credentials,  # intentionally NOT returned
+        "credentials": credentials,
         "start_date": start_date,
         "end_date": end_date,
         "testing": testing,
@@ -177,40 +154,34 @@ def resolve_run_config() -> dict:
 
 
 @task
-def reconcile_tables(tables: List[dict], vendor: str) -> List[dict]:
+def reconcile_table_specs(table_specs: List[dict]) -> List[dict]:
     """
-    Normalize + dedupe tables BEFORE mapping.
+    Ensure table specs are valid and dedupe repeats while preserving order.
 
-    Deduping is case-insensitive on (table, dataset_id), keeps first occurrence.
+    Each item must look like: {"table": <str>, "dataset_id": <str>}.
     """
-    if not isinstance(tables, list):
-        raise ValueError(f"tables must be a list, got {type(tables)}")
+    if not isinstance(table_specs, list):
+        raise ValueError("tables must be a list of {table,dataset_id} dicts")
 
     seen: set[tuple[str, str]] = set()
     out: List[dict] = []
 
-    for row in tables:
-        if not isinstance(row, dict):
-            continue
-
-        t = str(row.get("table", "")).strip()
-        ds = str(row.get("dataset_id", "")).strip()
-        if not t or not ds:
-            continue
-
-        key = (t.lower(), ds.lower())
+    for i, spec in enumerate(table_specs):
+        if not isinstance(spec, dict):
+            raise ValueError(f"tables[{i}] must be a dict")
+        table = spec.get("table")
+        dataset_id = spec.get("dataset_id")
+        if not table or not dataset_id:
+            raise ValueError(f"tables[{i}] missing table/dataset_id")
+        key = (str(table), str(dataset_id))
         if key in seen:
             continue
-
         seen.add(key)
-        out.append({"table": t, "dataset_id": ds})
+        out.append({"table": key[0], "dataset_id": key[1]})
 
     if not out:
-        raise ValueError(f"No valid tables after reconcile for vendor={vendor}")
+        raise ValueError("No valid table specs after reconciliation")
 
-    LOG.warning(
-        "reconcile_tables vendor=%s in=%d out=%d", vendor, len(tables), len(out)
-    )
     return out
 
 
@@ -219,7 +190,7 @@ def get_latest_s3_uri(s3_prefix: str, pattern: Optional[str] = None) -> str:
     """
     Return s3://bucket/key for the newest object under s3_prefix.
 
-    If pattern is provided, filter objects by fnmatch on the *filename* and return newest match.
+    If pattern is provided, filter objects by fnmatch on the filename and return newest match.
     Otherwise, return newest *path* (common prefix) created under s3_prefix.
     """
     u = urlparse(s3_prefix)
@@ -279,10 +250,12 @@ def get_sql(
 ) -> str:
     """
     Load a SQL template from: <CURRENT_DIR>/<type>/<type>_<table_name>.sql
-    Apply replacements:
+
+    Replacements:
       - {{ params.target_table }} => <DATABASE>.<SCHEMA>.<table>
       - {{ params.s3_uri }}       => key-only (no s3://bucket/) if provided
-    If enabled=False, return a safe no-op query.
+
+    If enabled=False, return a safe no-op.
     """
     if not enabled:
         return "SELECT 1;"
@@ -337,6 +310,13 @@ def build_env_vars(
 
 
 @task
+def build_data_extras(data_extras: Any, credentials: dict) -> Any:
+    if data_extras and credentials:
+        return _deep_replace_placeholders(data_extras, credentials)
+    return data_extras
+
+
+@task
 def build_event_json_for_table(
     vendor: str,
     table: str,
@@ -387,9 +367,6 @@ def build_glue_operator_kwargs(
     python_modules: Optional[str],
     index_url: str,
 ) -> dict:
-    """
-    Build a single GlueJobOperator kwargs dict for dynamic mapping via expand_kwargs().
-    """
     script_args = {
         "--env": env,
         "--run_mode": run_mode,
@@ -415,6 +392,42 @@ def build_glue_operator_kwargs(
         "script_args": script_args,
         "wait_for_completion": True,
     }
+
+
+@task
+def zip_specs_with_events(specs: List[dict], events: List[str]) -> List[dict]:
+    """Zip table specs + event_json into kwargs dicts for expand_kwargs()."""
+    if len(specs) != len(events):
+        raise ValueError("specs/events length mismatch")
+    out: List[dict] = []
+    for spec, ev in zip(specs, events):
+        out.append(
+            {
+                "table": spec["table"],
+                "dataset_id": spec["dataset_id"],
+                "event_json": ev,
+            }
+        )
+    return out
+
+
+@task
+def zip_tables_with_latest_json(
+    specs: List[dict], latest_json: List[str]
+) -> List[dict]:
+    """Zip table specs + latest_json into kwargs dicts for get_sql(copy) mapping."""
+    if len(specs) != len(latest_json):
+        raise ValueError("specs/latest_json length mismatch")
+    out: List[dict] = []
+    for spec, uri in zip(specs, latest_json):
+        out.append({"table_name": spec["table"], "s3_uri": uri})
+    return out
+
+
+@task
+def specs_to_table_names(specs: List[dict]) -> List[str]:
+    """Used for dedupe_sql (table-only) mapping without cartesian behavior elsewhere."""
+    return [s["table"] for s in specs]
 
 
 @dag(
@@ -446,9 +459,8 @@ def generic_ingester_dag():
     cfg = resolve_run_config()
     vendor = cfg["vendor"]
 
-    clean_tables = reconcile_tables(cfg["tables"], vendor)
+    table_specs = reconcile_table_specs(cfg["tables"])
 
-    # latest framework zip (single task)
     zip_prefix = f"s3://{bucket_name}/code/ETL/"
     latest_zip = get_latest_s3_uri.override(task_id="latest_framework_zip")(
         s3_prefix=zip_prefix,
@@ -459,7 +471,7 @@ def generic_ingester_dag():
         build_exchange_extras(env) if cfg["exchange_enabled"] else None
     )
     env_vars = build_env_vars(region, bucket_name, cfg["ingester_env_vars"])
-    data_extras = cfg["data_extras"]
+    data_extras = build_data_extras(cfg["data_extras"], cfg["credentials"])
 
     events = (
         build_event_json_for_table.override(task_id="build_event")
@@ -469,12 +481,14 @@ def generic_ingester_dag():
             exchange_extras=exchange_extras,
             data_extras=data_extras,
         )
-        .expand_kwargs(clean_tables)
+        .expand_kwargs(table_specs)
     )
 
     github_token = Variable.get(
         "C1SCOREDATASERVICES_GITHUB_PASSWORD", default_var=None
     )
+
+    glue_kwarg_dicts = zip_specs_with_events(table_specs, events)
 
     glue_kwargs = (
         build_glue_operator_kwargs.override(task_id="glue_op_kwargs")
@@ -494,16 +508,7 @@ def generic_ingester_dag():
             python_modules=cfg["python_modules"],
             index_url="https://artifactory.cloud.capitalone.com/artifactory/api/pypi/pypi-internalfacing/simple",
         )
-        .expand_kwargs(
-            [
-                {
-                    "table": t["table"],
-                    "dataset_id": t["dataset_id"],
-                    "event_json": events,
-                }
-                for t in clean_tables
-            ]
-        )
+        .expand_kwargs(glue_kwarg_dicts)
     )
 
     run_glue = GlueJobOperator.partial(task_id="run_glue_job").expand_kwargs(
@@ -513,7 +518,7 @@ def generic_ingester_dag():
     prefixes = (
         build_table_prefix.override(task_id="table_prefix")
         .partial(bucket_name=bucket_name, vendor=vendor, testing=cfg["testing"])
-        .expand_kwargs(clean_tables)
+        .expand_kwargs(table_specs)
     )
 
     latest_json = (
@@ -522,21 +527,21 @@ def generic_ingester_dag():
         .expand(s3_prefix=prefixes)
     )
 
+    copy_inputs = zip_tables_with_latest_json(table_specs, latest_json)
+
     copy_sql = (
         get_sql.override(task_id="copy_sql")
         .partial(sql_params=cfg["sql_params"], type="copy", enabled=True)
-        .expand_kwargs(
-            [
-                {"table_name": t["table"], "s3_uri": latest_json}
-                for t in clean_tables
-            ]
-        )
+        .expand_kwargs(copy_inputs)
     )
 
     load_table = SQLExecuteQueryOperator.partial(
         task_id="load_table",
         conn_id="snowflake_salesforce",
     ).expand(sql=copy_sql)
+
+    # dedupe step: table-only list is fine because it's mapped over 1 list
+    table_names = specs_to_table_names(table_specs)
 
     dedupe_sql = (
         get_sql.override(task_id="dedupe_sql")
@@ -546,7 +551,7 @@ def generic_ingester_dag():
             s3_uri=None,
             enabled=cfg["dedupe"],
         )
-        .expand_kwargs([{"table_name": t["table"]} for t in clean_tables])
+        .expand(table_name=table_names)
     )
 
     dedupe_table = SQLExecuteQueryOperator.partial(

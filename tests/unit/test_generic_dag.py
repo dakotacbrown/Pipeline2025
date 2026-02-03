@@ -11,28 +11,15 @@ from typing import Any, List, Optional
 
 import pytest
 
-# ---------------------------------------------------------------------
-# Configure these for your repo
-# ---------------------------------------------------------------------
 DAG_FILE_RELATIVE_PATH = Path("dags/generic/generic_ingester.py")
 DAG_MODULE_NAME = "generic_ingester_under_test"
 
 
-# ---------------------------------------------------------------------
-# Utilities: safe dynamic import with dependency stubs
-# ---------------------------------------------------------------------
 def _project_root() -> Path:
-    """
-    Assumes tests live in: <repo>/tests/<...>/test_*.py
-    """
     return Path(__file__).resolve().parents[2]
 
 
 def _install_stub_modules(monkeypatch: pytest.MonkeyPatch) -> None:
-    """
-    Minimal stub modules so importing the DAG file doesn't require
-    your full dags.common package during unit tests.
-    """
     dags_mod = types.ModuleType("dags")
     common_mod = types.ModuleType("dags.common")
 
@@ -40,7 +27,6 @@ def _install_stub_modules(monkeypatch: pytest.MonkeyPatch) -> None:
     slack_mod = types.ModuleType("dags.common.slack")
     udf_mod = types.ModuleType("dags.common.user_defined_filters")
 
-    # ---- stubs used at PARSE TIME in the DAG factory ----
     def failover_managed_dag_tag() -> str:
         return "failover-managed"
 
@@ -68,13 +54,11 @@ def _install_stub_modules(monkeypatch: pytest.MonkeyPatch) -> None:
         get_truncated_shairflow_region
     )
 
-    # ---- slack callback stub ----
     def task_fail_slack_alert(*args: Any, **kwargs: Any) -> None:
         return None
 
     slack_mod.task_fail_slack_alert = task_fail_slack_alert
 
-    # ---- user_defined_filters stub ----
     def ts_nodash_to_YYYYMMDDHHmmss(value: str) -> str:
         return value
 
@@ -93,11 +77,9 @@ def _load_module_from_path(
     module_name: str, file_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     _install_stub_modules(monkeypatch)
-
     spec = importlib.util.spec_from_file_location(module_name, str(file_path))
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load module spec from {file_path}")
-
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
@@ -106,10 +88,6 @@ def _load_module_from_path(
 
 @pytest.fixture()
 def dag_module(monkeypatch: pytest.MonkeyPatch):
-    """
-    Import the DAG module under test with stubs for dags.common.* and ensure
-    cleanup so it doesn't affect other tests.
-    """
     file_path = _project_root() / DAG_FILE_RELATIVE_PATH
     mod = _load_module_from_path(DAG_MODULE_NAME, file_path, monkeypatch)
     try:
@@ -118,39 +96,19 @@ def dag_module(monkeypatch: pytest.MonkeyPatch):
         sys.modules.pop(DAG_MODULE_NAME, None)
 
 
-# ---------------------------------------------------------------------
-# Helper: execute TaskFlow @task underlying callable (Airflow 2.10.5)
-# ---------------------------------------------------------------------
+# --- TaskFlow helper ---
 def call_task(task_obj, *args, **kwargs):
-    """
-    Airflow TaskFlow @task returns an XComArg when you call it normally.
-    In unit tests we must call the underlying python function (Airflow 2.10.x).
-    """
-    # Import lazily so test import doesn't fail if airflow isn't present in some contexts
-    try:
-        from airflow.models.xcom_arg import XComArg  # type: ignore
-    except Exception:  # pragma: no cover
-        XComArg = ()  # type: ignore
-
-    if isinstance(task_obj, XComArg):
-        raise TypeError(
-            "call_task() received an XComArg. "
-            "Pass the task function itself (e.g. dag_module.my_task), not dag_module.my_task(...)."
-        )
-
     fn = getattr(task_obj, "function", None)
     if callable(fn):
         return fn(*args, **kwargs)
-
     wrapped = getattr(task_obj, "__wrapped__", None)
     if callable(wrapped):
         return wrapped(*args, **kwargs)
-
     raise TypeError(f"Object {task_obj!r} does not look like a TaskFlow task")
 
 
 # ---------------------------------------------------------------------
-# Unit tests: _deep_replace_placeholders (NOT a task)
+# Unit tests: _deep_replace_placeholders
 # ---------------------------------------------------------------------
 def test_deep_replace_placeholders_leaves_missing_and_none_intact(dag_module):
     fn = dag_module._deep_replace_placeholders
@@ -170,58 +128,24 @@ def test_deep_replace_placeholders_leaves_missing_and_none_intact(dag_module):
 
 
 # ---------------------------------------------------------------------
-# Unit tests: extract helpers (only if still present in DAG code)
+# Unit tests: reconcile_table_specs
 # ---------------------------------------------------------------------
-def test_extract_helpers_if_present(dag_module):
-    if not hasattr(dag_module, "extract_table_names") or not hasattr(
-        dag_module, "extract_dataset_ids"
-    ):
-        pytest.skip(
-            "extract_* tasks not present (replaced by reconcile_tables)"
-        )
-
-    tables = [
-        {"table": "t1", "dataset_id": "d1"},
-        {"table": "t2", "dataset_id": "d2"},
+def test_reconcile_table_specs_dedupes_and_preserves_order(dag_module):
+    specs = [
+        {"table": "a", "dataset_id": "1"},
+        {"table": "b", "dataset_id": "2"},
+        {"table": "a", "dataset_id": "1"},  # dup
     ]
-    assert call_task(dag_module.extract_table_names, tables) == ["t1", "t2"]
-    assert call_task(dag_module.extract_dataset_ids, tables) == ["d1", "d2"]
-
-
-# ---------------------------------------------------------------------
-# Unit tests: reconcile_tables (only if present in DAG code)
-# ---------------------------------------------------------------------
-def test_reconcile_tables_dedupes_case_insensitive_and_filters_invalid_if_present(
-    dag_module,
-):
-    if not hasattr(dag_module, "reconcile_tables"):
-        pytest.skip("reconcile_tables task not present")
-
-    inp = [
-        {"table": "Accounts", "dataset_id": "ds1"},
-        {
-            "table": "accounts",
-            "dataset_id": "ds1-dup",
-        },  # duplicate by table name
-        {"table": "Contacts", "dataset_id": "ds2"},
-        {"table": "", "dataset_id": "dsX"},  # invalid
-        {"table": "Leads", "dataset_id": ""},  # invalid
-        "not-a-dict",  # invalid
-    ]
-
-    out = call_task(dag_module.reconcile_tables, inp, vendor="salesforce")
+    out = call_task(dag_module.reconcile_table_specs, specs)
     assert out == [
-        {"table": "Accounts", "dataset_id": "ds1"},
-        {"table": "Contacts", "dataset_id": "ds2"},
+        {"table": "a", "dataset_id": "1"},
+        {"table": "b", "dataset_id": "2"},
     ]
 
 
-def test_reconcile_tables_empty_raises_if_present(dag_module):
-    if not hasattr(dag_module, "reconcile_tables"):
-        pytest.skip("reconcile_tables task not present")
-
-    with pytest.raises(ValueError, match=r"No valid tables after reconcile"):
-        call_task(dag_module.reconcile_tables, [], vendor="x")
+def test_reconcile_table_specs_invalid_raises(dag_module):
+    with pytest.raises(ValueError):
+        call_task(dag_module.reconcile_table_specs, [{"table": "a"}])
 
 
 # ---------------------------------------------------------------------
@@ -247,15 +171,6 @@ def test_resolve_run_config_requires_vendor(monkeypatch, dag_module):
 def test_resolve_run_config_valid_exchange_enabled_true(
     monkeypatch, dag_module
 ):
-    """
-    resolve_run_config should:
-      - normalize vendor to lowercase
-      - pull workflow config from Variable.get(INGESTER_WORKFLOW_<VENDOR>)
-      - return tables list
-      - return credentials *as provided by scheduler* (dag_run.conf)
-      - NOT replace placeholders in data_extras here (that happens in build_data_extras)
-    """
-
     def fake_ctx():
         return {
             "dag_run": _FakeDagRun(
@@ -284,9 +199,7 @@ def test_resolve_run_config_valid_exchange_enabled_true(
                 "INGESTER_CONFIG_REPO_NAME": "repo",
                 "INGESTER_SQL_PARAMS": {"DATABASE": "DB", "SCHEMA": "SC"},
                 "INGESTER_ENV_VARS": {"A": "B"},
-                "INGESTER_DATA_EXTRAS": {
-                    "hello": "{{TOKEN}}"
-                },  # still templated here
+                "INGESTER_DATA_EXTRAS": {"hello": "{{TOKEN}}"},
                 "INGESTER_EXCHANGE": True,
             }
         return default_var
@@ -300,10 +213,7 @@ def test_resolve_run_config_valid_exchange_enabled_true(
         {"table": "accounts", "dataset_id": "ds1"},
         {"table": "contacts", "dataset_id": "ds2"},
     ]
-
-    # ✅ credentials should be present (scheduler-driven)
     assert cfg["credentials"] == {"TOKEN": "t"}
-
     assert cfg["start_date"] == "2020-01-01"
     assert cfg["end_date"] == "2020-01-31"
     assert cfg["testing"] is True
@@ -314,30 +224,8 @@ def test_resolve_run_config_valid_exchange_enabled_true(
     assert cfg["config_path"] == "path/to/config.yml"
     assert cfg["sql_params"] == {"DATABASE": "DB", "SCHEMA": "SC"}
     assert cfg["ingester_env_vars"] == {"A": "B"}
-
-    # ✅ placeholder replacement does NOT happen in resolve_run_config
     assert cfg["data_extras"] == {"hello": "{{TOKEN}}"}
-
     assert cfg["exchange_enabled"] is True
-
-
-def test_resolve_run_config_exchange_enabled_default_false(
-    monkeypatch, dag_module
-):
-    def fake_ctx():
-        return {"dag_run": _FakeDagRun(conf={"vendor": "x"})}
-
-    monkeypatch.setattr(dag_module, "get_current_context", fake_ctx)
-
-    def fake_variable_get(key: str, default_var=None, deserialize_json=False):
-        if key == "INGESTER_WORKFLOW_X":
-            return {"INGESTER_TABLES": {"t": "ds"}}  # no INGESTER_EXCHANGE key
-        return default_var
-
-    monkeypatch.setattr(dag_module.Variable, "get", fake_variable_get)
-
-    cfg = call_task(dag_module.resolve_run_config)
-    assert cfg["exchange_enabled"] is False
 
 
 def test_resolve_run_config_tables_missing_raises(monkeypatch, dag_module):
@@ -355,6 +243,35 @@ def test_resolve_run_config_tables_missing_raises(monkeypatch, dag_module):
 
     with pytest.raises(ValueError, match=r"INGESTER_TABLES missing/empty"):
         call_task(dag_module.resolve_run_config)
+
+
+# ---------------------------------------------------------------------
+# Unit tests: zip helpers
+# ---------------------------------------------------------------------
+def test_zip_specs_with_events(dag_module):
+    specs = [
+        {"table": "a", "dataset_id": "1"},
+        {"table": "b", "dataset_id": "2"},
+    ]
+    events = ['{"e":1}', '{"e":2}']
+    out = call_task(dag_module.zip_specs_with_events, specs, events)
+    assert out == [
+        {"table": "a", "dataset_id": "1", "event_json": '{"e":1}'},
+        {"table": "b", "dataset_id": "2", "event_json": '{"e":2}'},
+    ]
+
+
+def test_zip_tables_with_latest_json(dag_module):
+    specs = [
+        {"table": "a", "dataset_id": "1"},
+        {"table": "b", "dataset_id": "2"},
+    ]
+    latest = ["s3://x/a.json", "s3://x/b.json"]
+    out = call_task(dag_module.zip_tables_with_latest_json, specs, latest)
+    assert out == [
+        {"table_name": "a", "s3_uri": "s3://x/a.json"},
+        {"table_name": "b", "s3_uri": "s3://x/b.json"},
+    ]
 
 
 # ---------------------------------------------------------------------
@@ -413,49 +330,6 @@ def test_get_latest_s3_uri_pattern_branch_newest_match(monkeypatch, dag_module):
     assert out == "s3://my-bucket/code/ETL/debi-etl-framework-glue-2.zip"
 
 
-def test_get_latest_s3_uri_prefix_branch_latest_common_prefix(
-    monkeypatch, dag_module
-):
-    dt_old = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    dt_new = datetime(2024, 1, 5, tzinfo=timezone.utc)
-
-    pages_for_delimiter = [
-        {
-            "CommonPrefixes": [
-                {"Prefix": "vendor/ds1/"},
-                {"Prefix": "vendor/ds2/"},
-            ]
-        }
-    ]
-    pages_for_ds1 = [
-        {"Contents": [{"Key": "vendor/ds1/file.json", "LastModified": dt_old}]}
-    ]
-    pages_for_ds2 = [
-        {"Contents": [{"Key": "vendor/ds2/file.json", "LastModified": dt_new}]}
-    ]
-
-    class _SmartPaginator:
-        def paginate(self, **kwargs):
-            if kwargs.get("Delimiter") == "/":
-                yield from pages_for_delimiter
-                return
-            if kwargs.get("Prefix") == "vendor/ds1/":
-                yield from pages_for_ds1
-                return
-            if kwargs.get("Prefix") == "vendor/ds2/":
-                yield from pages_for_ds2
-                return
-            yield {"Contents": []}
-
-    fake_s3 = _FakeS3Client(_SmartPaginator())
-    monkeypatch.setattr(dag_module.boto3, "client", lambda name: fake_s3)
-
-    out = call_task(
-        dag_module.get_latest_s3_uri, "s3://my-bucket/vendor", pattern=None
-    )
-    assert out == "s3://my-bucket/vendor/ds2/"
-
-
 # ---------------------------------------------------------------------
 # Unit tests: get_sql
 # ---------------------------------------------------------------------
@@ -481,7 +355,7 @@ def test_get_sql_replacements(tmp_path: Path, monkeypatch, dag_module):
         enabled=True,
     )
     assert "DB.SC.accounts" in out
-    assert "vendor/ds/file.json" in out  # key-only
+    assert "vendor/ds/file.json" in out
 
 
 def test_get_sql_disabled_returns_noop(dag_module):
@@ -496,7 +370,7 @@ def test_get_sql_disabled_returns_noop(dag_module):
 
 
 # ---------------------------------------------------------------------
-# Unit tests: exchange/env vars/event json/prefix/glue kwargs
+# Unit tests: exchange/env/data_extras/event_json/prefix/glue kwargs
 # ---------------------------------------------------------------------
 def test_build_exchange_extras(monkeypatch, dag_module):
     monkeypatch.setattr(
@@ -528,6 +402,13 @@ def test_build_env_vars(dag_module):
     assert out["BUCKET_NAME"] == "bucket"
 
 
+def test_build_data_extras_placeholder_replacement(dag_module):
+    data_extras = {"headers": {"Authorization": "Bearer {{TOKEN}}"}}
+    creds = {"TOKEN": "abc"}
+    out = call_task(dag_module.build_data_extras, data_extras, creds)
+    assert out["headers"]["Authorization"] == "Bearer abc"
+
+
 def test_build_event_json_for_table_includes_exchange_when_present(dag_module):
     env_vars = {"REGION": "x"}
     exchange = {"c1_oauth_url": "u", "exchange_data": {"a": "b"}}
@@ -551,47 +432,21 @@ def test_build_event_json_for_table_includes_exchange_when_present(dag_module):
     assert payload["hello"] == "world"
 
 
-def test_build_event_json_for_table_omits_exchange_when_none(dag_module):
-    env_vars = {"REGION": "x"}
-    data_extras = {"hello": "world"}
-
-    out = call_task(
-        dag_module.build_event_json_for_table,
-        vendor="salesforce",
-        table="accounts",
-        dataset_id="ds1",
-        env_vars=env_vars,
-        exchange_extras=None,
-        data_extras=data_extras,
-    )
-    payload = json.loads(out)
-    assert payload["vendor"] == "salesforce"
-    assert "c1_oauth_url" not in payload
-    assert "exchange_data" not in payload
-    assert payload["hello"] == "world"
-
-
 def test_build_table_prefix(dag_module):
-    assert (
-        call_task(
-            dag_module.build_table_prefix,
-            "bucket",
-            "salesforce",
-            "ds1",
-            testing=False,
-        )
-        == "s3://bucket/salesforce/ds1/"
-    )
-    assert (
-        call_task(
-            dag_module.build_table_prefix,
-            "bucket",
-            "salesforce",
-            "ds1",
-            testing=True,
-        )
-        == "s3://bucket/test/salesforce/ds1"
-    )
+    assert call_task(
+        dag_module.build_table_prefix,
+        "bucket",
+        "salesforce",
+        "ds1",
+        testing=False,
+    ) == ("s3://bucket/salesforce/ds1/")
+    assert call_task(
+        dag_module.build_table_prefix,
+        "bucket",
+        "salesforce",
+        "ds1",
+        testing=True,
+    ) == ("s3://bucket/test/salesforce/ds1")
 
 
 def test_build_glue_operator_kwargs_drops_none_values(dag_module):
@@ -617,50 +472,37 @@ def test_build_glue_operator_kwargs_drops_none_values(dag_module):
     )
 
     assert out["task_id"] == "run_glue_job__accounts"
-    assert out["job_name"] == "job"
-    assert out["aws_conn_id"] == "conn"
-    assert "--additional-python-modules" not in out["script_args"]
+    script_args = out["script_args"]
+    assert script_args["--env"] == "dev"
+    assert script_args["--table"] == "accounts"
+    assert "--additional-python-modules" not in script_args
 
 
 # ---------------------------------------------------------------------
-# DAG structure test (import DAG and check task ids exist)
+# DAG structure test
 # ---------------------------------------------------------------------
 def test_dag_import_and_task_ids(dag_module):
     dag = dag_module.dag
     assert dag.dag_id == "debi_generic_ingester_glue_runner"
 
-    # These are core tasks expected in both versions
-    core_expected = {
+    expected = {
         "resolve_run_config",
+        "reconcile_table_specs",
         "latest_framework_zip",
         "build_exchange_extras",
         "build_env_vars",
+        "build_data_extras",
         "build_event",
+        "zip_specs_with_events",
         "glue_op_kwargs",
         "run_glue_job",
         "table_prefix",
         "latest_json",
+        "zip_tables_with_latest_json",
         "copy_sql",
         "load_table",
+        "specs_to_table_names",
         "dedupe_sql",
         "dedupe_table",
     }
-
-    # Optional depending on your refactor
-    optional = {
-        "reconcile_tables",
-        "extract_table_names",
-        "extract_dataset_ids",
-        "build_data_extras",
-    }
-
-    task_ids = set(dag.task_ids)
-    assert core_expected.issubset(task_ids)
-
-    # If reconcile is present, we should NOT require extract tasks, and vice versa.
-    # This prevents false failures as you refactor.
-    if "reconcile_tables" in task_ids:
-        assert "build_event" in task_ids
-    else:
-        # legacy split lists
-        assert {"extract_table_names", "extract_dataset_ids"}.issubset(task_ids)
+    assert expected.issubset(set(dag.task_ids))

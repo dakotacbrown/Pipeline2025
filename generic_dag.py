@@ -251,7 +251,7 @@ def get_sql(
 
 @task
 def build_exchange_extras(env: str) -> dict:
-    cl_oauth_url = get_cls_oauth_endpoint(env)
+    c1_oauth_url = get_cls_oauth_endpoint(env)
 
     exchange_id = Variable.get(
         "C1SCOREDATASERVICES_EXCHANGE_ID", default_var=None
@@ -261,7 +261,7 @@ def build_exchange_extras(env: str) -> dict:
     )
 
     return {
-        "cl_oauth_url": cl_oauth_url,
+        "c1_oauth_url": c1_oauth_url,
         "exchange_headers": {
             "Content-Type": "application/x-www-form-urlencoded"
         },

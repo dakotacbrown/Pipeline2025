@@ -14,7 +14,6 @@ import pytest
 # ---------------------------------------------------------------------
 # Configure these for your repo
 # ---------------------------------------------------------------------
-# Update this path to match the DAG file location in your repo.
 DAG_FILE_RELATIVE_PATH = Path("dags/generic/generic_ingester.py")
 DAG_MODULE_NAME = "generic_ingester_under_test"
 
@@ -167,6 +166,36 @@ def test_extract_helpers(dag_module):
 
 
 # ---------------------------------------------------------------------
+# Unit tests: reconcile_tables (new)
+# ---------------------------------------------------------------------
+def test_reconcile_tables_dedupes_case_insensitive_and_filters_invalid(
+    dag_module,
+):
+    inp = [
+        {"table": "Accounts", "dataset_id": "ds1"},
+        {
+            "table": "accounts",
+            "dataset_id": "ds1-dup",
+        },  # duplicate by table name
+        {"table": "Contacts", "dataset_id": "ds2"},
+        {"table": "", "dataset_id": "dsX"},  # invalid
+        {"table": "Leads", "dataset_id": ""},  # invalid
+        "not-a-dict",  # invalid
+    ]
+
+    out = call_task(dag_module.reconcile_tables, inp, vendor="salesforce")
+    assert out == [
+        {"table": "Accounts", "dataset_id": "ds1"},
+        {"table": "Contacts", "dataset_id": "ds2"},
+    ]
+
+
+def test_reconcile_tables_empty_raises(dag_module):
+    with pytest.raises(ValueError, match=r"No valid tables after reconcile"):
+        call_task(dag_module.reconcile_tables, [], vendor="x")
+
+
+# ---------------------------------------------------------------------
 # Unit tests: resolve_run_config (mock context + Variable.get)
 # ---------------------------------------------------------------------
 class _FakeDagRun:
@@ -186,7 +215,7 @@ def test_resolve_run_config_requires_vendor(monkeypatch, dag_module):
         call_task(dag_module.resolve_run_config)
 
 
-def test_resolve_run_config_valid_exchange_enabled_true(
+def test_resolve_run_config_valid_exchange_enabled_true_and_resolves_data_extras(
     monkeypatch, dag_module
 ):
     def fake_ctx():
@@ -217,8 +246,8 @@ def test_resolve_run_config_valid_exchange_enabled_true(
                 "INGESTER_CONFIG_REPO_NAME": "repo",
                 "INGESTER_SQL_PARAMS": {"DATABASE": "DB", "SCHEMA": "SC"},
                 "INGESTER_ENV_VARS": {"A": "B"},
-                "INGESTER_DATA_EXTRAS": {"hello": "{{TOKEN}}"},
-                "INGESTER_EXCHANGE": True,  # ✅ new behavior
+                "INGESTER_DATA_EXTRAS": {"hello": "{{TOKEN}}"},  # placeholder
+                "INGESTER_EXCHANGE": True,
             }
         return default_var
 
@@ -231,7 +260,9 @@ def test_resolve_run_config_valid_exchange_enabled_true(
         {"table": "accounts", "dataset_id": "ds1"},
         {"table": "contacts", "dataset_id": "ds2"},
     ]
-    assert cfg["credentials"] == {"TOKEN": "t"}
+
+    assert "credentials" not in cfg
+
     assert cfg["start_date"] == "2020-01-01"
     assert cfg["end_date"] == "2020-01-31"
     assert cfg["testing"] is True
@@ -242,7 +273,9 @@ def test_resolve_run_config_valid_exchange_enabled_true(
     assert cfg["config_path"] == "path/to/config.yml"
     assert cfg["sql_params"] == {"DATABASE": "DB", "SCHEMA": "SC"}
     assert cfg["ingester_env_vars"] == {"A": "B"}
-    assert cfg["data_extras"] == {"hello": "{{TOKEN}}"}
+
+    assert cfg["data_extras"] == {"hello": "t"}
+
     assert cfg["exchange_enabled"] is True
 
 
@@ -421,7 +454,7 @@ def test_get_sql_disabled_returns_noop(dag_module):
 
 
 # ---------------------------------------------------------------------
-# Unit tests: build_exchange_extras / build_env_vars / build_data_extras / event json / prefix / glue kwargs
+# Unit tests: exchange/env vars/event json/prefix/glue kwargs
 # ---------------------------------------------------------------------
 def test_build_exchange_extras(monkeypatch, dag_module):
     monkeypatch.setattr(
@@ -451,13 +484,6 @@ def test_build_env_vars(dag_module):
     assert out["X"] == "Y"
     assert out["REGION"] == "us-east-1"
     assert out["BUCKET_NAME"] == "bucket"
-
-
-def test_build_data_extras_placeholder_replacement(dag_module):
-    data_extras = {"headers": {"Authorization": "Bearer {{TOKEN}}"}}
-    creds = {"TOKEN": "abc"}
-    out = call_task(dag_module.build_data_extras, data_extras, creds)
-    assert out["headers"]["Authorization"] == "Bearer abc"
 
 
 def test_build_event_json_for_table_includes_exchange_when_present(dag_module):
@@ -493,7 +519,7 @@ def test_build_event_json_for_table_omits_exchange_when_none(dag_module):
         table="accounts",
         dataset_id="ds1",
         env_vars=env_vars,
-        exchange_extras=None,  # ✅ key behavior
+        exchange_extras=None,
         data_extras=data_extras,
     )
     payload = json.loads(out)
@@ -504,20 +530,26 @@ def test_build_event_json_for_table_omits_exchange_when_none(dag_module):
 
 
 def test_build_table_prefix(dag_module):
-    assert call_task(
-        dag_module.build_table_prefix,
-        "bucket",
-        "salesforce",
-        "ds1",
-        testing=False,
-    ) == ("s3://bucket/salesforce/ds1/")
-    assert call_task(
-        dag_module.build_table_prefix,
-        "bucket",
-        "salesforce",
-        "ds1",
-        testing=True,
-    ) == ("s3://bucket/test/salesforce/ds1")
+    assert (
+        call_task(
+            dag_module.build_table_prefix,
+            "bucket",
+            "salesforce",
+            "ds1",
+            testing=False,
+        )
+        == "s3://bucket/salesforce/ds1/"
+    )
+    assert (
+        call_task(
+            dag_module.build_table_prefix,
+            "bucket",
+            "salesforce",
+            "ds1",
+            testing=True,
+        )
+        == "s3://bucket/test/salesforce/ds1"
+    )
 
 
 def test_build_glue_operator_kwargs_drops_none_values(dag_module):
@@ -561,12 +593,12 @@ def test_dag_import_and_task_ids(dag_module):
 
     expected = {
         "resolve_run_config",
+        "reconcile_tables",
         "extract_table_names",
         "extract_dataset_ids",
         "latest_framework_zip",
         "build_exchange_extras",
         "build_env_vars",
-        "build_data_extras",
         "build_event",
         "glue_op_kwargs",
         "run_glue_job",

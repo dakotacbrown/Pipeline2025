@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import re
 from datetime import datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ from dags.common.dag_utilities import (
 from dags.common.slack import task_fail_slack_alert
 from dags.common.user_defined_filters import ts_nodash_to_YYYYMMDDHHmmss
 
+LOG = logging.getLogger(__name__)
 CURRENT_DIR = str(Path(__file__).resolve().parent)
 
 
@@ -68,6 +70,10 @@ def resolve_run_config() -> dict:
       }
 
     NOTE: start_date/end_date are passed through as-is because vendors may vary.
+
+    SECURITY NOTE:
+      - raw credentials are NOT returned in XCom (prevents leaking to logs/XCom UI)
+      - data_extras placeholders are resolved in-task using credentials
     """
     ctx = get_current_context()
     conf = ctx["dag_run"].conf or {}
@@ -96,6 +102,15 @@ def resolve_run_config() -> dict:
     tables: List[dict] = [
         {"table": t, "dataset_id": ds} for t, ds in tables_dict.items()
     ]
+
+    # Debug-only counts (no secrets). Helps explain mapped-task explosions.
+    unique_tables = {str(x.get("table", "")).lower() for x in tables}
+    LOG.warning(
+        "resolve_run_config vendor=%s tables_count=%d unique_tables=%d",
+        vendor,
+        len(tables),
+        len(unique_tables),
+    )
 
     credentials = conf.get("credentials", {}) or {}
     if not isinstance(credentials, dict):
@@ -131,14 +146,17 @@ def resolve_run_config() -> dict:
     if not isinstance(ingester_env_vars, dict):
         ingester_env_vars = {}
 
+    # Resolve data extras placeholders *here* so we don't push credentials into XCom.
     data_extras = workflow_dict.get("INGESTER_DATA_EXTRAS", None)
+    if data_extras and credentials:
+        data_extras = _deep_replace_placeholders(data_extras, credentials)
 
     exchange_enabled = bool(workflow_dict.get("INGESTER_EXCHANGE", False))
 
     return {
         "vendor": vendor,
         "tables": tables,
-        "credentials": credentials,
+        # "credentials": credentials,  # intentionally NOT returned (avoid secrets in XCom)
         "start_date": start_date,
         "end_date": end_date,
         "testing": testing,
@@ -154,6 +172,49 @@ def resolve_run_config() -> dict:
         "data_extras": data_extras,
         "exchange_enabled": exchange_enabled,
     }
+
+
+@task
+def reconcile_tables(tables: List[dict], vendor: str) -> List[dict]:
+    """
+    Normalize + dedupe tables BEFORE mapping.
+
+    This prevents mapped-task explosions if upstream somehow contains duplicates.
+
+    Deduping is case-insensitive on 'table' name, keeps first occurrence.
+    """
+    if not isinstance(tables, list):
+        raise ValueError(f"tables must be a list, got {type(tables)}")
+
+    seen: set[str] = set()
+    out: List[dict] = []
+
+    for row in tables:
+        if not isinstance(row, dict):
+            continue
+
+        t = str(row.get("table", "")).strip()
+        ds = str(row.get("dataset_id", "")).strip()
+        if not t or not ds:
+            continue
+
+        key = t.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"table": t, "dataset_id": ds})
+
+    if not out:
+        raise ValueError(f"No valid tables after reconcile for vendor={vendor}")
+
+    LOG.warning(
+        "reconcile_tables vendor=%s in=%d out=%d unique=%d",
+        vendor,
+        len(tables),
+        len(out),
+        len(seen),
+    )
+    return out
 
 
 @task
@@ -289,13 +350,6 @@ def build_env_vars(
 
 
 @task
-def build_data_extras(data_extras: Any, credentials: dict) -> Any:
-    if data_extras and credentials:
-        return _deep_replace_placeholders(data_extras, credentials)
-    return data_extras
-
-
-@task
 def build_event_json_for_table(
     vendor: str,
     table: str,
@@ -406,8 +460,10 @@ def generic_ingester_dag():
     cfg = resolve_run_config()
     vendor = cfg["vendor"]
 
-    table_names = extract_table_names(cfg["tables"])
-    dataset_ids = extract_dataset_ids(cfg["tables"])
+    clean_tables = reconcile_tables(cfg["tables"], vendor)
+
+    table_names = extract_table_names(clean_tables)
+    dataset_ids = extract_dataset_ids(clean_tables)
 
     # latest framework zip (single task)
     zip_prefix = f"s3://{bucket_name}/code/ETL/"
@@ -420,9 +476,10 @@ def generic_ingester_dag():
     exchange_extras = (
         build_exchange_extras(env) if cfg["exchange_enabled"] else None
     )
-
     env_vars = build_env_vars(region, bucket_name, cfg["ingester_env_vars"])
-    data_extras = build_data_extras(cfg["data_extras"], cfg["credentials"])
+
+    # data_extras already resolved in resolve_run_config (no credentials in XCom)
+    data_extras = cfg["data_extras"]
 
     # per-table: build event json (mapped)
     events = (

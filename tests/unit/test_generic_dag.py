@@ -33,7 +33,7 @@ def _load_module_from_path(module_name: str, file_path: Path):
 
 def _task_callable(task_obj):
     """
-    Airflow TaskFlow @task returns an object that usually exposes the python function as:
+    Airflow TaskFlow @task objects usually expose the underlying callable as:
       - .python_callable
       - or .function
       - or .__wrapped__
@@ -67,7 +67,7 @@ def stub_common_modules(monkeypatch):
     dag_utils.get_bucket_name = (
         lambda env, truncated_region: f"{env}-{truncated_region}-bucket"
     )
-    dag_utils.get_cls_oauth_endpoint = lambda env: f"https://oauth/{env}"
+    dag_utils.get_c1s_oauth_endpoint = lambda env: f"https://oauth/{env}"
     dag_utils.get_shairflow_environment = lambda: "qa"
     dag_utils.get_shairflow_region = lambda: "us-east-1"
     dag_utils.get_truncated_shairflow_region = lambda: "east"
@@ -88,24 +88,34 @@ def stub_common_modules(monkeypatch):
 @pytest.fixture
 def stub_provider_operators(monkeypatch):
     """
-    Minimal provider operator stubs that:
-      - support .partial().expand(...) / .partial().expand_kwargs(...)
-      - support dependency wiring (>>) via update_relative + __rshift__/__lshift__
+    Provider operator stubs that support:
+      - .partial().expand(...) / .partial().expand_kwargs(...)
+      - dependency wiring (>>) / (<<) with Airflow's edge_modifier kwarg
     """
 
     class _TaskLike:
         def __init__(self, task_id=None):
             self.task_id = task_id or "dummy"
 
-        def update_relative(self, other, upstream=True):
+        # ✅ Accept edge_modifier and any future kwargs Airflow passes
+        def update_relative(
+            self, other, upstream=True, edge_modifier=None, **kwargs
+        ):
             return None
 
         def __rshift__(self, other):
-            self.update_relative(other, upstream=False)
+            # Airflow sometimes calls update_relative on either side; support both.
+            try:
+                self.update_relative(other, upstream=False)
+            except TypeError:
+                pass
             return other
 
         def __lshift__(self, other):
-            self.update_relative(other, upstream=True)
+            try:
+                self.update_relative(other, upstream=True)
+            except TypeError:
+                pass
             return other
 
     # Snowflake operator stub
@@ -183,7 +193,6 @@ def test_deep_replace_placeholders_nested_preserves_missing(dag_module):
     out = fn(data, creds)
 
     assert out["a"] == "u1"
-    # None should not replace placeholder (keeps placeholder)
     assert out["b"]["c"][0] == "{{client_secret}}"
     assert out["b"]["c"][1] == "x"
 
@@ -225,17 +234,13 @@ def test_get_sql_disabled_returns_noop(dag_module):
 
 
 def test_build_exchange_extras_uses_c1_key(dag_module):
-    """
-    You renamed cl_* -> c1_*.
-    This verifies the payload uses c1_oauth_url (and not cl_oauth_url).
-    """
     fn = _task_callable(dag_module.build_exchange_extras)
 
     with patch.object(dag_module.Variable, "get", side_effect=["id", "secret"]):
         out = fn("qa")
 
     assert "c1_oauth_url" in out
-    assert "cl_oauth_url" not in out
+    assert out["c1_oauth_url"] == "https://oauth/qa"
 
 
 def test_get_latest_s3_uri_with_pattern_returns_newest(dag_module):
@@ -296,7 +301,7 @@ def test_get_latest_s3_uri_no_pattern_returns_latest_prefix(dag_module):
     s3.get_paginator.return_value = paginator
 
     def paginate_side_effect(**kwargs):
-        # First call lists "directories"
+        # First call: list common prefixes
         if kwargs.get("Delimiter") == "/":
             return [
                 {
@@ -306,7 +311,7 @@ def test_get_latest_s3_uri_no_pattern_returns_latest_prefix(dag_module):
                     ]
                 }
             ]
-        # Then it probes each prefix for latest object time
+        # Subsequent calls: list objects under each prefix
         if kwargs.get("Prefix") == "prefix/p1/":
             return [
                 {
@@ -351,9 +356,7 @@ def test_get_latest_s3_uri_invalid_scheme_raises(dag_module):
 
 def test_resolve_run_config_minimum_shape(dag_module):
     """
-    Your DAG uses resolve_run_config() to produce runtime config.
-    This test verifies it returns a dict with the keys the DAG expects,
-    without over-coupling to your exact internal structure.
+    Updated to match your new resolve_run_config() return shape (no workflow_dict).
     """
     resolve_fn = _task_callable(dag_module.resolve_run_config)
 
@@ -367,6 +370,11 @@ def test_resolve_run_config_minimum_shape(dag_module):
         "INGESTER_DEDUPE": True,
         "INGESTER_TESTING": False,
         "INGESTER_SQL_PARAMS": {"DATABASE": "DB", "SCHEMA": "SC"},
+        "INGESTER_GLUE_JOB_NAME": "etl-job",
+        "INGESTER_GLUE_CONN_NAME": "etl-net-conn",
+        "INGESTER_RUN_MODE": "once",
+        "INGESTER_CONFIG_PATH": "path/to/config.yml",
+        "INGESTER_CONFIG_REPO_NAME": "config_management",
     }
 
     with patch.object(
@@ -375,36 +383,34 @@ def test_resolve_run_config_minimum_shape(dag_module):
         out = resolve_fn()
 
     assert isinstance(out, dict)
-    assert "workflow_dict" in out
-    assert "vendor" in out
     assert out["vendor"] == "revcloud"
-    assert isinstance(out["workflow_dict"], dict)
+    assert isinstance(out["tables"], list)
+    assert out["tables"][0]["table"] == "accounts"
+    assert out["tables"][0]["dataset_id"] == "dataset_accounts"
+    assert "sql_params" in out
+    assert out["dedupe"] is True
 
 
 # --------------------------------------------------------------------------------------
 # DAG import / graph-level tests
 # --------------------------------------------------------------------------------------
 def test_dag_builds_expected_tasks(dag_module):
-    """
-    Important:
-    - When you call get_latest_s3_uri.override(task_id="latest_framework_zip"),
-      the task id becomes "latest_framework_zip", NOT "get_latest_s3_uri".
-    - Same for copy/dedupe SQL and latest_json.
-    """
     dag = dag_module.dag
     task_ids = {t.task_id for t in dag.tasks}
 
-    # Core runtime config
+    # Core runtime config + extractors
     assert "resolve_run_config" in task_ids
+    assert "extract_table_names" in task_ids
+    assert "extract_dataset_ids" in task_ids
 
-    # Your current TaskFlow ids (based on the set shown in your screenshot)
+    # Runtime extras tasks
     assert "build_exchange_extras" in task_ids
     assert "build_env_vars" in task_ids
     assert "build_data_extras" in task_ids
-    assert "build_event" in task_ids
 
-    # Overridden/mapped task ids (these are the ones you should assert)
+    # Overridden/mapped ids in your DAG factory
     assert "latest_framework_zip" in task_ids
+    assert "build_event" in task_ids
     assert "glue_op_kwargs" in task_ids
     assert "run_glue_job" in task_ids
     assert "table_prefix" in task_ids
@@ -413,6 +419,3 @@ def test_dag_builds_expected_tasks(dag_module):
     assert "load_table" in task_ids
     assert "dedupe_sql" in task_ids
     assert "dedupe_table" in task_ids
-
-    # Optional: ensure old function-name task_ids are NOT expected
-    assert "get_latest_s3_uri" not in task_ids

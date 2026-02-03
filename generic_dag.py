@@ -20,7 +20,7 @@ from airflow.providers.snowflake.operators.snowflake import (
 from dags.common.dag_utilities import (
     failover_managed_dag_tag,
     get_bucket_name,
-    get_cls_oauth_endpoint,
+    get_c1s_oauth_endpoint,
     get_shairflow_environment,
     get_shairflow_region,
     get_truncated_shairflow_region,
@@ -251,7 +251,7 @@ def get_sql(
 
 @task
 def build_exchange_extras(env: str) -> dict:
-    c1_oauth_url = get_cls_oauth_endpoint(env)
+    c1_oauth_url = get_c1s_oauth_endpoint(env)
 
     exchange_id = Variable.get(
         "C1SCOREDATASERVICES_EXCHANGE_ID", default_var=None

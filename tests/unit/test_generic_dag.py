@@ -26,113 +26,10 @@ def _load_module_from_path(module_name: str, file_path: Path):
     return module
 
 
-@pytest.fixture(autouse=True)
-def stub_common_modules():
-    """
-    Stub dags.common.* so importing the DAG doesn't require the real project modules.
-    This avoids breaking other tests.
-    """
-    # dags.common.dag_utilities
-    dag_utils = types.ModuleType("dags.common.dag_utilities")
-    dag_utils.failover_managed_dag_tag = lambda: "failover-managed"
-    dag_utils.get_bucket_name = (
-        lambda env, truncated_region: f"{env}-{truncated_region}-bucket"
-    )
-    dag_utils.get_cls_oauth_endpoint = lambda env: f"https://oauth/{env}"
-    dag_utils.get_shairflow_environment = lambda: "qa"
-    dag_utils.get_shairflow_region = lambda: "us-east-1"
-    dag_utils.get_truncated_shairflow_region = lambda: "east"
-
-    # dags.common.slack
-    slack = types.ModuleType("dags.common.slack")
-    slack.task_fail_slack_alert = lambda *args, **kwargs: None
-
-    # dags.common.user_defined_filters
-    udf = types.ModuleType("dags.common.user_defined_filters")
-    udf.ts_nodash_to_YYYYMMDDHHmmss = lambda s: s
-
-    # ensure package parents exist
-    sys.modules.setdefault("dags", types.ModuleType("dags"))
-    sys.modules.setdefault("dags.common", types.ModuleType("dags.common"))
-    sys.modules["dags.common.dag_utilities"] = dag_utils
-    sys.modules["dags.common.slack"] = slack
-    sys.modules["dags.common.user_defined_filters"] = udf
-
-    yield
-
-
-@pytest.fixture(autouse=True)
-def stub_provider_operators():
-    """
-    Stub provider operator classes to keep tests lightweight and independent.
-    """
-    # Snowflake operator stub module
-    snowflake_mod = types.ModuleType(
-        "airflow.providers.snowflake.operators.snowflake"
-    )
-
-    class _SQLExecuteQueryOperator:
-        template_fields = ("sql",)
-
-        def __init__(self, *args, **kwargs):
-            self.kwargs = kwargs
-
-        @classmethod
-        def partial(cls, **kwargs):
-            # return a minimal object with expand()
-            obj = types.SimpleNamespace(_partial_kwargs=kwargs)
-
-            def _expand(**expand_kwargs):
-                return types.SimpleNamespace(
-                    task_id=kwargs.get("task_id"), expand_kwargs=expand_kwargs
-                )
-
-            obj.expand = _expand
-            return obj
-
-    snowflake_mod.SQLExecuteQueryOperator = _SQLExecuteQueryOperator
-
-    # Glue operator stub module
-    glue_mod = types.ModuleType("airflow.providers.amazon.aws.operators.glue")
-
-    class _GlueJobOperator:
-        template_fields = ("job_name", "script_args")
-
-        def __init__(self, *args, **kwargs):
-            self.kwargs = kwargs
-
-        @classmethod
-        def partial(cls, **kwargs):
-            obj = types.SimpleNamespace(_partial_kwargs=kwargs)
-
-            def _expand_kwargs(x):
-                return types.SimpleNamespace(
-                    task_id=kwargs.get("task_id"), expand_kwargs=x
-                )
-
-            obj.expand_kwargs = _expand_kwargs
-            return obj
-
-    glue_mod.GlueJobOperator = _GlueJobOperator
-
-    sys.modules["airflow.providers.snowflake.operators.snowflake"] = (
-        snowflake_mod
-    )
-    sys.modules["airflow.providers.amazon.aws.operators.glue"] = glue_mod
-
-    yield
-
-
-@pytest.fixture
-def dag_module():
-    path = _project_root() / DAG_FILE_RELATIVE_PATH
-    return _load_module_from_path(DAG_MODULE_NAME, path)
-
-
 def _task_callable(task_obj):
     """
-    Airflow TaskFlow @task decorator exposes python callable as `.python_callable` on the decorator object.
-    In some versions it's available via `.function` or `.__wrapped__`.
+    Airflow TaskFlow @task decorator exposes python callable as `.python_callable` on the task object.
+    Depending on Airflow, it may also show up as `.function` or `.__wrapped__`.
     """
     if hasattr(task_obj, "python_callable"):
         return task_obj.python_callable
@@ -145,21 +42,136 @@ def _task_callable(task_obj):
     )
 
 
+@pytest.fixture
+def stub_common_modules(monkeypatch):
+    """
+    Stub ONLY the modules that generic_ingester imports.
+    This fixture is NOT autouse, so it won't affect other test files.
+    """
+    # Parent packages
+    sys.modules.setdefault("dags", types.ModuleType("dags"))
+    sys.modules.setdefault("dags.common", types.ModuleType("dags.common"))
+
+    # dags.common.dag_utilities (only what generic_ingester imports)
+    dag_utils = types.ModuleType("dags.common.dag_utilities")
+    dag_utils.failover_managed_dag_tag = lambda: "failover-managed-dag"
+    dag_utils.get_bucket_name = (
+        lambda env, truncated_region: f"{env}-{truncated_region}-bucket"
+    )
+    dag_utils.get_cls_oauth_endpoint = lambda env: f"https://oauth/{env}"
+    dag_utils.get_shairflow_environment = lambda: "qa"
+    dag_utils.get_shairflow_region = lambda: "us-east-1"
+    dag_utils.get_truncated_shairflow_region = lambda: "east"
+
+    slack = types.ModuleType("dags.common.slack")
+    slack.task_fail_slack_alert = lambda *args, **kwargs: None
+
+    udf = types.ModuleType("dags.common.user_defined_filters")
+    udf.ts_nodash_to_YYYYMMDDHHmmss = lambda s: s
+
+    monkeypatch.setitem(sys.modules, "dags.common.dag_utilities", dag_utils)
+    monkeypatch.setitem(sys.modules, "dags.common.slack", slack)
+    monkeypatch.setitem(sys.modules, "dags.common.user_defined_filters", udf)
+
+    yield
+
+
+@pytest.fixture
+def stub_provider_operators(monkeypatch):
+    """
+    Provide minimal operator classes that:
+      - allow .partial().expand(...) and .partial().expand_kwargs(...)
+      - support dependency wiring (>>) by implementing update_relative + __rshift__/__lshift__
+    This fixture is NOT autouse.
+    """
+
+    class _TaskLike:
+        def __init__(self, task_id=None):
+            self.task_id = task_id or "dummy"
+
+        def update_relative(self, other, upstream=True):
+            return None
+
+        def __rshift__(self, other):
+            self.update_relative(other, upstream=False)
+            return other
+
+        def __lshift__(self, other):
+            self.update_relative(other, upstream=True)
+            return other
+
+    # Snowflake operator stub
+    snowflake_mod = types.ModuleType(
+        "airflow.providers.snowflake.operators.snowflake"
+    )
+
+    class SQLExecuteQueryOperator(_TaskLike):
+        template_fields = ("sql",)
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(task_id=kwargs.get("task_id"))
+            self.kwargs = kwargs
+
+        @classmethod
+        def partial(cls, **kwargs):
+            base = _TaskLike(task_id=kwargs.get("task_id"))
+
+            def expand(**expand_kwargs):
+                return _TaskLike(task_id=kwargs.get("task_id"))
+
+            base.expand = expand
+            return base
+
+    snowflake_mod.SQLExecuteQueryOperator = SQLExecuteQueryOperator
+    monkeypatch.setitem(
+        sys.modules,
+        "airflow.providers.snowflake.operators.snowflake",
+        snowflake_mod,
+    )
+
+    # Glue operator stub
+    glue_mod = types.ModuleType("airflow.providers.amazon.aws.operators.glue")
+
+    class GlueJobOperator(_TaskLike):
+        template_fields = ("job_name", "script_args")
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(task_id=kwargs.get("task_id"))
+            self.kwargs = kwargs
+
+        @classmethod
+        def partial(cls, **kwargs):
+            base = _TaskLike(task_id=kwargs.get("task_id"))
+
+            def expand_kwargs(mapped_kwargs):
+                return _TaskLike(task_id=kwargs.get("task_id"))
+
+            base.expand_kwargs = expand_kwargs
+            return base
+
+    glue_mod.GlueJobOperator = GlueJobOperator
+    monkeypatch.setitem(
+        sys.modules, "airflow.providers.amazon.aws.operators.glue", glue_mod
+    )
+
+    yield
+
+
+@pytest.fixture
+def dag_module(stub_common_modules, stub_provider_operators):
+    path = _project_root() / DAG_FILE_RELATIVE_PATH
+    return _load_module_from_path(DAG_MODULE_NAME, path)
+
+
 def test_deep_replace_placeholders_nested_leaves_none_intact(dag_module):
     fn = dag_module._deep_replace_placeholders
 
-    data = {
-        "a": "{{username}}",
-        "b": {"c": ["{{client_secret}}", "x"]},
-    }
-    creds = {
-        "username": "u1",
-        "client_secret": None,  # should NOT become "None"
-    }
+    data = {"a": "{{username}}", "b": {"c": ["{{client_secret}}", "x"]}}
+    creds = {"username": "u1", "client_secret": None}
 
     out = fn(data, creds)
     assert out["a"] == "u1"
-    assert out["b"]["c"][0] == "{{client_secret}}"  # placeholder preserved
+    assert out["b"]["c"][0] == "{{client_secret}}"
     assert out["b"]["c"][1] == "x"
 
 
@@ -183,7 +195,7 @@ def test_get_sql_copy_replaces_and_strips_bucket(dag_module):
 
     assert "DB.SC.accounts" in out
     assert "@path/to/file.json" in out
-    assert "my-bucket" not in out  # bucket stripped
+    assert "my-bucket" not in out
 
 
 def test_get_sql_disabled_returns_noop(dag_module):
@@ -291,7 +303,6 @@ def test_get_latest_s3_uri_no_pattern_returns_latest_prefix(dag_module):
     paginator = MagicMock()
     s3.get_paginator.return_value = paginator
 
-    # first paginate call (Delimiter="/") returns two common prefixes
     def paginate_side_effect(**kwargs):
         if kwargs.get("Delimiter") == "/":
             return [
@@ -300,9 +311,8 @@ def test_get_latest_s3_uri_no_pattern_returns_latest_prefix(dag_module):
                         {"Prefix": "prefix/p1/"},
                         {"Prefix": "prefix/p2/"},
                     ]
-                },
+                }
             ]
-        # sub-page listings for each prefix
         if kwargs.get("Prefix") == "prefix/p1/":
             return [
                 {
@@ -349,7 +359,7 @@ def test_dag_builds_expected_base_tasks(dag_module):
     dag = dag_module.dag
     task_ids = {t.task_id for t in dag.tasks}
 
-    # core task ids (stable because we used .override(task_id=...))
+    # stable task ids (we used override(task_id=...))
     assert "resolve_run_config" in task_ids
     assert "latest_framework_zip" in task_ids
     assert "build_event" in task_ids

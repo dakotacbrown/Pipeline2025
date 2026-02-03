@@ -1,423 +1,363 @@
-# tests/unit/test_generic_ingester_dag.py
-import importlib
-import io
-import json
+import importlib.util
 import sys
+import types
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from pathlib import Path
+from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
-MODULE_PATH = "dags.generic.generic_ingester"
+DAG_FILE_RELATIVE_PATH = Path("dags/generic/generic_ingester.py")
+DAG_MODULE_NAME = "generic_ingester_under_test"
 
 
-def _dt(y, m, d, hh=0, mm=0, ss=0):
-    # Use tz-aware datetimes so max() comparisons are consistent.
-    return datetime(y, m, d, hh, mm, ss, tzinfo=timezone.utc)
+def _project_root() -> Path:
+    # Assumes tests live in: <repo>/tests/unit/test_generic_ingester_dag.py
+    return Path(__file__).resolve().parents[2]
 
 
-class _FakePaginator:
+def _load_module_from_path(module_name: str, file_path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, str(file_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load module spec from {file_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(autouse=True)
+def stub_common_modules():
     """
-    A paginator that returns a DIFFERENT set of pages per paginate() call.
-    This matches get_latest_s3_uri(), which calls paginate() multiple times:
-      - once for CommonPrefixes (top-level)
-      - then again per prefix to find latest object timestamps
+    Stub dags.common.* so importing the DAG doesn't require the real project modules.
+    This avoids breaking other tests.
     """
+    # dags.common.dag_utilities
+    dag_utils = types.ModuleType("dags.common.dag_utilities")
+    dag_utils.failover_managed_dag_tag = lambda: "failover-managed"
+    dag_utils.get_bucket_name = (
+        lambda env, truncated_region: f"{env}-{truncated_region}-bucket"
+    )
+    dag_utils.get_cls_oauth_endpoint = lambda env: f"https://oauth/{env}"
+    dag_utils.get_shairflow_environment = lambda: "qa"
+    dag_utils.get_shairflow_region = lambda: "us-east-1"
+    dag_utils.get_truncated_shairflow_region = lambda: "east"
 
-    def __init__(self, pages_by_call):
-        # pages_by_call: list of "call pages"
-        # each "call pages" can be:
-        #   - a dict (single page)
-        #   - a list[dict] (multiple pages)
-        self._pages_by_call = pages_by_call
-        self._call_idx = 0
+    # dags.common.slack
+    slack = types.ModuleType("dags.common.slack")
+    slack.task_fail_slack_alert = lambda *args, **kwargs: None
 
-    def paginate(self, **kwargs):
-        if self._call_idx >= len(self._pages_by_call):
-            return iter([])
+    # dags.common.user_defined_filters
+    udf = types.ModuleType("dags.common.user_defined_filters")
+    udf.ts_nodash_to_YYYYMMDDHHmmss = lambda s: s
 
-        pages = self._pages_by_call[self._call_idx]
-        self._call_idx += 1
+    # ensure package parents exist
+    sys.modules.setdefault("dags", types.ModuleType("dags"))
+    sys.modules.setdefault("dags.common", types.ModuleType("dags.common"))
+    sys.modules["dags.common.dag_utilities"] = dag_utils
+    sys.modules["dags.common.slack"] = slack
+    sys.modules["dags.common.user_defined_filters"] = udf
 
-        if pages is None:
-            return iter([])
-
-        if isinstance(pages, dict):
-            return iter([pages])
-
-        return iter(pages)
-
-
-class _FakeS3Client:
-    def __init__(self, paginator):
-        self._paginator = paginator
-
-    def get_paginator(self, name):
-        assert name == "list_objects_v2"
-        return self._paginator
+    yield
 
 
-def _get_task_callable(obj):
+@pytest.fixture(autouse=True)
+def stub_provider_operators():
     """
-    Airflow 2.10.5:
-      - @task decorated funcs are TaskDecorator -> has .function
-      - operator instances -> has .python_callable
+    Stub provider operator classes to keep tests lightweight and independent.
     """
-    if hasattr(obj, "python_callable"):
-        return obj.python_callable
-    if hasattr(obj, "function"):
-        return obj.function
-    if hasattr(obj, "__wrapped__"):
-        return obj.__wrapped__
-    raise TypeError(f"Don't know how to get callable from: {type(obj)}")
+    # Snowflake operator stub module
+    snowflake_mod = types.ModuleType(
+        "airflow.providers.snowflake.operators.snowflake"
+    )
+
+    class _SQLExecuteQueryOperator:
+        template_fields = ("sql",)
+
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        @classmethod
+        def partial(cls, **kwargs):
+            # return a minimal object with expand()
+            obj = types.SimpleNamespace(_partial_kwargs=kwargs)
+
+            def _expand(**expand_kwargs):
+                return types.SimpleNamespace(
+                    task_id=kwargs.get("task_id"), expand_kwargs=expand_kwargs
+                )
+
+            obj.expand = _expand
+            return obj
+
+    snowflake_mod.SQLExecuteQueryOperator = _SQLExecuteQueryOperator
+
+    # Glue operator stub module
+    glue_mod = types.ModuleType("airflow.providers.amazon.aws.operators.glue")
+
+    class _GlueJobOperator:
+        template_fields = ("job_name", "script_args")
+
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+        @classmethod
+        def partial(cls, **kwargs):
+            obj = types.SimpleNamespace(_partial_kwargs=kwargs)
+
+            def _expand_kwargs(x):
+                return types.SimpleNamespace(
+                    task_id=kwargs.get("task_id"), expand_kwargs=x
+                )
+
+            obj.expand_kwargs = _expand_kwargs
+            return obj
+
+    glue_mod.GlueJobOperator = _GlueJobOperator
+
+    sys.modules["airflow.providers.snowflake.operators.snowflake"] = (
+        snowflake_mod
+    )
+    sys.modules["airflow.providers.amazon.aws.operators.glue"] = glue_mod
+
+    yield
 
 
-def _import_module_fresh(
-    monkeypatch,
-    *,
-    workflow_var: dict,
-    sql_templates: Optional[Dict[str, str]] = None,
-    dag_run_conf: Optional[dict] = None,
-    s3_pages_by_call=None,
-):
+@pytest.fixture
+def dag_module():
+    path = _project_root() / DAG_FILE_RELATIVE_PATH
+    return _load_module_from_path(DAG_MODULE_NAME, path)
+
+
+def _task_callable(task_obj):
     """
-    Patch all external deps BEFORE importing the DAG module so module-level DAG creation works.
+    Airflow TaskFlow @task decorator exposes python callable as `.python_callable` on the decorator object.
+    In some versions it's available via `.function` or `.__wrapped__`.
     """
-    if MODULE_PATH in sys.modules:
-        del sys.modules[MODULE_PATH]
-
-    if sql_templates is None:
-        sql_templates = {
-            "copy": "COPY INTO {{ params.target_table }} FROM '{{ params.s3_uri }}';",
-            "deduplication": "DELETE FROM {{ params.target_table }} WHERE 1=0;",
-        }
-
-    # -------------------------
-    # Patch Airflow Variable.get
-    # -------------------------
-    def _fake_variable_get(key, default_var=None, deserialize_json=False):
-        if key.startswith("INGESTER_WORKFLOW_"):
-            return (
-                workflow_var if deserialize_json else json.dumps(workflow_var)
-            )
-
-        # values used by build_exchange_extras / github token
-        if key == "C1SCOREDATASERVICES_GITHUB_PASSWORD":
-            return "ghp_xxx"
-        if key == "C1SCOREDATASERVICES_EXCHANGE_ID":
-            return "ex_id"
-        if key == "C1SCOREDATASERVICES_EXCHANGE_SECRET":
-            return "ex_secret"
-
-        return default_var
-
-    monkeypatch.setattr(
-        "airflow.models.Variable.get", _fake_variable_get, raising=False
+    if hasattr(task_obj, "python_callable"):
+        return task_obj.python_callable
+    if hasattr(task_obj, "function"):
+        return task_obj.function
+    if hasattr(task_obj, "__wrapped__"):
+        return task_obj.__wrapped__
+    raise AttributeError(
+        "Could not locate underlying callable for TaskFlow task"
     )
 
-    # -------------------------
-    # Patch get_current_context
-    # -------------------------
-    if dag_run_conf is None:
-        dag_run_conf = {
-            "vendor": "generic",
-            "start_date": "2020-01-01",
-            "end_date": "2020-01-31",
-            "credentials": {"bar": "baz"},
-        }
 
-    def _fake_get_current_context():
-        dr = type("DR", (), {"conf": dag_run_conf})()
-        return {"dag_run": dr}
+def test_deep_replace_placeholders_nested_leaves_none_intact(dag_module):
+    fn = dag_module._deep_replace_placeholders
 
-    monkeypatch.setattr(
-        "airflow.operators.python.get_current_context",
-        _fake_get_current_context,
-        raising=False,
-    )
-
-    # -------------------------
-    # Patch dag_utilities getters
-    # -------------------------
-    monkeypatch.setattr(
-        "dags.common.dag_utilities.get_shairflow_environment",
-        lambda: "dev",
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "dags.common.dag_utilities.get_shairflow_region",
-        lambda: "us-east-1",
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "dags.common.dag_utilities.get_truncated_shairflow_region",
-        lambda: "use1",
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "dags.common.dag_utilities.get_bucket_name",
-        lambda env, trunc: "my-bucket",
-        raising=False,
-    )
-    monkeypatch.setattr(
-        "dags.common.dag_utilities.failover_managed_dag_tag",
-        lambda: "failover-managed",
-        raising=False,
-    )
-
-    # Your DAG imports get_cls_oauth_endpoint(env)
-    monkeypatch.setattr(
-        "dags.common.dag_utilities.get_cls_oauth_endpoint",
-        lambda env: "https://oauth.cls.example/token",
-        raising=False,
-    )
-
-    # -------------------------
-    # Patch open() for SQL templates
-    # -------------------------
-    def _fake_open(file, mode="r", *args, **kwargs):
-        # file looks like ".../<type>/<type>_<table>.sql"
-        path = str(file)
-        if "/copy/" in path:
-            return io.StringIO(sql_templates["copy"])
-        if "/deduplication/" in path:
-            return io.StringIO(sql_templates["deduplication"])
-        # fallback: allow empty
-        return io.StringIO("")
-
-    monkeypatch.setattr("builtins.open", _fake_open, raising=False)
-
-    # -------------------------
-    # Patch boto3 S3 client/paginator
-    # -------------------------
-    if s3_pages_by_call is None:
-        s3_pages_by_call = [[{"Contents": [], "CommonPrefixes": []}]]
-
-    paginator = _FakePaginator(s3_pages_by_call)
-    fake_s3 = _FakeS3Client(paginator)
-    monkeypatch.setattr("boto3.client", lambda service: fake_s3, raising=False)
-
-    return importlib.import_module(MODULE_PATH)
-
-
-# -------------------------
-# Pure helper unit tests
-# -------------------------
-def test_deep_replace_placeholders_nested(monkeypatch):
-    workflow_var = {"INGESTER_TABLES": {"t": "ds"}}
-    mod = _import_module_fresh(monkeypatch, workflow_var=workflow_var)
-
-    obj = {
-        "a": "{{foo}}",
-        "b": ["x", "{{bar}}", {"c": "{{baz}}"}],
-        "d": 123,
+    data = {
+        "a": "{{username}}",
+        "b": {"c": ["{{client_secret}}", "x"]},
     }
-    creds = {"foo": "FOO", "bar": "BAR"}  # baz missing stays "{{baz}}"
-    out = mod._deep_replace_placeholders(obj, creds)
+    creds = {
+        "username": "u1",
+        "client_secret": None,  # should NOT become "None"
+    }
 
-    assert out["a"] == "FOO"
-    assert out["b"][1] == "BAR"
-    assert out["b"][2]["c"] == "{{baz}}"
-
-    # Depending on your implementation, this is either preserved (preferred)
-    # or becomes None (older behavior). Keep this assertion flexible.
-    assert out["d"] in (123, None)
+    out = fn(data, creds)
+    assert out["a"] == "u1"
+    assert out["b"]["c"][0] == "{{client_secret}}"  # placeholder preserved
+    assert out["b"]["c"][1] == "x"
 
 
-# -------------------------
-# Task function unit tests
-# -------------------------
-def test_get_sql_copy_replaces_and_strips_bucket(monkeypatch):
-    workflow_var = {"INGESTER_TABLES": {"t": "ds"}}
-    copy_tpl = "COPY INTO {{ params.target_table }} FROM '{{ params.s3_uri }}';"
+def test_get_sql_copy_replaces_and_strips_bucket(dag_module):
+    get_sql_fn = _task_callable(dag_module.get_sql)
 
-    mod = _import_module_fresh(
-        monkeypatch,
-        workflow_var=workflow_var,
-        sql_templates={"copy": copy_tpl, "deduplication": "SELECT 1;"},
+    sql_params = {"DATABASE": "DB", "SCHEMA": "SC"}
+    template = (
+        "COPY INTO {{ params.target_table }} FROM '@{{ params.s3_uri }}';"
     )
+    m = mock_open(read_data=template)
 
-    fn = _get_task_callable(mod.get_sql)
+    with patch("builtins.open", m):
+        out = get_sql_fn(
+            table_name="accounts",
+            sql_params=sql_params,
+            type="copy",
+            s3_uri="s3://my-bucket/path/to/file.json",
+            enabled=True,
+        )
 
-    sql = fn(
-        table_name="my_table",
-        sql_params={"DATABASE": "DB", "SCHEMA": "SCH"},
-        type="copy",
-        s3_uri="s3://my-bucket/vendor/ds/file.jsonl",
-        enabled=True,
-    )
-
-    assert "COPY INTO DB.SCH.my_table" in sql
-    assert "vendor/ds/file.jsonl" in sql  # bucket stripped
-    assert "{{ params.target_table }}" not in sql
-    assert "{{ params.s3_uri }}" not in sql
+    assert "DB.SC.accounts" in out
+    assert "@path/to/file.json" in out
+    assert "my-bucket" not in out  # bucket stripped
 
 
-def test_get_sql_disabled_returns_noop(monkeypatch):
-    workflow_var = {"INGESTER_TABLES": {"t": "ds"}}
-    mod = _import_module_fresh(monkeypatch, workflow_var=workflow_var)
-    fn = _get_task_callable(mod.get_sql)
-
-    sql = fn(
-        table_name="my_table",
-        sql_params={"DATABASE": "DB", "SCHEMA": "SCH"},
+def test_get_sql_disabled_returns_noop(dag_module):
+    get_sql_fn = _task_callable(dag_module.get_sql)
+    out = get_sql_fn(
+        table_name="accounts",
+        sql_params={"DATABASE": "DB", "SCHEMA": "SC"},
         type="deduplication",
         s3_uri=None,
         enabled=False,
     )
-    assert sql.strip().lower().startswith("select 1")
+    assert out.strip().upper() == "SELECT 1;"
 
 
-def test_resolve_run_config_reads_workflow_tables_and_dedupe(monkeypatch):
-    workflow_var = {
-        "INGESTER_TABLES": {"Account": "account_ds", "Contact": "contact_ds"},
+def test_resolve_run_config_reads_workflow_tables_and_dedupe(dag_module):
+    resolve_fn = _task_callable(dag_module.resolve_run_config)
+
+    fake_ctx = {
+        "dag_run": types.SimpleNamespace(
+            conf={"vendor": "revCloud", "credentials": {"username": "u"}}
+        )
+    }
+
+    workflow_dict = {
+        "INGESTER_TABLES": {
+            "accounts": "dataset_accounts",
+            "contacts": "dataset_contacts",
+        },
         "INGESTER_DEDUPE": True,
-        "INGESTER_START_DATE": "2000-01-01",
-    }
-    dag_run_conf = {
-        "vendor": "generic",
-        "start_date": "2020-01-01",
-        "end_date": "2020-01-31",
-        "credentials": {"bar": "baz"},
+        "INGESTER_TESTING": False,
+        "INGESTER_SQL_PARAMS": {"DATABASE": "DB", "SCHEMA": "SC"},
     }
 
-    mod = _import_module_fresh(
-        monkeypatch,
-        workflow_var=workflow_var,
-        dag_run_conf=dag_run_conf,
-    )
+    with patch.object(
+        dag_module, "get_current_context", return_value=fake_ctx
+    ), patch.object(dag_module.Variable, "get", return_value=workflow_dict):
+        out = resolve_fn()
 
-    fn = _get_task_callable(mod.resolve_run_config)
-    out = fn()
-
-    assert out["vendor"] == "generic"
-    assert out["start_date"] == "2020-01-01"
-    assert out["end_date"] == "2020-01-31"
-    assert out["credentials"]["bar"] == "baz"
+    assert out["vendor"] == "revcloud"
     assert out["dedupe"] is True
-    assert len(out["tables"]) == 2
-    assert {"table": "Account", "dataset_id": "account_ds"} in out["tables"]
+    assert out["testing"] is False
+    assert out["credentials"]["username"] == "u"
+    assert {"table": "accounts", "dataset_id": "dataset_accounts"} in out[
+        "tables"
+    ]
+    assert {"table": "contacts", "dataset_id": "dataset_contacts"} in out[
+        "tables"
+    ]
 
 
-def test_get_latest_s3_uri_with_pattern_returns_newest(monkeypatch):
-    workflow_var = {"INGESTER_TABLES": {"t": "ds"}}
-    pages = [
+def test_get_latest_s3_uri_with_pattern_returns_newest(dag_module):
+    get_latest_fn = _task_callable(dag_module.get_latest_s3_uri)
+
+    s3 = MagicMock()
+    paginator = MagicMock()
+    s3.get_paginator.return_value = paginator
+
+    paginator.paginate.return_value = [
         {
             "Contents": [
-                {"Key": "x/a.jsonl", "LastModified": _dt(2024, 1, 1)},
-                {"Key": "x/b.jsonl", "LastModified": _dt(2024, 1, 2)},
-                {"Key": "x/c.csv", "LastModified": _dt(2024, 1, 3)},
+                {
+                    "Key": "prefix/a.txt",
+                    "LastModified": datetime(2024, 1, 1, tzinfo=timezone.utc),
+                },
+                {
+                    "Key": "prefix/b.csv",
+                    "LastModified": datetime(2024, 1, 2, tzinfo=timezone.utc),
+                },
             ]
         }
     ]
 
-    mod = _import_module_fresh(
-        monkeypatch,
-        workflow_var=workflow_var,
-        s3_pages_by_call=[pages],
-    )
+    with patch.object(dag_module.boto3, "client", return_value=s3):
+        out = get_latest_fn("s3://my-bucket/prefix/", pattern="*.csv")
 
-    fn = _get_task_callable(mod.get_latest_s3_uri)
-    out = fn("s3://my-bucket/x/", pattern="*.jsonl")
-    assert out == "s3://my-bucket/x/b.jsonl"
+    assert out == "s3://my-bucket/prefix/b.csv"
 
 
-def test_get_latest_s3_uri_with_pattern_no_matches_raises(monkeypatch):
-    workflow_var = {"INGESTER_TABLES": {"t": "ds"}}
-    pages = [
-        {"Contents": [{"Key": "x/a.csv", "LastModified": _dt(2024, 1, 1)}]}
+def test_get_latest_s3_uri_with_pattern_no_matches_raises(dag_module):
+    get_latest_fn = _task_callable(dag_module.get_latest_s3_uri)
+
+    s3 = MagicMock()
+    paginator = MagicMock()
+    s3.get_paginator.return_value = paginator
+    paginator.paginate.return_value = [
+        {
+            "Contents": [
+                {
+                    "Key": "prefix/a.txt",
+                    "LastModified": datetime.now(timezone.utc),
+                }
+            ]
+        }
     ]
 
-    mod = _import_module_fresh(
-        monkeypatch,
-        workflow_var=workflow_var,
-        s3_pages_by_call=[pages],
-    )
-
-    fn = _get_task_callable(mod.get_latest_s3_uri)
-    with pytest.raises(ValueError, match="No objects found"):
-        fn("s3://my-bucket/x/", pattern="*.jsonl")
+    with patch.object(dag_module.boto3, "client", return_value=s3):
+        with pytest.raises(ValueError):
+            get_latest_fn("s3://my-bucket/prefix/", pattern="*.csv")
 
 
-def test_get_latest_s3_uri_no_pattern_returns_latest_prefix(monkeypatch):
-    workflow_var = {"INGESTER_TABLES": {"t": "ds"}}
+def test_get_latest_s3_uri_no_pattern_returns_latest_prefix(dag_module):
+    get_latest_fn = _task_callable(dag_module.get_latest_s3_uri)
 
-    # Call 1: top-level listing with CommonPrefixes
-    top_listing = {"CommonPrefixes": [{"Prefix": "x/p1/"}, {"Prefix": "x/p2/"}]}
+    s3 = MagicMock()
+    paginator = MagicMock()
+    s3.get_paginator.return_value = paginator
 
-    # Call 2: p1 listing -> latest is Jan 1
-    p1_listing = {
-        "Contents": [{"Key": "x/p1/f1", "LastModified": _dt(2024, 1, 1)}]
-    }
+    # first paginate call (Delimiter="/") returns two common prefixes
+    def paginate_side_effect(**kwargs):
+        if kwargs.get("Delimiter") == "/":
+            return [
+                {
+                    "CommonPrefixes": [
+                        {"Prefix": "prefix/p1/"},
+                        {"Prefix": "prefix/p2/"},
+                    ]
+                },
+            ]
+        # sub-page listings for each prefix
+        if kwargs.get("Prefix") == "prefix/p1/":
+            return [
+                {
+                    "Contents": [
+                        {
+                            "Key": "prefix/p1/x",
+                            "LastModified": datetime(
+                                2024, 1, 1, tzinfo=timezone.utc
+                            ),
+                        }
+                    ]
+                }
+            ]
+        if kwargs.get("Prefix") == "prefix/p2/":
+            return [
+                {
+                    "Contents": [
+                        {
+                            "Key": "prefix/p2/y",
+                            "LastModified": datetime(
+                                2024, 1, 3, tzinfo=timezone.utc
+                            ),
+                        }
+                    ]
+                }
+            ]
+        return [{"Contents": []}]
 
-    # Call 3: p2 listing -> latest is Jan 3 (so p2 wins)
-    p2_listing = {
-        "Contents": [{"Key": "x/p2/f2", "LastModified": _dt(2024, 1, 3)}]
-    }
+    paginator.paginate.side_effect = paginate_side_effect
 
-    mod = _import_module_fresh(
-        monkeypatch,
-        workflow_var=workflow_var,
-        s3_pages_by_call=[top_listing, p1_listing, p2_listing],
-    )
+    with patch.object(dag_module.boto3, "client", return_value=s3):
+        out = get_latest_fn("s3://my-bucket/prefix/", pattern=None)
 
-    fn = _get_task_callable(mod.get_latest_s3_uri)
-    out = fn("s3://my-bucket/x/")
-    assert out == "s3://my-bucket/x/p2/"
+    assert out == "s3://my-bucket/prefix/p2/"
 
 
-def test_get_latest_s3_uri_invalid_scheme_raises(monkeypatch):
-    workflow_var = {"INGESTER_TABLES": {"t": "ds"}}
-    mod = _import_module_fresh(monkeypatch, workflow_var=workflow_var)
-
-    fn = _get_task_callable(mod.get_latest_s3_uri)
-    with pytest.raises(ValueError, match="Expected s3://bucket/prefix"):
-        fn("https://example.com/x/")
+def test_get_latest_s3_uri_invalid_scheme_raises(dag_module):
+    get_latest_fn = _task_callable(dag_module.get_latest_s3_uri)
+    with pytest.raises(ValueError):
+        get_latest_fn("http://not-s3/prefix/", pattern=None)
 
 
-# -------------------------
-# DAG construction tests (mapping-friendly)
-# -------------------------
-def test_dag_builds_expected_base_tasks(monkeypatch):
-    """
-    With dynamic task mapping, you won't have per-table task_ids.
-    So we assert the base tasks exist and the key dependencies exist.
-    """
-    workflow_var = {
-        "INGESTER_TABLES": {"Account": "account_ds", "Contact": "contact_ds"},
-        "INGESTER_CONFIG_PATH": "ingestor/salesforce.yml",
-        "INGESTER_CONFIG_REPO_NAME": "config_management",
-        "INGESTER_GLUE_JOB_NAME": "etl-job",
-        "INGESTER_GLUE_CONN_NAME": "etl-net-conn",
-        "INGESTER_RUN_MODE": "once",
-        "INGESTER_SQL_PARAMS": {"DATABASE": "DB", "SCHEMA": "SCH"},
-        "INGESTER_TESTING": False,
-        "INGESTER_DEDUPE": True,
-    }
+def test_dag_builds_expected_base_tasks(dag_module):
+    dag = dag_module.dag
+    task_ids = {t.task_id for t in dag.tasks}
 
-    mod = _import_module_fresh(monkeypatch, workflow_var=workflow_var)
-    dag = mod.dag
-
-    task_ids = set(dag.task_ids)
-
-    # Core “option B” / mapping-friendly tasks
+    # core task ids (stable because we used .override(task_id=...))
     assert "resolve_run_config" in task_ids
-    assert "build_event_json_for_table" in task_ids
-    assert "build_glue_script_args" in task_ids
+    assert "latest_framework_zip" in task_ids
+    assert "build_event" in task_ids
+    assert "glue_op_kwargs" in task_ids
     assert "run_glue_job" in task_ids
+    assert "table_prefix" in task_ids
+    assert "latest_json" in task_ids
+    assert "copy_sql" in task_ids
     assert "load_table" in task_ids
+    assert "dedupe_sql" in task_ids
     assert "dedupe_table" in task_ids
-
-    # Ensure run_glue_job comes after glue args
-    t_glue_args = dag.get_task("build_glue_script_args")
-    t_run_glue = dag.get_task("run_glue_job")
-    assert t_run_glue.task_id in t_glue_args.downstream_task_ids
-
-    # Ensure load_table depends on get_sql
-    t_get_sql = dag.get_task("get_sql")
-    t_load = dag.get_task("load_table")
-    assert t_load.task_id in t_get_sql.downstream_task_ids
-
-    # Ensure dedupe_table depends on get_sql as well (dedupe SQL is produced by get_sql)
-    t_dedupe = dag.get_task("dedupe_table")
-    assert t_dedupe.task_id in t_get_sql.downstream_task_ids

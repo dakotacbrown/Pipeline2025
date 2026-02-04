@@ -433,3 +433,29 @@ def test_dag_import_and_task_ids(dag_module):
         "dedupe_table",
     }
     assert expected.issubset(set(dag.task_ids))
+
+
+def test_build_event_json_for_table_puts_dataset_id_inside_env_vars(dag_module):
+    env_vars = {"REGION": "x", "BUCKET_NAME": "b"}
+    exchange = None
+    data_extras = None
+
+    out = call_task(
+        dag_module.build_event_json_for_table,
+        vendor="salesforce",
+        table="accounts",
+        dataset_id="ds1",
+        env_vars=env_vars,
+        exchange_extras=exchange,
+        data_extras=data_extras,
+    )
+    payload = json.loads(out)
+
+    assert payload["vendor"] == "salesforce"
+    assert payload["table"] == "accounts"
+
+    assert payload["env_vars"]["dataset_id"] == "ds1"
+
+    assert "dataset_id" not in payload
+
+    assert "dataset_id" not in env_vars

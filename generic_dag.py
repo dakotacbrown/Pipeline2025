@@ -326,11 +326,13 @@ def build_event_json_for_table(
     exchange_extras: dict | None,
     data_extras: Any,
 ) -> str:
+    env_vars_for_table = dict(env_vars or {})
+    env_vars_for_table["dataset_id"] = dataset_id
+
     base_event: Dict[str, Any] = {
-        "env_vars": env_vars,
+        "env_vars": env_vars_for_table,
         "table": table,
         "vendor": vendor,
-        "dataset_id": dataset_id,
     }
     if exchange_extras:
         base_event.update(exchange_extras)

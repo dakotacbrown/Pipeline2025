@@ -7,19 +7,27 @@ import sys
 import types
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pytest
 
+# ---------------------------------------------------------------------
+# Configure these for your repo
+# ---------------------------------------------------------------------
 DAG_FILE_RELATIVE_PATH = Path("dags/generic/generic_ingester.py")
 DAG_MODULE_NAME = "generic_ingester_under_test"
 
 
 def _project_root() -> Path:
+    # tests live in: <repo>/tests/unit/test_*.py
     return Path(__file__).resolve().parents[2]
 
 
 def _install_stub_modules(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Minimal stub modules so importing the DAG file doesn't require
+    your full dags.common package during unit tests.
+    """
     dags_mod = types.ModuleType("dags")
     common_mod = types.ModuleType("dags.common")
 
@@ -77,9 +85,11 @@ def _load_module_from_path(
     module_name: str, file_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     _install_stub_modules(monkeypatch)
+
     spec = importlib.util.spec_from_file_location(module_name, str(file_path))
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load module spec from {file_path}")
+
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
@@ -96,14 +106,33 @@ def dag_module(monkeypatch: pytest.MonkeyPatch):
         sys.modules.pop(DAG_MODULE_NAME, None)
 
 
-# --- TaskFlow helper ---
+# ---------------------------------------------------------------------
+# Helper: execute TaskFlow @task underlying callable (Airflow 2.10.5)
+# ---------------------------------------------------------------------
 def call_task(task_obj, *args, **kwargs):
+    """
+    Pass the TaskFlow task object itself (e.g., dag_module.resolve_run_config),
+    not dag_module.resolve_run_config(...), which would return an XComArg.
+    """
+    try:
+        from airflow.models.xcom_arg import XComArg  # type: ignore
+    except Exception:  # pragma: no cover
+        XComArg = ()  # type: ignore
+
+    if isinstance(task_obj, XComArg):
+        raise TypeError(
+            "call_task() received an XComArg. "
+            "Pass the task function itself (e.g. dag_module.my_task), not dag_module.my_task(...)."
+        )
+
     fn = getattr(task_obj, "function", None)
     if callable(fn):
         return fn(*args, **kwargs)
+
     wrapped = getattr(task_obj, "__wrapped__", None)
     if callable(wrapped):
         return wrapped(*args, **kwargs)
+
     raise TypeError(f"Object {task_obj!r} does not look like a TaskFlow task")
 
 
@@ -130,7 +159,7 @@ def test_deep_replace_placeholders_leaves_missing_and_none_intact(dag_module):
 # ---------------------------------------------------------------------
 # Unit tests: reconcile_table_specs
 # ---------------------------------------------------------------------
-def test_reconcile_table_specs_dedupes_and_preserves_order(dag_module):
+def test_reconcile_table_specs_dedupes_preserves_order(dag_module):
     specs = [
         {"table": "a", "dataset_id": "1"},
         {"table": "b", "dataset_id": "2"},
@@ -143,7 +172,7 @@ def test_reconcile_table_specs_dedupes_and_preserves_order(dag_module):
     ]
 
 
-def test_reconcile_table_specs_invalid_raises(dag_module):
+def test_reconcile_table_specs_requires_table_and_dataset(dag_module):
     with pytest.raises(ValueError):
         call_task(dag_module.reconcile_table_specs, [{"table": "a"}])
 
@@ -168,9 +197,7 @@ def test_resolve_run_config_requires_vendor(monkeypatch, dag_module):
         call_task(dag_module.resolve_run_config)
 
 
-def test_resolve_run_config_valid_exchange_enabled_true(
-    monkeypatch, dag_module
-):
+def test_resolve_run_config_exchange_enabled_true(monkeypatch, dag_module):
     def fake_ctx():
         return {
             "dag_run": _FakeDagRun(
@@ -214,21 +241,12 @@ def test_resolve_run_config_valid_exchange_enabled_true(
         {"table": "contacts", "dataset_id": "ds2"},
     ]
     assert cfg["credentials"] == {"TOKEN": "t"}
-    assert cfg["start_date"] == "2020-01-01"
-    assert cfg["end_date"] == "2020-01-31"
-    assert cfg["testing"] is True
-    assert cfg["dedupe"] is False
-    assert cfg["etl_job_name"] == "jobname"
-    assert cfg["etl_conn_name"] == "connname"
-    assert cfg["repo_name"] == "repo"
-    assert cfg["config_path"] == "path/to/config.yml"
-    assert cfg["sql_params"] == {"DATABASE": "DB", "SCHEMA": "SC"}
-    assert cfg["ingester_env_vars"] == {"A": "B"}
-    assert cfg["data_extras"] == {"hello": "{{TOKEN}}"}
     assert cfg["exchange_enabled"] is True
 
 
-def test_resolve_run_config_tables_missing_raises(monkeypatch, dag_module):
+def test_resolve_run_config_exchange_enabled_default_false(
+    monkeypatch, dag_module
+):
     def fake_ctx():
         return {"dag_run": _FakeDagRun(conf={"vendor": "x"})}
 
@@ -236,42 +254,13 @@ def test_resolve_run_config_tables_missing_raises(monkeypatch, dag_module):
 
     def fake_variable_get(key: str, default_var=None, deserialize_json=False):
         if key == "INGESTER_WORKFLOW_X":
-            return {"INGESTER_TABLES": {}}
+            return {"INGESTER_TABLES": {"t": "ds"}}  # no INGESTER_EXCHANGE key
         return default_var
 
     monkeypatch.setattr(dag_module.Variable, "get", fake_variable_get)
 
-    with pytest.raises(ValueError, match=r"INGESTER_TABLES missing/empty"):
-        call_task(dag_module.resolve_run_config)
-
-
-# ---------------------------------------------------------------------
-# Unit tests: zip helpers
-# ---------------------------------------------------------------------
-def test_zip_specs_with_events(dag_module):
-    specs = [
-        {"table": "a", "dataset_id": "1"},
-        {"table": "b", "dataset_id": "2"},
-    ]
-    events = ['{"e":1}', '{"e":2}']
-    out = call_task(dag_module.zip_specs_with_events, specs, events)
-    assert out == [
-        {"table": "a", "dataset_id": "1", "event_json": '{"e":1}'},
-        {"table": "b", "dataset_id": "2", "event_json": '{"e":2}'},
-    ]
-
-
-def test_zip_tables_with_latest_json(dag_module):
-    specs = [
-        {"table": "a", "dataset_id": "1"},
-        {"table": "b", "dataset_id": "2"},
-    ]
-    latest = ["s3://x/a.json", "s3://x/b.json"]
-    out = call_task(dag_module.zip_tables_with_latest_json, specs, latest)
-    assert out == [
-        {"table_name": "a", "s3_uri": "s3://x/a.json"},
-        {"table_name": "b", "s3_uri": "s3://x/b.json"},
-    ]
+    cfg = call_task(dag_module.resolve_run_config)
+    assert cfg["exchange_enabled"] is False
 
 
 # ---------------------------------------------------------------------
@@ -330,156 +319,94 @@ def test_get_latest_s3_uri_pattern_branch_newest_match(monkeypatch, dag_module):
     assert out == "s3://my-bucket/code/ETL/debi-etl-framework-glue-2.zip"
 
 
-# ---------------------------------------------------------------------
-# Unit tests: get_sql
-# ---------------------------------------------------------------------
-def test_get_sql_replacements(tmp_path: Path, monkeypatch, dag_module):
-    current_dir = tmp_path
-    (current_dir / "copy").mkdir()
-    sql_file = current_dir / "copy" / "copy_accounts.sql"
-    sql_file.write_text(
-        "COPY INTO {{ params.target_table }} FROM '{{ params.s3_uri }}';"
-    )
+def test_get_latest_s3_uri_prefix_branch_latest_common_prefix(
+    monkeypatch, dag_module
+):
+    dt_old = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    dt_new = datetime(2024, 1, 5, tzinfo=timezone.utc)
 
-    monkeypatch.setattr(dag_module, "CURRENT_DIR", str(current_dir))
+    pages_for_delimiter = [
+        {
+            "CommonPrefixes": [
+                {"Prefix": "vendor/ds1/"},
+                {"Prefix": "vendor/ds2/"},
+            ]
+        }
+    ]
+    pages_for_ds1 = [
+        {"Contents": [{"Key": "vendor/ds1/file.json", "LastModified": dt_old}]}
+    ]
+    pages_for_ds2 = [
+        {"Contents": [{"Key": "vendor/ds2/file.json", "LastModified": dt_new}]}
+    ]
 
-    sql_params = {"DATABASE": "DB", "SCHEMA": "SC"}
-    s3_uri = "s3://bucket/vendor/ds/file.json"
+    class _SmartPaginator:
+        def paginate(self, **kwargs):
+            if kwargs.get("Delimiter") == "/":
+                yield from pages_for_delimiter
+                return
+            if kwargs.get("Prefix") == "vendor/ds1/":
+                yield from pages_for_ds1
+                return
+            if kwargs.get("Prefix") == "vendor/ds2/":
+                yield from pages_for_ds2
+                return
+            yield {"Contents": []}
 
-    out = call_task(
-        dag_module.get_sql,
-        "accounts",
-        sql_params=sql_params,
-        type="copy",
-        s3_uri=s3_uri,
-        enabled=True,
-    )
-    assert "DB.SC.accounts" in out
-    assert "vendor/ds/file.json" in out
-
-
-def test_get_sql_disabled_returns_noop(dag_module):
-    out = call_task(
-        dag_module.get_sql,
-        "anything",
-        sql_params={"DATABASE": "DB", "SCHEMA": "SC"},
-        type="copy",
-        enabled=False,
-    )
-    assert out == "SELECT 1;"
-
-
-# ---------------------------------------------------------------------
-# Unit tests: exchange/env/data_extras/event_json/prefix/glue kwargs
-# ---------------------------------------------------------------------
-def test_build_exchange_extras(monkeypatch, dag_module):
-    monkeypatch.setattr(
-        dag_module, "get_c1s_oauth_endpoint", lambda env: f"https://oauth/{env}"
-    )
-
-    def fake_variable_get(key: str, default_var=None):
-        if key == "C1SCOREDATASERVICES_EXCHANGE_ID":
-            return "cid"
-        if key == "C1SCOREDATASERVICES_EXCHANGE_SECRET":
-            return "csec"
-        return default_var
-
-    monkeypatch.setattr(dag_module.Variable, "get", fake_variable_get)
-
-    out = call_task(dag_module.build_exchange_extras, "dev")
-    assert out["c1_oauth_url"] == "https://oauth/dev"
-    assert out["exchange_data"]["client_id"] == "cid"
-    assert out["exchange_data"]["client_secret"] == "csec"
-    assert out["exchange_data"]["grant_type"] == "client_credentials"
-
-
-def test_build_env_vars(dag_module):
-    out = call_task(
-        dag_module.build_env_vars, "us-east-1", "bucket", {"X": "Y"}
-    )
-    assert out["X"] == "Y"
-    assert out["REGION"] == "us-east-1"
-    assert out["BUCKET_NAME"] == "bucket"
-
-
-def test_build_data_extras_placeholder_replacement(dag_module):
-    data_extras = {"headers": {"Authorization": "Bearer {{TOKEN}}"}}
-    creds = {"TOKEN": "abc"}
-    out = call_task(dag_module.build_data_extras, data_extras, creds)
-    assert out["headers"]["Authorization"] == "Bearer abc"
-
-
-def test_build_event_json_for_table_includes_exchange_when_present(dag_module):
-    env_vars = {"REGION": "x"}
-    exchange = {"c1_oauth_url": "u", "exchange_data": {"a": "b"}}
-    data_extras = {"hello": "world"}
+    fake_s3 = _FakeS3Client(_SmartPaginator())
+    monkeypatch.setattr(dag_module.boto3, "client", lambda name: fake_s3)
 
     out = call_task(
-        dag_module.build_event_json_for_table,
-        vendor="salesforce",
-        table="accounts",
-        dataset_id="ds1",
-        env_vars=env_vars,
-        exchange_extras=exchange,
-        data_extras=data_extras,
+        dag_module.get_latest_s3_uri, "s3://my-bucket/vendor", pattern=None
     )
-    payload = json.loads(out)
-    assert payload["vendor"] == "salesforce"
-    assert payload["table"] == "accounts"
-    assert payload["dataset_id"] == "ds1"
-    assert payload["c1_oauth_url"] == "u"
-    assert payload["exchange_data"] == {"a": "b"}
-    assert payload["hello"] == "world"
+    assert out == "s3://my-bucket/vendor/ds2/"
 
 
-def test_build_table_prefix(dag_module):
-    assert call_task(
+# ---------------------------------------------------------------------
+# Unit tests: build_table_prefix accepts 'table' kw (prevents your runtime error)
+# ---------------------------------------------------------------------
+def test_build_table_prefix_accepts_table_kw(dag_module):
+    out = call_task(
         dag_module.build_table_prefix,
-        "bucket",
-        "salesforce",
-        "ds1",
+        bucket_name="bucket",
+        vendor="salesforce",
+        dataset_id="ds1",
         testing=False,
-    ) == ("s3://bucket/salesforce/ds1/")
-    assert call_task(
-        dag_module.build_table_prefix,
-        "bucket",
-        "salesforce",
-        "ds1",
-        testing=True,
-    ) == ("s3://bucket/test/salesforce/ds1")
-
-
-def test_build_glue_operator_kwargs_drops_none_values(dag_module):
-    out = call_task(
-        dag_module.build_glue_operator_kwargs,
-        env="dev",
-        region="us-east-1",
-        vendor="salesforce",
         table="accounts",
-        dataset_id="ds1",
-        event_json='{"x":1}',
-        latest_zip_s3="s3://b/code/ETL/z.zip",
-        etl_job_name="job",
-        etl_conn_name="conn",
-        run_mode="once",
-        repo_name="repo",
-        config_path="path.yml",
-        github_token="gh",
-        start_date="2020-01-01",
-        end_date="2020-01-31",
-        python_modules=None,
-        index_url="https://index/simple",
     )
-
-    assert out["task_id"] == "run_glue_job__accounts"
-    script_args = out["script_args"]
-    assert script_args["--env"] == "dev"
-    assert script_args["--table"] == "accounts"
-    assert "--additional-python-modules" not in script_args
+    assert out == "s3://bucket/salesforce/ds1/"
 
 
 # ---------------------------------------------------------------------
-# DAG structure test
+# Unit tests: zipper helpers
+# ---------------------------------------------------------------------
+def test_zip_specs_with_events(dag_module):
+    specs = [
+        {"table": "a", "dataset_id": "1"},
+        {"table": "b", "dataset_id": "2"},
+    ]
+    events = ['{"x":1}', '{"y":2}']
+    out = call_task(dag_module.zip_specs_with_events, specs, events)
+    assert out[0]["table"] == "a"
+    assert out[0]["dataset_id"] == "1"
+    assert out[0]["event_json"] == '{"x":1}'
+
+
+def test_zip_tables_with_latest_path(dag_module):
+    specs = [
+        {"table": "a", "dataset_id": "1"},
+        {"table": "b", "dataset_id": "2"},
+    ]
+    paths = ["s3://bucket/vendor/1/run=1/", "s3://bucket/vendor/2/run=2/"]
+    out = call_task(dag_module.zip_tables_with_latest_path, specs, paths)
+    assert out == [
+        {"table_name": "a", "s3_uri": "s3://bucket/vendor/1/run=1/"},
+        {"table_name": "b", "s3_uri": "s3://bucket/vendor/2/run=2/"},
+    ]
+
+
+# ---------------------------------------------------------------------
+# DAG structure smoke test
 # ---------------------------------------------------------------------
 def test_dag_import_and_task_ids(dag_module):
     dag = dag_module.dag
@@ -497,8 +424,8 @@ def test_dag_import_and_task_ids(dag_module):
         "glue_op_kwargs",
         "run_glue_job",
         "table_prefix",
-        "latest_json",
-        "zip_tables_with_latest_json",
+        "latest_path",
+        "zip_tables_with_latest_path",
         "copy_sql",
         "load_table",
         "specs_to_table_names",

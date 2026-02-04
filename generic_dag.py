@@ -190,8 +190,8 @@ def get_latest_s3_uri(s3_prefix: str, pattern: Optional[str] = None) -> str:
     """
     Return s3://bucket/key for the newest object under s3_prefix.
 
-    If pattern is provided, filter objects by fnmatch on the filename and return newest match.
-    Otherwise, return newest *path* (common prefix) created under s3_prefix.
+    If pattern is provided, filter objects by fnmatch on the *filename* and return newest match.
+    Otherwise (pattern=None), return newest *sub-prefix/path* found under s3_prefix using Delimiter="/".
     """
     u = urlparse(s3_prefix)
     if u.scheme != "s3" or not u.netloc:
@@ -222,6 +222,7 @@ def get_latest_s3_uri(s3_prefix: str, pattern: Optional[str] = None) -> str:
         newest = max(matches, key=lambda o: o["LastModified"])
         return f"s3://{bucket}/{newest['Key']}"
 
+    # pattern=None: choose latest sub-prefix (folder) under prefix
     paths: Dict[str, datetime] = {}
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
         for common_prefix in page.get("CommonPrefixes", []) or []:
@@ -255,7 +256,7 @@ def get_sql(
       - {{ params.target_table }} => <DATABASE>.<SCHEMA>.<table>
       - {{ params.s3_uri }}       => key-only (no s3://bucket/) if provided
 
-    If enabled=False, return a safe no-op.
+    If enabled=False, return a safe no-op query.
     """
     if not enabled:
         return "SELECT 1;"
@@ -340,10 +341,17 @@ def build_event_json_for_table(
 
 @task
 def build_table_prefix(
-    bucket_name: str, vendor: str, dataset_id: str, testing: bool
+    bucket_name: str,
+    vendor: str,
+    dataset_id: str,
+    testing: bool,
+    table: Optional[
+        str
+    ] = None,  # <-- IMPORTANT: allows expand_kwargs(table_specs)
 ) -> str:
+    # 'table' is intentionally ignored; it's only present to avoid unexpected-kwarg errors.
     if testing:
-        return f"s3://{bucket_name}/test/{vendor}/{dataset_id}"
+        return f"s3://{bucket_name}/test/{vendor}/{dataset_id}/"
     return f"s3://{bucket_name}/{vendor}/{dataset_id}/"
 
 
@@ -396,9 +404,13 @@ def build_glue_operator_kwargs(
 
 @task
 def zip_specs_with_events(specs: List[dict], events: List[str]) -> List[dict]:
-    """Zip table specs + event_json into kwargs dicts for expand_kwargs()."""
+    """
+    Pair each table spec with its event_json so build_glue_operator_kwargs can be mapped
+    WITHOUT splitting table/dataset into separate lists.
+    """
     if len(specs) != len(events):
         raise ValueError("specs/events length mismatch")
+
     out: List[dict] = []
     for spec, ev in zip(specs, events):
         out.append(
@@ -412,21 +424,24 @@ def zip_specs_with_events(specs: List[dict], events: List[str]) -> List[dict]:
 
 
 @task
-def zip_tables_with_latest_json(
-    specs: List[dict], latest_json: List[str]
+def zip_tables_with_latest_path(
+    specs: List[dict], latest_paths: List[str]
 ) -> List[dict]:
-    """Zip table specs + latest_json into kwargs dicts for get_sql(copy) mapping."""
-    if len(specs) != len(latest_json):
-        raise ValueError("specs/latest_json length mismatch")
+    """
+    Pair each table spec with its latest produced *path* (prefix),
+    so COPY SQL can be mapped without cartesian behavior.
+    """
+    if len(specs) != len(latest_paths):
+        raise ValueError("specs/latest_paths length mismatch")
+
     out: List[dict] = []
-    for spec, uri in zip(specs, latest_json):
+    for spec, uri in zip(specs, latest_paths):
         out.append({"table_name": spec["table"], "s3_uri": uri})
     return out
 
 
 @task
 def specs_to_table_names(specs: List[dict]) -> List[str]:
-    """Used for dedupe_sql (table-only) mapping without cartesian behavior elsewhere."""
     return [s["table"] for s in specs]
 
 
@@ -459,20 +474,24 @@ def generic_ingester_dag():
     cfg = resolve_run_config()
     vendor = cfg["vendor"]
 
+    # Keep table<->dataset paired
     table_specs = reconcile_table_specs(cfg["tables"])
 
+    # --- latest framework zip (file) ---
     zip_prefix = f"s3://{bucket_name}/code/ETL/"
     latest_zip = get_latest_s3_uri.override(task_id="latest_framework_zip")(
         s3_prefix=zip_prefix,
         pattern="debi-etl-framework-glue*.zip",
     )
 
+    # runtime extras
     exchange_extras = (
         build_exchange_extras(env) if cfg["exchange_enabled"] else None
     )
     env_vars = build_env_vars(region, bucket_name, cfg["ingester_env_vars"])
     data_extras = build_data_extras(cfg["data_extras"], cfg["credentials"])
 
+    # --- per-table event json (mapped, no cartesian) ---
     events = (
         build_event_json_for_table.override(task_id="build_event")
         .partial(
@@ -484,10 +503,10 @@ def generic_ingester_dag():
         .expand_kwargs(table_specs)
     )
 
+    # --- glue operator kwargs (mapped 1:1) ---
     github_token = Variable.get(
         "C1SCOREDATASERVICES_GITHUB_PASSWORD", default_var=None
     )
-
     glue_kwarg_dicts = zip_specs_with_events(table_specs, events)
 
     glue_kwargs = (
@@ -515,19 +534,22 @@ def generic_ingester_dag():
         glue_kwargs
     )
 
+    # --- per-table: base prefix for that dataset_id (mapped, accepts 'table' kw) ---
     prefixes = (
         build_table_prefix.override(task_id="table_prefix")
         .partial(bucket_name=bucket_name, vendor=vendor, testing=cfg["testing"])
         .expand_kwargs(table_specs)
     )
 
-    latest_json = (
-        get_latest_s3_uri.override(task_id="latest_json")
+    # --- per-table: latest *path* created under each prefix (NOT latest file) ---
+    latest_paths = (
+        get_latest_s3_uri.override(task_id="latest_path")
         .partial(pattern=None)
         .expand(s3_prefix=prefixes)
     )
 
-    copy_inputs = zip_tables_with_latest_json(table_specs, latest_json)
+    # --- per-table: COPY sql + execute ---
+    copy_inputs = zip_tables_with_latest_path(table_specs, latest_paths)
 
     copy_sql = (
         get_sql.override(task_id="copy_sql")
@@ -540,7 +562,7 @@ def generic_ingester_dag():
         conn_id="snowflake_salesforce",
     ).expand(sql=copy_sql)
 
-    # dedupe step: table-only list is fine because it's mapped over 1 list
+    # --- per-table: DEDUPE sql + execute ---
     table_names = specs_to_table_names(table_specs)
 
     dedupe_sql = (
@@ -559,11 +581,12 @@ def generic_ingester_dag():
         conn_id="snowflake_salesforce",
     ).expand(sql=dedupe_sql)
 
+    # Dependencies
     latest_zip >> events >> glue_kwargs >> run_glue
     (
         run_glue
         >> prefixes
-        >> latest_json
+        >> latest_paths
         >> copy_sql
         >> load_table
         >> dedupe_sql

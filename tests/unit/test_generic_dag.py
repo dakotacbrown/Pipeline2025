@@ -107,7 +107,7 @@ def dag_module(monkeypatch: pytest.MonkeyPatch):
 
 
 # ---------------------------------------------------------------------
-# Helper: execute TaskFlow @task underlying callable (Airflow 2.10.5)
+# Helper: execute TaskFlow @task underlying callable (Airflow 2.x / 3.x)
 # ---------------------------------------------------------------------
 def call_task(task_obj, *args, **kwargs):
     """
@@ -363,7 +363,7 @@ def test_get_latest_s3_uri_prefix_branch_latest_common_prefix(
 
 
 # ---------------------------------------------------------------------
-# Unit tests: build_table_prefix accepts 'table' kw (prevents your runtime error)
+# Unit tests: build_table_prefix accepts 'table' kw
 # ---------------------------------------------------------------------
 def test_build_table_prefix_accepts_table_kw(dag_module):
     out = call_task(
@@ -447,6 +447,7 @@ def test_build_event_json_for_table_puts_dataset_id_inside_env_vars(dag_module):
         dataset_id="ds1",
         env_vars=env_vars,
         exchange_extras=exchange,
+        exchange_enabled=False,
         data_extras=data_extras,
     )
     payload = json.loads(out)
@@ -457,5 +458,4 @@ def test_build_event_json_for_table_puts_dataset_id_inside_env_vars(dag_module):
     assert payload["env_vars"]["dataset_id"] == "ds1"
 
     assert "dataset_id" not in payload
-
     assert "dataset_id" not in env_vars

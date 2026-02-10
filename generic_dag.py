@@ -1,3 +1,4 @@
+# dags/generic/generic_ingester.py
 from __future__ import annotations
 
 import fnmatch
@@ -12,11 +13,13 @@ import boto3
 import pendulum
 from airflow.decorators import dag, task
 from airflow.models import Variable
-from airflow.operators.python import get_current_context
 from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
 from airflow.providers.snowflake.operators.snowflake import (
     SQLExecuteQueryOperator,
 )
+
+# Airflow 3.x: context helper is in providers.standard
+from airflow.providers.standard.operators.python import get_current_context
 from dags.common.dag_utilities import (
     failover_managed_dag_tag,
     get_bucket_name,
@@ -324,8 +327,12 @@ def build_event_json_for_table(
     dataset_id: str,
     env_vars: dict,
     exchange_extras: dict | None,
+    exchange_enabled: bool,
     data_extras: Any,
 ) -> str:
+    """
+    Build a JSON payload per table. Exchange fields are included only when exchange_enabled=True.
+    """
     env_vars_for_table = dict(env_vars or {})
     env_vars_for_table["dataset_id"] = dataset_id
 
@@ -334,10 +341,12 @@ def build_event_json_for_table(
         "table": table,
         "vendor": vendor,
     }
-    if exchange_extras:
+
+    if exchange_enabled and exchange_extras:
         base_event.update(exchange_extras)
     if data_extras:
         base_event.update(data_extras)
+
     return json.dumps(base_event)
 
 
@@ -347,9 +356,7 @@ def build_table_prefix(
     vendor: str,
     dataset_id: str,
     testing: bool,
-    table: Optional[
-        str
-    ] = None,  # <-- IMPORTANT: allows expand_kwargs(table_specs)
+    table: Optional[str] = None,  # allows expand_kwargs(table_specs)
 ) -> str:
     # 'table' is intentionally ignored; it's only present to avoid unexpected-kwarg errors.
     if testing:
@@ -372,8 +379,8 @@ def build_glue_operator_kwargs(
     repo_name: str,
     config_path: str,
     github_token: str,
-    start_date: str,
-    end_date: str,
+    start_date_str: str,  # Airflow 3: avoid reserved context var name "start_date"
+    end_date_str: str,  # Airflow 3: avoid reserved context var name "end_date"
     python_modules: Optional[str],
     index_url: str,
 ) -> dict:
@@ -385,8 +392,8 @@ def build_glue_operator_kwargs(
         "--repo_name": repo_name,
         "--file_path": config_path,
         "--github_token": github_token,
-        "--start_date": start_date,
-        "--end_date": end_date,
+        "--start_date": start_date_str,
+        "--end_date": end_date_str,
         "--additional-python-modules": python_modules,
         "--python-modules-installer-option": f"--index-url={index_url}",
         "--extra-py-files": latest_zip_s3,
@@ -450,7 +457,7 @@ def specs_to_table_names(specs: List[dict]) -> List[str]:
 @dag(
     tags=[
         "invoke-lambda",
-        "airflow-2.x.x-compatible",
+        "airflow-3.1.x-compatible",
         failover_managed_dag_tag(),
     ],
     default_args={
@@ -465,7 +472,7 @@ def specs_to_table_names(specs: List[dict]) -> List[str]:
     catchup=False,
     user_defined_filters={"convertToEpochSeconds": ts_nodash_to_YYYYMMDDHHmmss},
     max_active_runs=1,
-    start_date=datetime(2023, 12, 23, tzinfo=pendulum.timezone("UTC")),
+    start_date=pendulum.datetime(2023, 12, 23, tz="UTC"),
 )
 def generic_ingester_dag():
     env = get_shairflow_environment().lower()
@@ -486,12 +493,16 @@ def generic_ingester_dag():
         pattern="debi-etl-framework-glue*.zip",
     )
 
-    # runtime extras
-    exchange_extras = (
-        build_exchange_extras(env) if cfg["exchange_enabled"] else None
+    # Runtime extras (avoid boolean checks on XComArg at parse time)
+    exchange_extras = build_exchange_extras.override(
+        task_id="build_exchange_extras"
+    )(env)
+    env_vars = build_env_vars.override(task_id="build_env_vars")(
+        region, bucket_name, cfg["ingester_env_vars"]
     )
-    env_vars = build_env_vars(region, bucket_name, cfg["ingester_env_vars"])
-    data_extras = build_data_extras(cfg["data_extras"], cfg["credentials"])
+    data_extras = build_data_extras.override(task_id="build_data_extras")(
+        cfg["data_extras"], cfg["credentials"]
+    )
 
     # --- per-table event json (mapped, no cartesian) ---
     events = (
@@ -500,6 +511,7 @@ def generic_ingester_dag():
             vendor=vendor,
             env_vars=env_vars,
             exchange_extras=exchange_extras,
+            exchange_enabled=cfg["exchange_enabled"],
             data_extras=data_extras,
         )
         .expand_kwargs(table_specs)
@@ -524,8 +536,8 @@ def generic_ingester_dag():
             repo_name=cfg["repo_name"],
             config_path=cfg["config_path"],
             github_token=github_token,
-            start_date=cfg["start_date"],
-            end_date=cfg["end_date"],
+            start_date_str=cfg["start_date"],
+            end_date_str=cfg["end_date"],
             python_modules=cfg["python_modules"],
             index_url="https://artifactory.cloud.capitalone.com/artifactory/api/pypi/pypi-internalfacing/simple",
         )
@@ -561,7 +573,7 @@ def generic_ingester_dag():
 
     load_table = SQLExecuteQueryOperator.partial(
         task_id="load_table",
-        conn_id="snowflake_salesforce",
+        snowflake_conn_id="snowflake_salesforce",
     ).expand(sql=copy_sql)
 
     # --- per-table: DEDUPE sql + execute ---
@@ -580,7 +592,7 @@ def generic_ingester_dag():
 
     dedupe_table = SQLExecuteQueryOperator.partial(
         task_id="dedupe_table",
-        conn_id="snowflake_salesforce",
+        snowflake_conn_id="snowflake_salesforce",
     ).expand(sql=dedupe_sql)
 
     # Dependencies

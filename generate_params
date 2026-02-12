@@ -1,0 +1,88 @@
+def _generate_job_execution_status(
+    task_group_id,
+    on_success,
+    job_execution_status_table,
+    on_failure=None,
+    **kwargs,
+):
+    """
+    Airflow 3.1.3-safe:
+      - No dag_run.get_task_instances()
+      - No metadb access
+      - Determines try_sql success by presence of XCom from `{task_group_id}.try_sql`
+
+    Assumptions (based on your DAG):
+      - `{task_group_id}.generate_params` returns a list with one dict element (or a dict)
+      - `{task_group_id}.try_sql` pushes XCom on success (so sql_success_handler can read sql_xcom[0])
+      - This task is configured with trigger_rule="all_done" if you want it to run even when try_sql fails
+    """
+    on_failure = on_failure or _default_failure_handler
+
+    ti = kwargs["ti"]
+
+    # ----------------------------
+    # Pull job_run_params from generate_params
+    # ----------------------------
+    generate_params_task_id = f"{task_group_id}.generate_params"
+    job_run_params = ti.xcom_pull(task_ids=generate_params_task_id)
+
+    # Your existing code indexes [0]; keep compatibility but be defensive.
+    if isinstance(job_run_params, (list, tuple)):
+        if not job_run_params:
+            raise ValueError(f"No job_run_params returned from {generate_params_task_id}")
+        job_run_params = job_run_params[0]
+
+    if not isinstance(job_run_params, dict):
+        raise ValueError(
+            f"Expected dict job_run_params from {generate_params_task_id}, "
+            f"got {type(job_run_params).__name__}: {job_run_params}"
+        )
+
+    # Add standard fields
+    job_run_params["run_end_timestamp"] = print_dt_utc(time.time_ns() / 1e6)
+    job_run_params["job_execution_status_table"] = job_execution_status_table
+
+    # Make available to callbacks/handlers (matches your current pattern)
+    kwargs["job_run_params"] = job_run_params
+
+    # ----------------------------
+    # Pull try_sql XCom
+    # ----------------------------
+    try_sql_task_id = f"{task_group_id}.try_sql"
+    try_sql_xcom = ti.xcom_pull(task_ids=try_sql_task_id)
+
+    # Normalize list/tuple form (your handlers use sql_xcom[0])
+    try_sql_payload = try_sql_xcom
+    if isinstance(try_sql_xcom, (list, tuple)) and try_sql_xcom:
+        try_sql_payload = try_sql_xcom  # keep list form for existing handlers
+    elif try_sql_xcom is None:
+        try_sql_payload = None
+
+    # ----------------------------
+    # Decide success/failure WITHOUT task state
+    # ----------------------------
+    # If try_sql succeeded and do_xcom_push is enabled, we should have XCom.
+    # If try_sql failed, it generally won't push XCom.
+    try_sql_succeeded = try_sql_payload is not None
+
+    if try_sql_succeeded:
+        # Keep behavior consistent with your current code:
+        # you set sql_xcom only on success path and handlers expect sql_xcom[0]
+        kwargs["sql_xcom"] = try_sql_payload
+        result_params = on_success(**kwargs)
+    else:
+        # This preserves your old intent: if it "failed", there should be no XCom.
+        # If you *ever* see try_sql_xcom not None while treating as failure,
+        # that indicates upstream is emitting XCom on failure and you should encode status.
+        result_params = on_failure(**kwargs)
+
+    # Apply handler output
+    if result_params:
+        if not isinstance(result_params, dict):
+            raise ValueError(
+                f"Expected {('on_success' if try_sql_succeeded else 'on_failure')} "
+                f"to return dict, got {type(result_params).__name__}: {result_params}"
+            )
+        job_run_params.update(result_params)
+
+    return [job_run_params]

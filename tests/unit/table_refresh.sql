@@ -31,7 +31,7 @@ WHEN NOT MATCHED THEN
   VALUES (s.database_name, s.schema_name, s.table_name, s.refresh_path, s.is_enabled);
 
 
-CREATE OR REPLACE PROCEDURE CADET.CONTROL.REFRESH_LISTED_EXTERNAL_TABLES_DAILY()
+CREATE OR REPLACE PROCEDURE CADET.CONTROL.REFRESH_LISTED_EXTERNAL_TABLES_HOURLY()
   RETURNS VARIANT
   LANGUAGE SQL
   EXECUTE AS OWNER
@@ -44,13 +44,17 @@ BEGIN
   results := ARRAY_CONSTRUCT();
 
   FOR r IN (
-    SELECT database_name, schema_name, table_name, refresh_path
-    FROM CADET.CONTROL.EXTERNAL_TABLE_REFRESH_LIST_DAILY
+    SELECT
+      database_name  AS DATABASE_NAME,
+      schema_name    AS SCHEMA_NAME,
+      table_name     AS TABLE_NAME,
+      refresh_path   AS REFRESH_PATH
+    FROM CADET.CONTROL.EXTERNAL_TABLE_REFRESH_LIST_HOURLY
     WHERE is_enabled = TRUE
     ORDER BY database_name, schema_name, table_name
   ) DO
 
-    IF (r.REFRESH_PATH IS NULL) THEN
+    IF (r.REFRESH_PATH IS NULL OR r.REFRESH_PATH = '') THEN
       stmt := 'ALTER EXTERNAL TABLE "' || r.DATABASE_NAME || '"."' || r.SCHEMA_NAME || '"."' || r.TABLE_NAME || '" REFRESH';
     ELSE
       stmt := 'ALTER EXTERNAL TABLE "' || r.DATABASE_NAME || '"."' || r.SCHEMA_NAME || '"."' || r.TABLE_NAME || '" REFRESH ''' || r.REFRESH_PATH || '''';
@@ -88,6 +92,7 @@ BEGIN
   );
 END;
 $$;
+
 
 
 

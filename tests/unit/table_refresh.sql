@@ -31,15 +31,14 @@ WHEN NOT MATCHED THEN
   VALUES (s.database_name, s.schema_name, s.table_name, s.refresh_path, s.is_enabled);
 
 
-CREATE OR REPLACE PROCEDURE CADET.CONTROL.REFRESH_LISTED_EXTERNAL_TABLES()
-RETURNS VARIANT
-LANGUAGE SQL
-EXECUTE AS OWNER
+CREATE OR REPLACE PROCEDURE CADET.CONTROL.REFRESH_LISTED_EXTERNAL_TABLES_DAILY()
+  RETURNS VARIANT
+  LANGUAGE SQL
+  EXECUTE AS OWNER
 AS
 $$
 DECLARE
   rs RESULTSET;
-  rec RECORD;
   results ARRAY;
   stmt STRING;
 BEGIN
@@ -47,34 +46,40 @@ BEGIN
 
   rs := (
     SELECT database_name, schema_name, table_name, refresh_path
-    FROM CADET.CONTROL.EXTERNAL_TABLE_REFRESH_LIST
+    FROM CADET.CONTROL.EXTERNAL_TABLE_REFRESH_LIST_DAILY
     WHERE is_enabled = TRUE
     ORDER BY database_name, schema_name, table_name
   );
 
-  FOR rec IN rs DO
-    IF rec.refresh_path IS NULL THEN
-      stmt := 'ALTER EXTERNAL TABLE "'||rec.database_name||'"."'||rec.schema_name||'"."'||rec.table_name||'" REFRESH';
+  FOR r IN rs DO
+    IF r.REFRESH_PATH IS NULL THEN
+      stmt := 'ALTER EXTERNAL TABLE "' || r.DATABASE_NAME || '"."' || r.SCHEMA_NAME || '"."' || r.TABLE_NAME || '" REFRESH';
     ELSE
-      stmt := 'ALTER EXTERNAL TABLE "'||rec.database_name||'"."'||rec.schema_name||'"."'||rec.table_name||'" REFRESH '''||rec.refresh_path||'''';
+      stmt := 'ALTER EXTERNAL TABLE "' || r.DATABASE_NAME || '"."' || r.SCHEMA_NAME || '"."' || r.TABLE_NAME || '" REFRESH ''' || r.REFRESH_PATH || '''';
     END IF;
 
     BEGIN
       EXECUTE IMMEDIATE :stmt;
 
-      results := ARRAY_APPEND(results, OBJECT_CONSTRUCT(
-        'table', rec.database_name||'.'||rec.schema_name||'.'||rec.table_name,
-        'status', 'success',
-        'path', rec.refresh_path
-      ));
+      results := ARRAY_APPEND(
+        results,
+        OBJECT_CONSTRUCT(
+          'table', r.DATABASE_NAME || '.' || r.SCHEMA_NAME || '.' || r.TABLE_NAME,
+          'status', 'success',
+          'path', r.REFRESH_PATH
+        )
+      );
     EXCEPTION
       WHEN OTHER THEN
-        results := ARRAY_APPEND(results, OBJECT_CONSTRUCT(
-          'table', rec.database_name||'.'||rec.schema_name||'.'||rec.table_name,
-          'status', 'failed',
-          'path', rec.refresh_path,
-          'error', SQLERRM
-        ));
+        results := ARRAY_APPEND(
+          results,
+          OBJECT_CONSTRUCT(
+            'table', r.DATABASE_NAME || '.' || r.SCHEMA_NAME || '.' || r.TABLE_NAME,
+            'status', 'failed',
+            'path', r.REFRESH_PATH,
+            'error', SQLERRM
+          )
+        );
     END;
   END FOR;
 
@@ -91,6 +96,6 @@ CREATE OR REPLACE TASK CADET.CONTROL.REFRESH_EXTERNAL_TABLES_TASK
   SCHEDULE = '15 MINUTE'
 AS
   CALL CADET.CONTROL.REFRESH_LISTED_EXTERNAL_TABLES();
-  
+
 
 ALTER TASK CADET.CONTROL.REFRESH_EXTERNAL_TABLES_TASK RESUME;

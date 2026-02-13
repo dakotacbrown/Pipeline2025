@@ -38,21 +38,19 @@ CREATE OR REPLACE PROCEDURE CADET.CONTROL.REFRESH_LISTED_EXTERNAL_TABLES_DAILY()
 AS
 $$
 DECLARE
-  rs RESULTSET;
   results ARRAY;
   stmt STRING;
 BEGIN
   results := ARRAY_CONSTRUCT();
 
-  rs := (
+  FOR r IN (
     SELECT database_name, schema_name, table_name, refresh_path
     FROM CADET.CONTROL.EXTERNAL_TABLE_REFRESH_LIST_DAILY
     WHERE is_enabled = TRUE
     ORDER BY database_name, schema_name, table_name
-  );
+  ) DO
 
-  FOR r IN rs DO
-    IF r.REFRESH_PATH IS NULL THEN
+    IF (r.REFRESH_PATH IS NULL) THEN
       stmt := 'ALTER EXTERNAL TABLE "' || r.DATABASE_NAME || '"."' || r.SCHEMA_NAME || '"."' || r.TABLE_NAME || '" REFRESH';
     ELSE
       stmt := 'ALTER EXTERNAL TABLE "' || r.DATABASE_NAME || '"."' || r.SCHEMA_NAME || '"."' || r.TABLE_NAME || '" REFRESH ''' || r.REFRESH_PATH || '''';
@@ -81,6 +79,7 @@ BEGIN
           )
         );
     END;
+
   END FOR;
 
   RETURN OBJECT_CONSTRUCT(
@@ -89,6 +88,51 @@ BEGIN
   );
 END;
 $$;
+
+
+
+CREATE OR REPLACE PROCEDURE CADET.CONTROL.REFRESH_LISTED_EXTERNAL_TABLES_DAILY_JS()
+  RETURNS VARIANT
+  LANGUAGE JAVASCRIPT
+  EXECUTE AS OWNER
+AS
+$$
+var results = [];
+
+var q = `
+  SELECT database_name, schema_name, table_name, refresh_path
+  FROM CADET.CONTROL.EXTERNAL_TABLE_REFRESH_LIST_DAILY
+  WHERE is_enabled = TRUE
+  ORDER BY database_name, schema_name, table_name
+`;
+
+var stmt = snowflake.createStatement({sqlText: q});
+var rs = stmt.execute();
+
+while (rs.next()) {
+  var db = rs.getColumnValue(1);
+  var sc = rs.getColumnValue(2);
+  var tb = rs.getColumnValue(3);
+  var path = rs.getColumnValue(4);
+
+  var refreshSql;
+  if (path === null) {
+    refreshSql = `ALTER EXTERNAL TABLE "${db}"."${sc}"."${tb}" REFRESH`;
+  } else {
+    refreshSql = `ALTER EXTERNAL TABLE "${db}"."${sc}"."${tb}" REFRESH '${path}'`;
+  }
+
+  try {
+    snowflake.createStatement({sqlText: refreshSql}).execute();
+    results.push({table: `${db}.${sc}.${tb}`, status: "success", path: path});
+  } catch (err) {
+    results.push({table: `${db}.${sc}.${tb}`, status: "failed", path: path, error: err.message});
+  }
+}
+
+return {refreshed_at: new Date().toISOString(), results: results};
+$$;
+
 
 
 CREATE OR REPLACE TASK CADET.CONTROL.REFRESH_EXTERNAL_TABLES_TASK

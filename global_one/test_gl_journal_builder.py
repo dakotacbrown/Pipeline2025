@@ -13,7 +13,7 @@ Covers:
   - filename convention
   - S3 boundary functions (find_dataset_prefix, read_jsonl_from_s3,
     read_jsonl_prefix_from_s3, read_table_by_dataset_id, upload_to_s3,
-    write_success_file, save_validation_parquet), all mocked
+    write_success_file, save_validation_file, build_partitioned_prefix), all mocked
   - run(): full orchestration with a mocked build_source_dataframe
   - main(): the Databricks entry point, with the three environment-only
     dependencies (asvc1scoredataservices_common, pyspark, helpers) faked
@@ -30,7 +30,7 @@ import pandas as pd
 import pytest
 
 import gl_journal_builder_pandas_s3 as gljb
-import gl_source_join as glsj
+import helpers.gl_source_join as glsj
 from gl_journal_builder_pandas_s3 import (
     fmt,
     build_line,
@@ -46,7 +46,8 @@ from gl_journal_builder_pandas_s3 import (
     read_table_by_dataset_id,
     upload_to_s3,
     write_success_file,
-    save_validation_parquet,
+    save_validation_file,
+    build_partitioned_prefix,
 )
 
 
@@ -390,30 +391,29 @@ class TestBuildFilename:
 # ---------------------------------------------------------------------------
 
 class TestFindDatasetPrefix:
-    def test_default_pattern(self):
+    def test_default_pattern_matches_confirmed_s3_structure(self):
+        # confirmed via S3 console browse: salesforce/reports/{dataset_id}/
         result = find_dataset_prefix("my-bucket", "abc-123")
-        assert result == "salesforce/abc-123/"
+        assert result == "salesforce/reports/abc-123/"
 
-    def test_with_base_prefix(self):
-        result = find_dataset_prefix("my-bucket", "abc-123", base_prefix="raw")
-        assert result == "raw/salesforce/abc-123/"
+    def test_custom_source_prefix(self):
+        # this is now the whole point — source_prefix is a single configurable
+        # value from the YAML's source_key_prefix parameter, not assembled
+        # here from separate vendor/segment guesses
+        result = find_dataset_prefix("my-bucket", "abc-123", source_prefix="other/path")
+        assert result == "other/path/abc-123/"
 
-    def test_base_prefix_with_leading_and_trailing_slashes_stripped(self):
-        result = find_dataset_prefix("my-bucket", "abc-123", base_prefix="/raw/")
-        assert result == "raw/salesforce/abc-123/"
-
-    def test_custom_vendor(self):
-        result = find_dataset_prefix("my-bucket", "abc-123", vendor="other_vendor")
-        assert result == "other_vendor/abc-123/"
-
-    def test_empty_base_prefix_omitted_from_path(self):
-        result = find_dataset_prefix("my-bucket", "abc-123", base_prefix="")
-        assert "//" not in result
-        assert result == "salesforce/abc-123/"
+    def test_source_prefix_with_leading_and_trailing_slashes_stripped(self):
+        result = find_dataset_prefix("my-bucket", "abc-123", source_prefix="/raw/salesforce/reports/")
+        assert result == "raw/salesforce/reports/abc-123/"
 
     def test_always_ends_with_trailing_slash(self):
-        result = find_dataset_prefix("my-bucket", "abc-123", base_prefix="raw", vendor="v")
+        result = find_dataset_prefix("my-bucket", "abc-123", source_prefix="anything")
         assert result.endswith("/")
+
+    def test_no_double_slash_when_source_prefix_already_has_trailing_slash(self):
+        result = find_dataset_prefix("my-bucket", "abc-123", source_prefix="salesforce/reports/")
+        assert "//" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -534,13 +534,13 @@ class TestReadTableByDatasetId:
     def test_builds_correct_prefix_and_reads(self):
         s3 = MagicMock()
         paginator = MagicMock()
-        paginator.paginate.return_value = [{"Contents": [{"Key": "salesforce/DSID1/data.jsonl"}]}]
+        paginator.paginate.return_value = [{"Contents": [{"Key": "salesforce/reports/DSID1/data.jsonl"}]}]
         s3.get_paginator.return_value = paginator
         s3.get_object.return_value = {"Body": BytesIO(b'{"Id": "X1"}\n')}
 
         df = read_table_by_dataset_id(s3, "bucket", "DSID1")
 
-        paginator.paginate.assert_called_once_with(Bucket="bucket", Prefix="salesforce/DSID1/")
+        paginator.paginate.assert_called_once_with(Bucket="bucket", Prefix="salesforce/reports/DSID1/")
         assert len(df) == 1
 
     def test_passes_through_expected_columns_on_empty_result(self):
@@ -592,24 +592,53 @@ class TestWriteSuccessFile:
 
 
 # ---------------------------------------------------------------------------
-# save_validation_parquet()
+# build_partitioned_prefix()
 # ---------------------------------------------------------------------------
 
-class TestSaveValidationParquet:
-    def test_key_follows_year_month_day_partition_pattern(self):
+class TestBuildPartitionedPrefix:
+    def test_includes_year_month_day_hour(self):
+        result = build_partitioned_prefix("outbound", datetime(2026, 8, 4, 14, 32, 30))
+        assert result == "outbound/year=2026/month=08/day=04/hour=14/"
+
+    def test_strips_trailing_slash_from_base_prefix(self):
+        result = build_partitioned_prefix("outbound/", datetime(2026, 1, 1, 5))
+        assert "//" not in result
+
+    def test_zero_pads_single_digit_hour(self):
+        result = build_partitioned_prefix("outbound", datetime(2026, 1, 1, 3))
+        assert "hour=03/" in result
+
+    def test_different_hours_produce_different_partitions(self):
+        result1 = build_partitioned_prefix("outbound", datetime(2026, 1, 1, 5))
+        result2 = build_partitioned_prefix("outbound", datetime(2026, 1, 1, 17))
+        assert "hour=05" in result1
+        assert "hour=17" in result2
+        assert result1 != result2
+
+    def test_always_ends_with_trailing_slash(self):
+        result = build_partitioned_prefix("outbound", datetime(2026, 1, 1))
+        assert result.endswith("/")
+
+
+# ---------------------------------------------------------------------------
+# save_validation_file()
+# ---------------------------------------------------------------------------
+
+class TestSaveValidationFile:
+    def test_key_follows_year_month_day_hour_partition_pattern(self):
         s3 = MagicMock()
         df = pd.DataFrame([{"a": 1}])
         dt = datetime(2026, 8, 4, 14, 32, 30)
-        url = save_validation_parquet(s3, df, "bucket", "validation", creation_dt=dt)
-        assert "year=2026/month=08/day=04/" in url
-        assert url.startswith("s3://bucket/validation/year=2026/month=08/day=04/general_ledger_")
+        url = save_validation_file(s3, df, "bucket", "validation", creation_dt=dt)
+        assert "year=2026/month=08/day=04/hour=14/" in url
+        assert url.startswith("s3://bucket/validation/year=2026/month=08/day=04/hour=14/general_ledger_")
         assert url.endswith(".parquet")
 
     def test_filename_uses_epoch_timestamp(self):
         s3 = MagicMock()
         df = pd.DataFrame([{"a": 1}])
         dt = datetime(2026, 1, 30, 14, 2, 30)
-        url = save_validation_parquet(s3, df, "bucket", "validation", creation_dt=dt)
+        url = save_validation_file(s3, df, "bucket", "validation", creation_dt=dt)
         expected_epoch = int(dt.timestamp())
         assert f"general_ledger_{expected_epoch}.parquet" in url
 
@@ -617,13 +646,13 @@ class TestSaveValidationParquet:
         s3 = MagicMock()
         df = pd.DataFrame([{"a": 1}])
         dt = datetime(2026, 1, 1)
-        url = save_validation_parquet(s3, df, "bucket", "validation/", creation_dt=dt)
+        url = save_validation_file(s3, df, "bucket", "validation/", creation_dt=dt)
         assert "//" not in url.replace("s3://", "")
 
-    def test_calls_put_object_with_parquet_bytes(self):
+    def test_calls_put_object_with_parquet_bytes_by_default(self):
         s3 = MagicMock()
         df = pd.DataFrame([{"a": 1, "b": "x"}])
-        save_validation_parquet(s3, df, "bucket", "validation", creation_dt=datetime(2026, 1, 1))
+        save_validation_file(s3, df, "bucket", "validation", creation_dt=datetime(2026, 1, 1))
         call_kwargs = s3.put_object.call_args.kwargs
         assert call_kwargs["Bucket"] == "bucket"
         assert isinstance(call_kwargs["Body"], bytes)
@@ -632,10 +661,40 @@ class TestSaveValidationParquet:
     def test_different_dates_produce_different_partitions(self):
         s3 = MagicMock()
         df = pd.DataFrame([{"a": 1}])
-        url1 = save_validation_parquet(s3, df, "bucket", "validation", creation_dt=datetime(2026, 1, 1))
-        url2 = save_validation_parquet(s3, df, "bucket", "validation", creation_dt=datetime(2026, 12, 25))
+        url1 = save_validation_file(s3, df, "bucket", "validation", creation_dt=datetime(2026, 1, 1))
+        url2 = save_validation_file(s3, df, "bucket", "validation", creation_dt=datetime(2026, 12, 25))
         assert "month=01/day=01" in url1
         assert "month=12/day=25" in url2
+
+    def test_csv_file_type_produces_csv_extension(self):
+        s3 = MagicMock()
+        df = pd.DataFrame([{"a": 1}])
+        url = save_validation_file(s3, df, "bucket", "validation", file_type="csv",
+                                    creation_dt=datetime(2026, 1, 1))
+        assert url.endswith(".csv")
+
+    def test_csv_file_type_writes_actual_csv_content(self):
+        s3 = MagicMock()
+        df = pd.DataFrame([{"a": 1, "b": "x"}])
+        save_validation_file(s3, df, "bucket", "validation", file_type="csv",
+                              creation_dt=datetime(2026, 1, 1))
+        body = s3.put_object.call_args.kwargs["Body"]
+        assert b"a,b" in body  # CSV header row
+        assert b"1,x" in body
+
+    def test_file_type_case_insensitive(self):
+        s3 = MagicMock()
+        df = pd.DataFrame([{"a": 1}])
+        url = save_validation_file(s3, df, "bucket", "validation", file_type="CSV",
+                                    creation_dt=datetime(2026, 1, 1))
+        assert url.endswith(".csv")
+
+    def test_invalid_file_type_raises(self):
+        s3 = MagicMock()
+        df = pd.DataFrame([{"a": 1}])
+        with pytest.raises(ValueError, match="Unsupported validation file_type"):
+            save_validation_file(s3, df, "bucket", "validation", file_type="excel",
+                                  creation_dt=datetime(2026, 1, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -714,8 +773,60 @@ class TestRunOrchestration:
         log = MagicMock()
 
         url, _ = gljb.run(log, s3, "bucket", "outbound", "BX1")
-        assert url.startswith("s3://bucket/outbound/BX1_")
+        # output path is now partitioned: outbound/year=/month=/day=/hour=/BX1_....txt
+        assert url.startswith("s3://bucket/outbound/year=")
+        assert "/BX1_" in url
         assert url.endswith(".txt")
+
+    def test_output_file_lands_in_partitioned_path(self, monkeypatch):
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
+        s3 = MagicMock()
+        log = MagicMock()
+
+        gljb.run(log, s3, "bucket", "outbound", "BX1")
+
+        keys_written = [call.kwargs["Key"] for call in s3.put_object.call_args_list]
+        data_file_keys = [k for k in keys_written if k.endswith(".txt")]
+        assert len(data_file_keys) == 1
+        assert "year=" in data_file_keys[0]
+        assert "month=" in data_file_keys[0]
+        assert "day=" in data_file_keys[0]
+        assert "hour=" in data_file_keys[0]
+
+    def test_success_marker_lands_in_same_partitioned_path_as_data_file(self, monkeypatch):
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
+        s3 = MagicMock()
+        log = MagicMock()
+
+        gljb.run(log, s3, "bucket", "outbound", "BX1")
+
+        keys_written = [call.kwargs["Key"] for call in s3.put_object.call_args_list]
+        data_file_key = next(k for k in keys_written if k.endswith(".txt"))
+        success_key = next(k for k in keys_written if k.endswith("_SUCCESS"))
+        # both should share the same partitioned folder
+        assert data_file_key.rsplit("/", 1)[0] == success_key.rsplit("/", 1)[0]
+
+    def test_validation_file_type_passed_through(self, monkeypatch):
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
+        s3 = MagicMock()
+        log = MagicMock()
+
+        gljb.run(log, s3, "bucket", "outbound", "BX1",
+                 validation_key_prefix="validation", validation_file_type="csv")
+
+        keys_written = [call.kwargs["Key"] for call in s3.put_object.call_args_list]
+        assert any(k.endswith(".csv") for k in keys_written)
+        assert not any(k.endswith(".parquet") for k in keys_written)
+
+    def test_validation_file_defaults_to_parquet(self, monkeypatch):
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
+        s3 = MagicMock()
+        log = MagicMock()
+
+        gljb.run(log, s3, "bucket", "outbound", "BX1", validation_key_prefix="validation")
+
+        keys_written = [call.kwargs["Key"] for call in s3.put_object.call_args_list]
+        assert any(k.endswith(".parquet") for k in keys_written)
 
     def test_logs_progress_through_run(self, monkeypatch):
         monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
@@ -830,6 +941,8 @@ VALID_ARGV = [
     "gl-interface/outbound",       # output_key_prefix
     "gl-interface/validation",     # validation_key_prefix
     "BX1",                 # filename_prefix
+    "salesforce/reports",  # source_key_prefix
+    "parquet",              # validation_file_type
 ]
 
 
@@ -853,7 +966,8 @@ class TestMainSuccessPath:
         assert result["status_code"] == 200
         assert result["num_records"] == 1
         assert result["message"] == "SUCCESS"
-        assert result["s3_url"].startswith("s3://my-bucket/gl-interface/outbound/BX1_")
+        assert result["s3_url"].startswith("s3://my-bucket/gl-interface/outbound/year=")
+        assert "/BX1_" in result["s3_url"]
 
     def test_calls_new_session_with_service_credential(self, monkeypatch):
         monkeypatch.setattr(sys, "argv", VALID_ARGV)

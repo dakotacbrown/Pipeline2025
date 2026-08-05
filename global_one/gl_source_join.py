@@ -3,9 +3,28 @@ Source-side join: builds the flat dataframe that feeds into the GL journal
 file builder. Pulls TransactionJournal + related billing objects (as JSONL
 landed in S3 by api_ingester) and resolves:
 
-  1. bu / did  via TransactionJournal -> UsageResource -> RateCardEntry -> Product2
-  2. Account Name via TransactionJournal -> (Invoice | CreditMemo | Payment | Refund)
-     -> Account, resolved through ReferenceTransactionRecordId
+  1. bu / did via TransactionJournal's TransactionType-specific path:
+       InvoiceLine     -> InvoiceLine's own fields directly
+       InvoiceLineTax  -> InvoiceLine (one hop via InvoiceLineId)
+       Payment         -> PaymentLineInvoiceLine (line-level, currently
+                           0 rows) or PaymentLineInvoice -> Invoice ->
+                           InvoiceLine (header-level fallback, what
+                           actually resolves data today)
+       CreditMemo      -> CreditMemoLine -> CreditMemoLineInvoiceLine
+                           (line-level, currently 0 rows) or
+                           CreditMemoInvApplication -> Invoice ->
+                           InvoiceLine (header-level fallback, what
+                           actually resolves data today)
+     NOTE: an earlier design routed this through
+     TransactionJournal -> UsageResource -> RateCardEntry -> Product2, but
+     that was abandoned — UsageResourceId/Product2Id were confirmed to
+     always point to the same product regardless of transaction, a dead
+     end for differentiating bu/did. UsageResource/RateCardEntry/Product2
+     are not used anywhere in the current resolution and don't need to be
+     pulled from S3 for this job.
+  2. Account Name via TransactionJournal -> (Invoice | CreditMemo | Payment
+     | Refund | InvoiceLine | InvoiceLineTax) -> Account, resolved through
+     the polymorphic ReferenceTransactionRecordId
 
 NOTE: TransactionJournal.AccountId exists on the object but is NOT populated
 in practice — confirmed. The polymorphic ReferenceTransactionRecordId path
@@ -17,12 +36,17 @@ schemas (not placeholders).
 
 import re
 import pandas as pd
-from gl_journal_builder_pandas_s3 import read_table_by_dataset_id  # dataset_id-based S3 reader
+from helpers.s3_utils import read_table_by_dataset_id  # dataset_id-based S3 reader
 
 
 # ---------------------------------------------------------------------------
 # 0. Dataset IDs, pulled from the salesforce_global_one.yml for_each_task inputs.
-#    Update this if the job config changes.
+#    Update this if the job config changes. Only tables actually loaded by
+#    build_source_dataframe() are listed here — usage_resource,
+#    rate_card_entry, product2, and credit_memo_line_tax were removed since
+#    none of them are used in the current bu/did or account-name resolution
+#    (see module docstring above for why UsageResource/RateCardEntry/Product2
+#    specifically were dropped).
 # ---------------------------------------------------------------------------
 
 DATASET_IDS = {
@@ -31,18 +55,14 @@ DATASET_IDS = {
     "credit_memo_inv_application": "beac368e-b5e0-418f-9643-63c7ae746711",
     "credit_memo_line": "3ddfc4de-6efe-4994-b104-a2ccd929754c",
     "credit_memo_line_invoice_line": "0134e58d-be02-4f45-9a77-4f91ccad31fd",
-    "credit_memo_line_tax": "1fbd49b9-7417-484c-acd8-8abf7208b670",
     "invoice": "89ff4754-a708-4399-9be8-2e5acc1310c9",
     "invoice_line": "54ac4870-eeec-4fe5-b27a-1a1bde0a3ad2",
     "invoice_line_tax": "cd087f0b-57f4-4c15-9e35-fa228dbed0b9",
     "payment": "cfeab860-7d21-4dac-a6ee-a808aab35ba8",
     "payment_line_invoice": "684a8f4f-21cb-4261-a9d1-69ca6b6c66e9",
     "payment_line_invoice_line": "ee3ff156-133d-4165-9a00-f752b1fc32a4",
-    "product2": "29351664-7f3c-4266-8937-018cc5a7dd44",
-    "rate_card_entry": "dcd02b50-e462-4ece-8f7c-f8446482be37",
     "refund": "2e0bb7aa-a383-47a3-8d46-205739c680d0",
     "transaction_journal": "ffa0bf8e-1c98-49c4-9935-fb6e88efae8f",
-    "usage_resource": "432dfb1b-ea23-44e8-9bfd-9aa84d9e1993",
 }
 
 # Expected columns per table — used so an empty/never-populated table (e.g.
@@ -69,7 +89,7 @@ EXPECTED_COLUMNS = {
 
 
 # ---------------------------------------------------------------------------
-# 1. bu / did via UsageResource -> RateCardEntry -> Product2
+# 1. bu / did resolution — see module docstring for the per-TransactionType path
 # ---------------------------------------------------------------------------
 
 def resolve_bu_did(tj: pd.DataFrame, invoice_line: pd.DataFrame,
@@ -315,7 +335,7 @@ def resolve_amount(tj: pd.DataFrame) -> pd.Series:
 # 4. Orchestrate: build the final flat frame that feeds build_gl_file()
 # ---------------------------------------------------------------------------
 
-def build_source_dataframe(s3_client, bucket: str, base_prefix: str = "", vendor: str = "salesforce",
+def build_source_dataframe(s3_client, bucket: str, source_prefix: str = "salesforce/reports",
                             log=None) -> pd.DataFrame:
     """
     Reads every source table by its dataset_id (see DATASET_IDS above) rather
@@ -328,6 +348,11 @@ def build_source_dataframe(s3_client, bucket: str, base_prefix: str = "", vendor
     gl_journal_builder_pandas_s3.py for how this gets built via
     new_session(service_credential)).
 
+    source_prefix: the S3 prefix each dataset_id folder sits under (e.g.
+    "salesforce/reports") — comes from the DAB job YAML's source_key_prefix
+    parameter, not hardcoded here, specifically so a future path change is
+    a config edit rather than another code guess.
+
     log: optional Logger — if provided, logs progress through table reads and
     each join step. Omit for quiet/test usage.
     """
@@ -337,7 +362,7 @@ def build_source_dataframe(s3_client, bucket: str, base_prefix: str = "", vendor
         df = read_table_by_dataset_id(
             s3_client, bucket, DATASET_IDS[table_key],
             expected_columns=EXPECTED_COLUMNS.get(table_key),
-            base_prefix=base_prefix, vendor=vendor,
+            source_prefix=source_prefix,
         )
         if log:
             log.info(f"reading {table_key}...complete ({len(df)} rows)")
@@ -400,5 +425,5 @@ if __name__ == "__main__":
     # gl_journal_builder_pandas_s3.py's __main__ for the real pattern).
     import boto3
     df = build_source_dataframe(boto3.client("s3"), "your-ingester-bucket",
-                                 base_prefix="raw", vendor="salesforce")
+                                 source_prefix="salesforce/reports")
     print(df.head())

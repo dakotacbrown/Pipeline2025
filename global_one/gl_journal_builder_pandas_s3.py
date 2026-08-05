@@ -4,77 +4,31 @@ GL Journal Entry Interface — pandas version.
 Reads JSONL source files from S3 (as landed by api_ingester), joins them,
 formats fixed-width rows, and uploads the assembled file back to S3.
 
-S3 access uses an injected s3_client rather than a bare boto3.client("s3")
-call — on Databricks this needs to come from new_session(service_credential)
-(see helpers.helper_functions in salesforce_ofac.py), which vends AWS
-credentials via set_ingester_aws_credentials(). A bare boto3.client("s3")
-would use the default credential chain, which won't have the right
-permissions on a job cluster.
+S3 I/O functions (read_jsonl_from_s3, upload_to_s3, etc.) now live in
+s3_utils.py, imported below and re-exported here — see that module's
+docstring for why this got split out (it removes a fragile near-circular
+dependency that used to exist between this file and gl_source_join.py).
 """
 
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
-import io
 import pandas as pd
 
-
-# ---------------------------------------------------------------------------
-# 1. Read JSONL from S3 into pandas
-# ---------------------------------------------------------------------------
-
-def read_jsonl_from_s3(s3_client, bucket: str, key: str) -> pd.DataFrame:
-    obj = s3_client.get_object(Bucket=bucket, Key=key)
-    body = obj["Body"].read().decode("utf-8")
-    return pd.read_json(io.StringIO(body), lines=True)
-
-
-def read_jsonl_prefix_from_s3(s3_client, bucket: str, prefix: str, expected_columns: list = None) -> pd.DataFrame:
-    """
-    Read + concat every JSONL object under a prefix (handles multi-part
-    ingester output). If the prefix has no objects — which is expected for
-    some tables (e.g. Refund, PaymentLineInvoiceLine currently have 0 rows) —
-    returns an empty dataframe with expected_columns instead of raising, so
-    downstream joins don't break on legitimately-empty source tables.
-    """
-    paginator = s3_client.get_paginator("list_objects_v2")
-    frames = []
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith(".jsonl") or key.endswith(".json"):
-                frames.append(read_jsonl_from_s3(s3_client, bucket, key))
-    if not frames:
-        return pd.DataFrame(columns=expected_columns or [])
-    return pd.concat(frames, ignore_index=True)
-
-
-def find_dataset_prefix(bucket: str, dataset_id: str, base_prefix: str = "",
-                         vendor: str = "salesforce") -> str:
-    """
-    Builds the S3 prefix for a table by its dataset_id rather than table
-    name, since that's what the ingester keys output by (per the DAB job's
-    for_each_task inputs: {"table": ..., "dataset_id": ...}).
-
-    ASSUMPTION — the exact key pattern api_ingester.py writes to hasn't been
-    confirmed here. This defaults to:
-        {base_prefix}/{vendor}/{dataset_id}/
-    Swap this to match api_ingester.py's actual output path convention
-    (check the script or browse a known-populated dataset_id folder in S3,
-    e.g. the UsageResource one with 3 rows, to confirm the real pattern).
-    """
-    parts = [p for p in [base_prefix.strip("/"), vendor, dataset_id] if p]
-    return "/".join(parts) + "/"
-
-
-def read_table_by_dataset_id(s3_client, bucket: str, dataset_id: str, expected_columns: list = None,
-                              base_prefix: str = "", vendor: str = "salesforce") -> pd.DataFrame:
-    """Convenience wrapper: locate + read a table's JSONL by its dataset_id."""
-    prefix = find_dataset_prefix(bucket, dataset_id, base_prefix, vendor)
-    return read_jsonl_prefix_from_s3(s3_client, bucket, prefix, expected_columns=expected_columns)
+from helpers.s3_utils import (
+    read_jsonl_from_s3,
+    read_jsonl_prefix_from_s3,
+    find_dataset_prefix,
+    read_table_by_dataset_id,
+    upload_to_s3,
+    write_success_file,
+    save_validation_file,
+    build_partitioned_prefix,
+)
+import helpers.gl_source_join as gl_source_join
 
 
 # ---------------------------------------------------------------------------
-# 2. Fixed-width formatting helpers
+# 3. Fixed-width formatting helpers
 # ---------------------------------------------------------------------------
 
 def fmt(value, length, justify="left", fill=" "):
@@ -162,7 +116,7 @@ def file_trailer(row_count, total_debits, total_credits, total_stat=0):
 
 
 # ---------------------------------------------------------------------------
-# 3. Assemble full file from the joined dataframe
+# 4. Assemble full file from the joined dataframe
 # ---------------------------------------------------------------------------
 
 def build_gl_file(df: pd.DataFrame, business_unit: str = None, source: str = "",
@@ -233,7 +187,7 @@ def build_gl_file(df: pd.DataFrame, business_unit: str = None, source: str = "",
 
 
 # ---------------------------------------------------------------------------
-# 4. Filename + upload
+# 5. Filename + upload
 # ---------------------------------------------------------------------------
 
 def build_filename(prefix: str, creation_dt: datetime) -> str:
@@ -242,55 +196,14 @@ def build_filename(prefix: str, creation_dt: datetime) -> str:
     return f"{prefix}_{creation_dt.strftime('%Y%m%d%H%M%S')}.txt"
 
 
-def upload_to_s3(s3_client, content: str, bucket: str, key_prefix: str, filename: str):
-    key = f"{key_prefix.rstrip('/')}/{filename}"
-    s3_client.put_object(Bucket=bucket, Key=key, Body=content.encode("utf-8"))
-    return f"s3://{bucket}/{key}"
-
-
-def write_success_file(s3_client, bucket: str, key_prefix: str):
-    key = f"{key_prefix.rstrip('/')}/_SUCCESS"
-    s3_client.put_object(Bucket=bucket, Key=key, Body=b"")
-    return f"s3://{bucket}/{key}"
-
-
-def save_validation_parquet(s3_client, df: pd.DataFrame, bucket: str, base_prefix: str,
-                             creation_dt: datetime = None) -> str:
-    """
-    Saves the combined/joined dataframe to S3 as parquet, before it gets
-    formatted into the fixed-width text file — gives you something to
-    validate the join/business logic against independently of the file
-    layout itself.
-
-    Path pattern matches the year=/month=/day=/ partition style, with an
-    epoch-timestamp filename (e.g. general_ledger_1767243625.parquet).
-    """
-    creation_dt = creation_dt or datetime.now()
-    epoch_ts = int(creation_dt.timestamp())
-
-    key = (
-        f"{base_prefix.rstrip('/')}/"
-        f"year={creation_dt.strftime('%Y')}/"
-        f"month={creation_dt.strftime('%m')}/"
-        f"day={creation_dt.strftime('%d')}/"
-        f"general_ledger_{epoch_ts}.parquet"
-    )
-
-    buffer = io.BytesIO()
-    df.to_parquet(buffer, engine="pyarrow", index=False)
-    buffer.seek(0)
-
-    s3_client.put_object(Bucket=bucket, Key=key, Body=buffer.getvalue())
-    return f"s3://{bucket}/{key}"
-
-
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
 def run(log, s3_client, bucket, output_key_prefix, filename_prefix,
         business_unit=None, source="CS1",
-        validation_key_prefix=None, vendor="salesforce", source_base_prefix=""):
+        validation_key_prefix=None, validation_file_type="parquet",
+        source_prefix="salesforce/reports"):
     """
     s3_client must come from an authenticated session (e.g.
     new_session(service_credential).client("s3") — see helpers.helper_functions,
@@ -298,7 +211,21 @@ def run(log, s3_client, bucket, output_key_prefix, filename_prefix,
 
     bucket is used for both reading source Salesforce datasets (by dataset_id,
     see gl_source_join.DATASET_IDS) and writing the output file + validation
-    parquet.
+    file.
+
+    source_prefix: the S3 prefix each dataset_id folder sits under (e.g.
+    "salesforce/reports"). Comes from the YAML job's source_key_prefix
+    parameter — kept as a config value rather than assembled from separate
+    vendor/segment guesses in code, since a wrong guess here fails silently
+    (an empty-but-valid prefix just returns 0 rows) rather than erroring.
+
+    validation_file_type: "parquet" (default) or "csv" — comes from the
+    YAML job's validation_file_type parameter.
+
+    Both the main GL output file and the validation file land under the
+    same year=/month=/day=/hour=/ partition (computed once from this run's
+    creation_dt), so a given run's outputs are easy to find together and to
+    correlate.
 
     business_unit: if None (default), the file covers ALL business units —
     build_source_dataframe pulls TransactionJournal broadly and build_gl_file
@@ -306,12 +233,10 @@ def run(log, s3_client, bucket, output_key_prefix, filename_prefix,
     blocks per BU in one file). Pass a specific value to filter to just that
     BU instead. Still needs a decision — see note in Dakota's chat.
     """
-    from gl_source_join import build_source_dataframe
-
     creation_dt = datetime.now()
 
     log.info("building source dataframe...")
-    df = build_source_dataframe(s3_client, bucket, base_prefix=source_base_prefix, vendor=vendor, log=log)
+    df = gl_source_join.build_source_dataframe(s3_client, bucket, source_prefix=source_prefix, log=log)
     log.info(f"building source dataframe...complete ({len(df)} rows)")
 
     if business_unit is not None:
@@ -320,9 +245,10 @@ def run(log, s3_client, bucket, output_key_prefix, filename_prefix,
         log.info(f"filtering to business_unit={business_unit}...complete ({len(df)} rows)")
 
     if validation_key_prefix:
-        log.info("saving validation parquet...")
-        parquet_url = save_validation_parquet(s3_client, df, bucket, validation_key_prefix, creation_dt)
-        log.info(f"saving validation parquet...complete ({parquet_url})")
+        log.info(f"saving validation file ({validation_file_type})...")
+        validation_url = save_validation_file(s3_client, df, bucket, validation_key_prefix,
+                                               file_type=validation_file_type, creation_dt=creation_dt)
+        log.info(f"saving validation file...complete ({validation_url})")
 
     log.info("building GL journal file...")
     content = build_gl_file(df, business_unit=business_unit, source=source, creation_dt=creation_dt)
@@ -330,8 +256,9 @@ def run(log, s3_client, bucket, output_key_prefix, filename_prefix,
     log.info(f"building GL journal file...complete ({filename})")
 
     log.info("uploading GL journal file to s3...")
-    url = upload_to_s3(s3_client, content, bucket, output_key_prefix, filename)
-    write_success_file(s3_client, bucket, output_key_prefix)
+    partitioned_output_prefix = build_partitioned_prefix(output_key_prefix, creation_dt)
+    url = upload_to_s3(s3_client, content, bucket, partitioned_output_prefix, filename)
+    write_success_file(s3_client, bucket, partitioned_output_prefix)
     log.info(f"uploading GL journal file to s3...complete ({url})")
 
     return url, len(df)
@@ -349,10 +276,11 @@ def main():
 
     logger = setup_logger()
 
-    if len(sys.argv) < 8:
+    if len(sys.argv) < 10:
         raise ValueError(
             "Usage: script.py <env> <chamber_role> <service_credential> <bucket> "
-            "<output_key_prefix> <validation_key_prefix> <filename_prefix>"  # noqa
+            "<output_key_prefix> <validation_key_prefix> <filename_prefix> "
+            "<source_key_prefix> <validation_file_type>"  # noqa
         )
 
     args = sys.argv[1:]
@@ -363,6 +291,8 @@ def main():
     output_key_prefix = args[4]
     validation_key_prefix = args[5]
     filename_prefix = args[6]
+    source_key_prefix = args[7]
+    validation_file_type = args[8]
 
     # NOTE: chamber_role isn't used yet — it's only needed if this script
     # ever calls read_secret_from_chamber() directly for its own secrets.
@@ -382,14 +312,26 @@ def main():
 
         logger.info("retrieving aws credentials...")
         aws_session = new_session(service_credential)
-        s3_client = aws_session.client("s3")
+        # Explicit timeouts so a network/NCC connectivity problem fails fast
+        # with a clear error instead of hanging indefinitely — bare
+        # boto3 clients have no default timeout, so a stuck connection
+        # (e.g. DNS/routing issue reaching S3 from this compute) just hangs
+        # forever with no error, which is much harder to diagnose than a
+        # clean ConnectTimeoutError.
+        from botocore.config import Config
+        s3_client = aws_session.client(
+            "s3",
+            config=Config(connect_timeout=10, read_timeout=30, retries={"max_attempts": 3}),
+        )
         logger.info("retrieving aws credentials...complete")
 
         url, record_count = run(
             logger, s3_client, bucket,
             output_key_prefix=output_key_prefix,
             validation_key_prefix=validation_key_prefix,
+            validation_file_type=validation_file_type,
             filename_prefix=filename_prefix,
+            source_prefix=source_key_prefix,
         )
 
         logger.info("running gl journal builder...complete")

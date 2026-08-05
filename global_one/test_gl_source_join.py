@@ -21,8 +21,8 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-import gl_source_join as glsj
-from gl_source_join import (
+import helpers.gl_source_join as glsj
+from helpers.gl_source_join import (
     resolve_bu_did,
     build_reference_to_account_lookup,
     clean_account_name,
@@ -495,7 +495,7 @@ class TestBuildSourceDataframeOrchestration:
         Missing keys return an empty DataFrame with EXPECTED_COLUMNS shape.
         """
         def fake_read_table(s3_client, bucket, dataset_id, expected_columns=None,
-                             base_prefix="", vendor="salesforce"):
+                             source_prefix="salesforce/reports"):
             # Reverse-lookup the table_key from dataset_id so the fake doesn't
             # need to duplicate DATASET_IDS itself.
             table_key = next(k for k, v in DATASET_IDS.items() if v == dataset_id)
@@ -712,18 +712,16 @@ class TestBuildSourceDataframeOrchestration:
         result = build_source_dataframe(MagicMock(), "bucket", log=None)
         assert len(result) == 1
 
-    def test_passes_through_base_prefix_and_vendor(self, monkeypatch):
+    def test_passes_through_source_prefix(self, monkeypatch):
         captured_args = {}
 
         def fake_read_table(s3_client, bucket, dataset_id, expected_columns=None,
-                             base_prefix="", vendor="salesforce"):
-            captured_args["base_prefix"] = base_prefix
-            captured_args["vendor"] = vendor
+                             source_prefix="salesforce/reports"):
+            captured_args["source_prefix"] = source_prefix
             return pd.DataFrame(columns=expected_columns or [])
 
         monkeypatch.setattr(glsj, "read_table_by_dataset_id", fake_read_table)
 
-        build_source_dataframe(MagicMock(), "bucket", base_prefix="raw", vendor="custom_vendor")
+        build_source_dataframe(MagicMock(), "bucket", source_prefix="custom/reports/path")
 
-        assert captured_args["base_prefix"] == "raw"
-        assert captured_args["vendor"] == "custom_vendor"
+        assert captured_args["source_prefix"] == "custom/reports/path"

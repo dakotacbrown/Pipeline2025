@@ -784,7 +784,29 @@ def install_fake_databricks_deps(monkeypatch, logger_mock=None, new_session_mock
     monkeypatch.setattr("helpers.helper_functions.new_session", new_session_mock)
 
     from pyspark.sql import SparkSession
-    monkeypatch.setattr(SparkSession.builder, "getOrCreate", lambda: spark_session_mock)
+    # SparkSession.builder returns a NEW Builder instance on every access —
+    # confirmed: SparkSession.builder is not SparkSession.builder. Patching
+    # getOrCreate on one instance (the old approach) only affected that one
+    # temporary object; main()'s later SparkSession.builder.getOrCreate()
+    # call gets a fresh instance without the patch and hits the real Spark
+    # Connect code. Patch the method on the Builder CLASS instead, so every
+    # instance (including ones created after this patch) picks it up.
+    monkeypatch.setattr(SparkSession.Builder, "getOrCreate", lambda self: spark_session_mock)
+
+    # Defensive fallback: if main() (or the real production script it's
+    # eventually merged into) imports setup_logger/new_session/
+    # write_execution_log_to_s3 at module top level rather than deferred
+    # inside main(), the dotted-path patches above won't reach those
+    # already-bound local copies (same "from X import Y copies a reference"
+    # issue as elsewhere). Patch the module-level aliases on gljb too, if
+    # present, as a belt-and-suspenders measure. No-ops harmlessly if this
+    # file's own deferred-import pattern is what's actually running.
+    if hasattr(gljb, "setup_logger"):
+        monkeypatch.setattr(gljb, "setup_logger", setup_logger_mock)
+    if hasattr(gljb, "new_session"):
+        monkeypatch.setattr(gljb, "new_session", new_session_mock)
+    if hasattr(gljb, "write_execution_log_to_s3"):
+        monkeypatch.setattr(gljb, "write_execution_log_to_s3", write_execution_log_mock)
 
     return {
         "logger": logger_mock,

@@ -21,7 +21,6 @@ Covers:
 """
 
 import sys
-import types
 from datetime import datetime
 from decimal import Decimal
 from io import BytesIO
@@ -747,74 +746,57 @@ class TestRunOrchestration:
 #
 # main() does deferred imports of three packages that only exist inside the
 # actual Databricks environment: asvc1scoredataservices_common, pyspark, and
-# helpers.helper_functions. Since those imports happen at call-time (inside
-# the function body, not at module load), we can inject fake versions into
-# sys.modules before calling main() and they'll be picked up instead of
-# raising ImportError. This tests main()'s actual control flow (success
-# path, argument validation, error wrapping, execution-log-on-both-paths)
-# without needing a real cluster.
+# helpers.helper_functions. In a real repo these ARE genuinely installed, so
+# faking whole modules via sys.modules is fragile — if anything else in test
+# collection (a conftest.py fixture, another test module) imports the real
+# package first, that sys.modules-injection approach can lose the race and
+# main() ends up calling the real functions (e.g. a real SparkSession trying
+# to open a real Spark Connect session, which fails outside a cluster).
+#
+# Instead, patch the specific functions directly on the real installed
+# packages using monkeypatch.setattr's dotted-string form. This works
+# regardless of import timing/ordering, since it patches the actual
+# attribute on the actual module object main() will look up at call time.
 
-def install_fake_databricks_modules(monkeypatch, logger_mock=None, new_session_mock=None,
-                                     write_execution_log_mock=None, spark_session_mock=None):
+def install_fake_databricks_deps(monkeypatch, logger_mock=None, new_session_mock=None,
+                                  write_execution_log_mock=None, spark_session_mock=None):
     """
-    Registers fake asvc1scoredataservices_common / pyspark / helpers packages
-    into sys.modules for the duration of a test. monkeypatch.setitem cleans
-    these up automatically at teardown (removing keys that didn't exist
-    before, restoring ones that did).
+    Patches setup_logger / write_execution_log_to_s3 / new_session /
+    SparkSession.builder.getOrCreate directly on the real (installed)
+    packages. Requires asvc1scoredataservices_common, pyspark, and
+    helpers.helper_functions to actually be importable in the environment
+    running these tests — true in the real repo. monkeypatch.setattr
+    reverts all of this automatically at test teardown.
     """
     logger_mock = logger_mock or MagicMock()
     new_session_mock = new_session_mock or MagicMock()
     write_execution_log_mock = write_execution_log_mock or MagicMock()
     spark_session_mock = spark_session_mock or MagicMock()
 
-    # asvc1scoredataservices_common.logger.basic_logger / .logger
-    basic_logger_mod = types.ModuleType("asvc1scoredataservices_common.logger.basic_logger")
-    basic_logger_mod.setup_logger = MagicMock(return_value=logger_mock)
+    setup_logger_mock = MagicMock(return_value=logger_mock)
 
-    logger_logger_mod = types.ModuleType("asvc1scoredataservices_common.logger.logger")
-    logger_logger_mod.write_execution_log_to_s3 = write_execution_log_mock
+    monkeypatch.setattr(
+        "asvc1scoredataservices_common.logger.basic_logger.setup_logger", setup_logger_mock
+    )
+    monkeypatch.setattr(
+        "asvc1scoredataservices_common.logger.logger.write_execution_log_to_s3", write_execution_log_mock
+    )
+    monkeypatch.setattr("helpers.helper_functions.new_session", new_session_mock)
 
-    logger_pkg = types.ModuleType("asvc1scoredataservices_common.logger")
-    logger_pkg.basic_logger = basic_logger_mod
-    logger_pkg.logger = logger_logger_mod
-
-    top_pkg = types.ModuleType("asvc1scoredataservices_common")
-    top_pkg.logger = logger_pkg
-
-    monkeypatch.setitem(sys.modules, "asvc1scoredataservices_common", top_pkg)
-    monkeypatch.setitem(sys.modules, "asvc1scoredataservices_common.logger", logger_pkg)
-    monkeypatch.setitem(sys.modules, "asvc1scoredataservices_common.logger.basic_logger", basic_logger_mod)
-    monkeypatch.setitem(sys.modules, "asvc1scoredataservices_common.logger.logger", logger_logger_mod)
-
-    # pyspark.sql.SparkSession
-    sql_mod = types.ModuleType("pyspark.sql")
-    fake_spark_session_class = MagicMock()
-    fake_spark_session_class.builder.getOrCreate.return_value = spark_session_mock
-    sql_mod.SparkSession = fake_spark_session_class
-
-    pyspark_pkg = types.ModuleType("pyspark")
-    pyspark_pkg.sql = sql_mod
-
-    monkeypatch.setitem(sys.modules, "pyspark", pyspark_pkg)
-    monkeypatch.setitem(sys.modules, "pyspark.sql", sql_mod)
-
-    # helpers.helper_functions.new_session
-    helper_functions_mod = types.ModuleType("helpers.helper_functions")
-    helper_functions_mod.new_session = new_session_mock
-
-    helpers_pkg = types.ModuleType("helpers")
-    helpers_pkg.helper_functions = helper_functions_mod
-
-    monkeypatch.setitem(sys.modules, "helpers", helpers_pkg)
-    monkeypatch.setitem(sys.modules, "helpers.helper_functions", helper_functions_mod)
+    from pyspark.sql import SparkSession
+    monkeypatch.setattr(SparkSession.builder, "getOrCreate", lambda: spark_session_mock)
 
     return {
         "logger": logger_mock,
-        "setup_logger": basic_logger_mod.setup_logger,
+        "setup_logger": setup_logger_mock,
         "new_session": new_session_mock,
         "write_execution_log_to_s3": write_execution_log_mock,
         "spark_session": spark_session_mock,
     }
+
+
+# Kept as an alias so any external references to the old name still work.
+install_fake_databricks_modules = install_fake_databricks_deps
 
 
 VALID_ARGV = [

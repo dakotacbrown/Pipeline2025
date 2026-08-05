@@ -29,9 +29,17 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-import gl_journal_builder_pandas_s3 as gljb
+import src.salesforce.resources.scripts.salesforce_global_one as gljb
+# Bare (short) form here on purpose — NOT src.salesforce.resources.scripts.helpers.
+# salesforce_global_one.py's own internals do `import helpers.gl_source_join`
+# (the short form, since that's what actually resolves when Databricks runs
+# the script directly — see helpers/gl_source_join.py's docstring). For
+# monkeypatch.setattr(glsj, "build_source_dataframe", ...) to actually
+# intercept what gljb.run() calls, this has to be the SAME module object
+# gljb resolves internally — the long src.-qualified form would be a
+# different module object, and patching it would silently do nothing.
 import helpers.gl_source_join as glsj
-from gl_journal_builder_pandas_s3 import (
+from src.salesforce.resources.scripts.salesforce_global_one import (
     fmt,
     build_line,
     file_header,

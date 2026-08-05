@@ -21,8 +21,8 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-import helpers.gl_source_join as glsj
-from helpers.gl_source_join import (
+import src.salesforce.resources.scripts.helpers.gl_source_join as glsj
+from src.salesforce.resources.scripts.helpers.gl_source_join import (
     resolve_bu_did,
     build_reference_to_account_lookup,
     clean_account_name,

@@ -73,7 +73,7 @@ EXPECTED_COLUMNS = {
     "credit_memo": ["Id", "BillingAccountId"],
     "payment": ["Id", "AccountId"],
     "refund": ["Id", "AccountId"],
-    "account": ["Id", "Name"],
+    "account": ["Id", "AccountNumber"],
     "invoice_line": ["Id", "InvoiceId", "Product2Id", "Business_Unit_BU__c", "Department_ID_DID__c"],
     "invoice_line_tax": ["Id", "InvoiceLineId"],
     "payment_line_invoice_line": ["PaymentId", "InvoiceLineId"],
@@ -295,22 +295,30 @@ def build_reference_to_account_lookup(invoice: pd.DataFrame, credit_memo: pd.Dat
     ref_to_account_id = ref_to_account_id.rename(columns={"Id": "ReferenceTransactionRecordId"})
 
     if account.empty:
-        ref_to_account_id["AccountName"] = None
+        ref_to_account_id["AccountNumber"] = None
         return ref_to_account_id
 
-    acct = account[["Id", "Name"]].rename(columns={"Id": "AccountId", "Name": "AccountName"})
+    acct = account[["Id", "AccountNumber"]].rename(columns={"Id": "AccountId"})
     return ref_to_account_id.merge(acct, on="AccountId", how="left")
 
 
-def clean_account_name(name: str, prefix_pattern: str = r"^A") -> str:
+def clean_account_number(account_number: str, prefix_pattern: str = r"^A") -> str:
     """
-    Strip the leading "A" from Account.Name per Dakota: "removed the leading A
-    at the beginning of the data in that column" — a single leading character,
-    not a dash-separated prefix like "A-".
+    Strip the leading "A" from Account.AccountNumber. CONFIRMED via
+    Salesforce API response (screenshot): real values look like "A00000213"
+    — stripping the leading "A" gives "00000213", an 8-digit code that fits
+    the Journal Line Account field's 10-character width exactly, matching
+    that field's own spec label ("Salesforce Account Number").
+
+    This field was originally mapped to Account.Name (the descriptive
+    company name) per an earlier instruction, but that doesn't fit: full
+    account names routinely exceed 10 characters and were being silently
+    truncated in the actual output file. AccountNumber is the correct
+    source field — confirmed, not a guess.
     """
-    if pd.isna(name):
-        return name
-    return re.sub(prefix_pattern, "", str(name))
+    if pd.isna(account_number):
+        return account_number
+    return re.sub(prefix_pattern, "", str(account_number))
 
 
 # ---------------------------------------------------------------------------
@@ -392,26 +400,26 @@ def build_source_dataframe(s3_client, bucket: str, source_prefix: str = "salesfo
         log.info(f"resolving business_unit/department_id...complete ({null_bu_count} rows with null bu)")
 
     if log:
-        log.info("resolving account names...")
+        log.info("resolving account numbers...")
     ref_lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
                                                     invoice_line, invoice_line_tax, account)
-    tj = tj.merge(ref_lookup[["ReferenceTransactionRecordId", "AccountName"]],
+    tj = tj.merge(ref_lookup[["ReferenceTransactionRecordId", "AccountNumber"]],
                   on="ReferenceTransactionRecordId", how="left")
     if log:
-        null_account_count = int(tj["AccountName"].isna().sum())
-        log.info(f"resolving account names...complete ({null_account_count} rows with null account name)")
+        null_account_count = int(tj["AccountNumber"].isna().sum())
+        log.info(f"resolving account numbers...complete ({null_account_count} rows with null account number)")
 
-    tj["AccountName"] = tj["AccountName"].apply(clean_account_name)
+    tj["AccountNumber"] = tj["AccountNumber"].apply(clean_account_number)
     tj["amount"] = resolve_amount(tj)
 
     result = tj[[
         "bu", "did", "ActivityDate", "TransactionType",
-        "AccountName", "UsageType", "amount", "Name",
+        "AccountNumber", "UsageType", "amount", "Name",
     ]].rename(columns={
         "bu": "business_unit",
         "ActivityDate": "activity_date",
         "TransactionType": "transaction_type",
-        "AccountName": "account_name",
+        "AccountNumber": "account_number",
         "UsageType": "usage_type",
         "Name": "tj_name",  # TransactionJournal.Name -> Journal Header Description
     })

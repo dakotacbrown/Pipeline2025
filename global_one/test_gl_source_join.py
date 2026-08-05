@@ -6,7 +6,7 @@ Run with: pytest test_gl_source_join.py -v
 
 Covers:
   - resolve_amount(): Credit/Debit sign resolution
-  - clean_account_name(): leading "A" stripping
+  - clean_account_number(): leading "A" stripping
   - build_reference_to_account_lookup(): polymorphic account-name resolution,
     including the InvoiceLine/InvoiceLineTax bug fix
   - resolve_bu_did(): per-TransactionType bu/department_id resolution,
@@ -25,7 +25,7 @@ import src.salesforce.resources.scripts.helpers.gl_source_join as glsj
 from src.salesforce.resources.scripts.helpers.gl_source_join import (
     resolve_bu_did,
     build_reference_to_account_lookup,
-    clean_account_name,
+    clean_account_number,
     resolve_amount,
     build_source_dataframe,
     DATASET_IDS,
@@ -83,34 +83,34 @@ class TestResolveAmount:
 
 
 # ---------------------------------------------------------------------------
-# clean_account_name()
+# clean_account_number()
 # ---------------------------------------------------------------------------
 
-class TestCleanAccountName:
+class TestCleanAccountNumber:
     def test_strips_single_leading_a_only(self):
         # per Dakota: "removed the leading A" — one character, not "A-".
         # Using a non-word example so the stripping behavior itself is
         # unambiguous (real account names may legitimately start with "A").
-        assert clean_account_name("A9999-TestAccount") == "9999-TestAccount"
+        assert clean_account_number("A9999-TestAccount") == "9999-TestAccount"
 
     def test_does_not_strip_if_no_leading_a(self):
-        assert clean_account_name("Beta LLC") == "Beta LLC"
+        assert clean_account_number("Beta LLC") == "Beta LLC"
 
     def test_nan_passthrough(self):
-        assert pd.isna(clean_account_name(float("nan")))
+        assert pd.isna(clean_account_number(float("nan")))
 
     def test_lowercase_leading_a_not_stripped(self):
         # pattern is anchored on literal "A", case-sensitive
-        assert clean_account_name("acme") == "acme"
+        assert clean_account_number("acme") == "acme"
 
     def test_empty_string_unchanged(self):
-        assert clean_account_name("") == ""
+        assert clean_account_number("") == ""
 
     def test_only_a_becomes_empty_string(self):
-        assert clean_account_name("A") == ""
+        assert clean_account_number("A") == ""
 
     def test_custom_prefix_pattern_override(self):
-        assert clean_account_name("XY-Test", prefix_pattern=r"^XY-") == "Test"
+        assert clean_account_number("XY-Test", prefix_pattern=r"^XY-") == "Test"
 
 
 # ---------------------------------------------------------------------------
@@ -124,55 +124,55 @@ class TestBuildReferenceToAccountLookup:
     def _empty_ilt(self):
         return pd.DataFrame([], columns=["Id", "InvoiceLineId"])
 
-    def test_resolves_account_name_via_invoice(self):
+    def test_resolves_account_number_via_invoice(self):
         invoice = pd.DataFrame([{"Id": "INV1", "BillingAccountId": "ACC1"}])
         credit_memo = pd.DataFrame([], columns=["Id", "BillingAccountId"])
         payment = pd.DataFrame([], columns=["Id", "AccountId"])
         refund = pd.DataFrame([], columns=["Id", "AccountId"])
-        account = pd.DataFrame([{"Id": "ACC1", "Name": "A-Acme Corp"}])
+        account = pd.DataFrame([{"Id": "ACC1", "AccountNumber": "A-Acme Corp"}])
 
         lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
                                                      self._empty_il(), self._empty_ilt(), account)
         row = lookup[lookup["ReferenceTransactionRecordId"] == "INV1"].iloc[0]
-        assert row["AccountName"] == "A-Acme Corp"
+        assert row["AccountNumber"] == "A-Acme Corp"
 
-    def test_resolves_account_name_via_credit_memo(self):
+    def test_resolves_account_number_via_credit_memo(self):
         invoice = pd.DataFrame([], columns=["Id", "BillingAccountId"])
         credit_memo = pd.DataFrame([{"Id": "CM1", "BillingAccountId": "ACC3"}])
         payment = pd.DataFrame([], columns=["Id", "AccountId"])
         refund = pd.DataFrame([], columns=["Id", "AccountId"])
-        account = pd.DataFrame([{"Id": "ACC3", "Name": "Gamma Co"}])
+        account = pd.DataFrame([{"Id": "ACC3", "AccountNumber": "Gamma Co"}])
 
         lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
                                                      self._empty_il(), self._empty_ilt(), account)
         row = lookup[lookup["ReferenceTransactionRecordId"] == "CM1"].iloc[0]
-        assert row["AccountName"] == "Gamma Co"
+        assert row["AccountNumber"] == "Gamma Co"
 
-    def test_resolves_account_name_via_payment(self):
+    def test_resolves_account_number_via_payment(self):
         invoice = pd.DataFrame([], columns=["Id", "BillingAccountId"])
         credit_memo = pd.DataFrame([], columns=["Id", "BillingAccountId"])
         payment = pd.DataFrame([{"Id": "PAY1", "AccountId": "ACC2"}])
         refund = pd.DataFrame([], columns=["Id", "AccountId"])
-        account = pd.DataFrame([{"Id": "ACC2", "Name": "Beta LLC"}])
+        account = pd.DataFrame([{"Id": "ACC2", "AccountNumber": "Beta LLC"}])
 
         lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
                                                      self._empty_il(), self._empty_ilt(), account)
         row = lookup[lookup["ReferenceTransactionRecordId"] == "PAY1"].iloc[0]
-        assert row["AccountName"] == "Beta LLC"
+        assert row["AccountNumber"] == "Beta LLC"
 
-    def test_resolves_account_name_via_refund(self):
+    def test_resolves_account_number_via_refund(self):
         invoice = pd.DataFrame([], columns=["Id", "BillingAccountId"])
         credit_memo = pd.DataFrame([], columns=["Id", "BillingAccountId"])
         payment = pd.DataFrame([], columns=["Id", "AccountId"])
         refund = pd.DataFrame([{"Id": "REF1", "AccountId": "ACC4"}])
-        account = pd.DataFrame([{"Id": "ACC4", "Name": "Delta Inc"}])
+        account = pd.DataFrame([{"Id": "ACC4", "AccountNumber": "Delta Inc"}])
 
         lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
                                                      self._empty_il(), self._empty_ilt(), account)
         row = lookup[lookup["ReferenceTransactionRecordId"] == "REF1"].iloc[0]
-        assert row["AccountName"] == "Delta Inc"
+        assert row["AccountNumber"] == "Delta Inc"
 
-    def test_resolves_account_name_via_invoice_line_bug_fix(self):
+    def test_resolves_account_number_via_invoice_line_bug_fix(self):
         # This is the bug: TransactionType='InvoiceLine' means
         # ReferenceTransactionRecordId = InvoiceLine.Id, NOT Invoice.Id.
         # Before the fix, this returned a null account name for every
@@ -182,14 +182,14 @@ class TestBuildReferenceToAccountLookup:
         payment = pd.DataFrame([], columns=["Id", "AccountId"])
         refund = pd.DataFrame([], columns=["Id", "AccountId"])
         invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1"}])
-        account = pd.DataFrame([{"Id": "ACC1", "Name": "A-Gamma Inc"}])
+        account = pd.DataFrame([{"Id": "ACC1", "AccountNumber": "A-Gamma Inc"}])
 
         lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
                                                      invoice_line, self._empty_ilt(), account)
         row = lookup[lookup["ReferenceTransactionRecordId"] == "IL1"].iloc[0]
-        assert row["AccountName"] == "A-Gamma Inc"
+        assert row["AccountNumber"] == "A-Gamma Inc"
 
-    def test_resolves_account_name_via_invoice_line_tax_bug_fix(self):
+    def test_resolves_account_number_via_invoice_line_tax_bug_fix(self):
         # Same bug, one hop further: TransactionType='InvoiceLineTax' means
         # ReferenceTransactionRecordId = InvoiceLineTax.Id.
         invoice = pd.DataFrame([{"Id": "INV1", "BillingAccountId": "ACC1"}])
@@ -198,12 +198,12 @@ class TestBuildReferenceToAccountLookup:
         refund = pd.DataFrame([], columns=["Id", "AccountId"])
         invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1"}])
         invoice_line_tax = pd.DataFrame([{"Id": "ILT1", "InvoiceLineId": "IL1"}])
-        account = pd.DataFrame([{"Id": "ACC1", "Name": "A-Delta Co"}])
+        account = pd.DataFrame([{"Id": "ACC1", "AccountNumber": "A-Delta Co"}])
 
         lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
                                                      invoice_line, invoice_line_tax, account)
         row = lookup[lookup["ReferenceTransactionRecordId"] == "ILT1"].iloc[0]
-        assert row["AccountName"] == "A-Delta Co"
+        assert row["AccountNumber"] == "A-Delta Co"
 
     def test_invoice_line_tax_with_no_matching_invoice_line_returns_null(self):
         invoice = pd.DataFrame([], columns=["Id", "BillingAccountId"])
@@ -212,7 +212,7 @@ class TestBuildReferenceToAccountLookup:
         refund = pd.DataFrame([], columns=["Id", "AccountId"])
         invoice_line = pd.DataFrame([], columns=["Id", "InvoiceId"])
         invoice_line_tax = pd.DataFrame([{"Id": "ILT1", "InvoiceLineId": "IL_MISSING"}])
-        account = pd.DataFrame([], columns=["Id", "Name"])
+        account = pd.DataFrame([], columns=["Id", "AccountNumber"])
 
         lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
                                                      invoice_line, invoice_line_tax, account)
@@ -220,7 +220,7 @@ class TestBuildReferenceToAccountLookup:
         # the join has nothing to match against — either absent or null name
         matches = lookup[lookup["ReferenceTransactionRecordId"] == "ILT1"]
         if len(matches) > 0:
-            assert pd.isna(matches.iloc[0]["AccountName"])
+            assert pd.isna(matches.iloc[0]["AccountNumber"])
 
     def test_ids_are_globally_unique_no_collisions(self):
         # Salesforce IDs are unique across objects — confirms union approach is safe
@@ -229,37 +229,37 @@ class TestBuildReferenceToAccountLookup:
         payment = pd.DataFrame([{"Id": "REC3", "AccountId": "ACC3"}])
         refund = pd.DataFrame([{"Id": "REC4", "AccountId": "ACC4"}])
         account = pd.DataFrame([
-            {"Id": "ACC1", "Name": "One"}, {"Id": "ACC2", "Name": "Two"},
-            {"Id": "ACC3", "Name": "Three"}, {"Id": "ACC4", "Name": "Four"},
+            {"Id": "ACC1", "AccountNumber": "One"}, {"Id": "ACC2", "AccountNumber": "Two"},
+            {"Id": "ACC3", "AccountNumber": "Three"}, {"Id": "ACC4", "AccountNumber": "Four"},
         ])
 
         lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
                                                      self._empty_il(), self._empty_ilt(), account)
         assert len(lookup) == 4
-        assert set(lookup["AccountName"]) == {"One", "Two", "Three", "Four"}
+        assert set(lookup["AccountNumber"]) == {"One", "Two", "Three", "Four"}
 
     def test_missing_account_returns_null_name(self):
         invoice = pd.DataFrame([{"Id": "INV1", "BillingAccountId": "ACC_MISSING"}])
         credit_memo = pd.DataFrame([], columns=["Id", "BillingAccountId"])
         payment = pd.DataFrame([], columns=["Id", "AccountId"])
         refund = pd.DataFrame([], columns=["Id", "AccountId"])
-        account = pd.DataFrame([], columns=["Id", "Name"])
+        account = pd.DataFrame([], columns=["Id", "AccountNumber"])
 
         lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
                                                      self._empty_il(), self._empty_ilt(), account)
         row = lookup[lookup["ReferenceTransactionRecordId"] == "INV1"].iloc[0]
-        assert pd.isna(row["AccountName"])
+        assert pd.isna(row["AccountNumber"])
 
     def test_all_sources_empty_returns_empty_lookup(self):
         empty_inv = pd.DataFrame([], columns=["Id", "BillingAccountId"])
         empty_pay = pd.DataFrame([], columns=["Id", "AccountId"])
-        empty_acct = pd.DataFrame([], columns=["Id", "Name"])
+        empty_acct = pd.DataFrame([], columns=["Id", "AccountNumber"])
 
         lookup = build_reference_to_account_lookup(empty_inv, empty_inv, empty_pay, empty_pay,
                                                      self._empty_il(), self._empty_ilt(), empty_acct)
         assert len(lookup) == 0
         assert "ReferenceTransactionRecordId" in lookup.columns
-        assert "AccountName" in lookup.columns
+        assert "AccountNumber" in lookup.columns
 
 
 # ---------------------------------------------------------------------------
@@ -518,7 +518,7 @@ class TestBuildSourceDataframeOrchestration:
                 "Business_Unit_BU__c": "US001", "Department_ID_DID__c": "10500",
             }]),
             "invoice": pd.DataFrame([{"Id": "INV1", "BillingAccountId": "ACC1"}]),
-            "account": pd.DataFrame([{"Id": "ACC1", "Name": "A-Test Account"}]),
+            "account": pd.DataFrame([{"Id": "ACC1", "AccountNumber": "A-Test Account"}]),
         }
         self._patch_read_table(monkeypatch, table_data)
 
@@ -528,7 +528,7 @@ class TestBuildSourceDataframeOrchestration:
         row = result.iloc[0]
         assert row["business_unit"] == "US001"
         assert row["did"] == "10500"
-        assert row["account_name"] == "-Test Account"  # leading "A" stripped
+        assert row["account_number"] == "-Test Account"  # leading "A" stripped
         assert row["amount"] == 100.0
         assert row["tj_name"] == "Batch 1"
 
@@ -546,7 +546,7 @@ class TestBuildSourceDataframeOrchestration:
             }]),
             "payment_line_invoice": pd.DataFrame([{"PaymentId": "PAY1", "InvoiceId": "INV1"}]),
             "payment": pd.DataFrame([{"Id": "PAY1", "AccountId": "ACC2"}]),
-            "account": pd.DataFrame([{"Id": "ACC2", "Name": "Beta LLC"}]),
+            "account": pd.DataFrame([{"Id": "ACC2", "AccountNumber": "Beta LLC"}]),
         }
         self._patch_read_table(monkeypatch, table_data)
 
@@ -554,7 +554,7 @@ class TestBuildSourceDataframeOrchestration:
 
         row = result.iloc[0]
         assert row["business_unit"] == "US002"
-        assert row["account_name"] == "Beta LLC"
+        assert row["account_number"] == "Beta LLC"
         assert row["amount"] == -50.0  # credit -> negative
 
     def test_end_to_end_with_credit_memo_transaction_via_header_fallback(self, monkeypatch):
@@ -571,7 +571,7 @@ class TestBuildSourceDataframeOrchestration:
             }]),
             "credit_memo_inv_application": pd.DataFrame([{"CreditMemoId": "CM1", "InvoiceId": "INV1"}]),
             "credit_memo": pd.DataFrame([{"Id": "CM1", "BillingAccountId": "ACC3"}]),
-            "account": pd.DataFrame([{"Id": "ACC3", "Name": "Gamma Corp"}]),
+            "account": pd.DataFrame([{"Id": "ACC3", "AccountNumber": "Gamma Corp"}]),
         }
         self._patch_read_table(monkeypatch, table_data)
 
@@ -579,7 +579,7 @@ class TestBuildSourceDataframeOrchestration:
 
         row = result.iloc[0]
         assert row["business_unit"] == "US003"
-        assert row["account_name"] == "Gamma Corp"
+        assert row["account_number"] == "Gamma Corp"
         assert row["amount"] == -25.0
 
     def test_missing_tables_still_produce_output_with_nulls(self, monkeypatch):
@@ -599,7 +599,7 @@ class TestBuildSourceDataframeOrchestration:
         assert len(result) == 1
         row = result.iloc[0]
         assert pd.isna(row["business_unit"])
-        assert pd.isna(row["account_name"])
+        assert pd.isna(row["account_number"])
         assert row["amount"] == 10.0  # amount still resolves independent of bu/account
 
     def test_empty_transaction_journal_produces_empty_result(self, monkeypatch):
@@ -627,7 +627,7 @@ class TestBuildSourceDataframeOrchestration:
 
         expected_cols = {
             "business_unit", "did", "activity_date", "transaction_type",
-            "account_name", "usage_type", "amount", "tj_name",
+            "account_number", "usage_type", "amount", "tj_name",
         }
         assert expected_cols == set(result.columns)
 
@@ -675,7 +675,7 @@ class TestBuildSourceDataframeOrchestration:
         # spot check a couple of expected log messages happened
         messages = [call.args[0] for call in fake_log.info.call_args_list]
         assert any("resolving business_unit" in m for m in messages)
-        assert any("resolving account names" in m for m in messages)
+        assert any("resolving account numbers" in m for m in messages)
 
     def test_logging_includes_per_table_read_messages(self, monkeypatch):
         table_data = {

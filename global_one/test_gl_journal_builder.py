@@ -185,14 +185,15 @@ class TestJournalLine:
         line = journal_line(business_unit="US001", account="12345678")
         assert line[0] == "L"
 
-    def test_us_business_unit_gets_corp_ledger(self):
+    def test_defaults_to_corp_regardless_of_business_unit(self):
+        # real BUs are numeric ("10901"), not "US"/"EU"-prefixed — CORP is
+        # the default for now, pending a real rule for CORP vs LOCAL
         line = journal_line(business_unit="US001", account="12345678")
-        # position 16-25 (1-indexed) -> [15:25]
         assert line[15:25] == "CORP      "
 
-    def test_non_us_business_unit_gets_local_ledger(self):
-        line = journal_line(business_unit="EU002", account="12345678")
-        assert line[15:25] == "LOCAL     "
+    def test_numeric_business_unit_also_gets_corp(self):
+        line = journal_line(business_unit="10901", account="12345678")
+        assert line[15:25] == "CORP      "
 
     def test_negative_amount_preserved(self):
         line = journal_line(business_unit="US001", account="12345678",
@@ -214,7 +215,7 @@ class TestJournalLine:
         # position 277-281 (1-indexed) -> [276:281]
         assert line[276:281] == "USDLY"
 
-    def test_us_lowercase_still_matches_corp(self):
+    def test_case_does_not_matter_since_always_corp(self):
         line = journal_line(business_unit="us001", account="12345678")
         assert line[15:25] == "CORP      "
 
@@ -326,9 +327,9 @@ class TestBuildGlFile:
 
     def test_multi_bu_mode_groups_by_distinct_business_unit(self):
         df = pd.DataFrame([
-            {"business_unit": "US001", "did": "10500", "account_name": "A", "amount": 10.0,
+            {"business_unit": "US001", "did": "10500", "account_number": "A", "amount": 10.0,
              "usage_type": "", "transaction_type": "", "tj_name": "Batch A"},
-            {"business_unit": "EU002", "did": "20500", "account_name": "B", "amount": 20.0,
+            {"business_unit": "EU002", "did": "20500", "account_number": "B", "amount": 20.0,
              "usage_type": "", "transaction_type": "", "tj_name": "Batch B"},
         ])
         content = build_gl_file(df, business_unit=None, source="CS1",
@@ -341,9 +342,9 @@ class TestBuildGlFile:
 
     def test_multi_bu_groups_sorted_alphabetically(self):
         df = pd.DataFrame([
-            {"business_unit": "US002", "did": "1", "account_name": "", "amount": 1.0,
+            {"business_unit": "US002", "did": "1", "account_number": "", "amount": 1.0,
              "usage_type": "", "transaction_type": "", "tj_name": ""},
-            {"business_unit": "EU001", "did": "2", "account_name": "", "amount": 1.0,
+            {"business_unit": "EU001", "did": "2", "account_number": "", "amount": 1.0,
              "usage_type": "", "transaction_type": "", "tj_name": ""},
         ])
         content = build_gl_file(df, business_unit=None, source="CS1",
@@ -355,9 +356,9 @@ class TestBuildGlFile:
 
     def test_filtering_to_single_business_unit_excludes_others(self):
         df = pd.DataFrame([
-            {"business_unit": "US001", "did": "1", "account_name": "", "amount": 1.0,
+            {"business_unit": "US001", "did": "1", "account_number": "", "amount": 1.0,
              "usage_type": "", "transaction_type": "", "tj_name": ""},
-            {"business_unit": "EU002", "did": "2", "account_name": "", "amount": 1.0,
+            {"business_unit": "EU002", "did": "2", "account_number": "", "amount": 1.0,
              "usage_type": "", "transaction_type": "", "tj_name": ""},
         ])
         content = build_gl_file(df, business_unit="US001", source="CS1",
@@ -397,7 +398,7 @@ class TestBuildFilename:
 class TestRunOrchestration:
     def _sample_df(self):
         return pd.DataFrame([
-            {"business_unit": "US001", "did": "10500", "account_name": "Acme",
+            {"business_unit": "US001", "did": "10500", "account_number": "Acme",
              "amount": 100.0, "usage_type": "Storage", "transaction_type": "InvoiceLine",
              "tj_name": "Batch"},
         ])
@@ -416,9 +417,9 @@ class TestRunOrchestration:
 
     def test_filters_by_business_unit_when_given(self, monkeypatch):
         fake_df = pd.DataFrame([
-            {"business_unit": "US001", "did": "10500", "account_name": "A", "amount": 1.0,
+            {"business_unit": "US001", "did": "10500", "account_number": "A", "amount": 1.0,
              "usage_type": "", "transaction_type": "", "tj_name": ""},
-            {"business_unit": "US002", "did": "20500", "account_name": "B", "amount": 2.0,
+            {"business_unit": "US002", "did": "20500", "account_number": "B", "amount": 2.0,
              "usage_type": "", "transaction_type": "", "tj_name": ""},
         ])
         monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: fake_df)
@@ -641,7 +642,7 @@ VALID_ARGV = [
 
 def sample_df():
     return pd.DataFrame([
-        {"business_unit": "US001", "did": "10500", "account_name": "Acme",
+        {"business_unit": "US001", "did": "10500", "account_number": "Acme",
          "amount": 100.0, "usage_type": "Storage", "transaction_type": "InvoiceLine",
          "tj_name": "Batch"},
     ])

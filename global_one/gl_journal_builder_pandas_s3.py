@@ -72,7 +72,12 @@ def journal_header(business_unit, journal_date, source, description=""):
 def journal_line(business_unit, account, dept_id="", project_id="",
                   journal_line_ref="", journal_line_desc="",
                   txn_currency_code="", txn_monetary_amount=0):
-    ledger = "CORP" if str(business_unit).upper().startswith("US") else "LOCAL"
+    # Real business units are numeric (e.g. "10901"), not "US"/"EU"-prefixed
+    # strings — the original startswith("US") check never matched anything,
+    # so every line silently fell to LOCAL. Defaulting to CORP for now per
+    # Dakota, pending a real rule for distinguishing CORP vs LOCAL by
+    # numeric BU.
+    ledger = "CORP"
     amt = Decimal(str(txn_monetary_amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     return build_line([
         ("L", 1, "left", " "),
@@ -165,14 +170,18 @@ def build_gl_file(df: pd.DataFrame, business_unit: str = None, source: str = "",
                 total_credits += amt
 
             # Field mapping confirmed by Dakota:
-            #   account          <- Account.Name, leading "A" stripped (clean_account_name)
+            #   account          <- Account.AccountNumber, leading "A" stripped
+            #                       (clean_account_number) — CONFIRMED via Salesforce
+            #                       API response, not Account.Name (which routinely
+            #                       exceeds this field's 10-char width and was
+            #                       silently truncating in the actual output)
             #   dept_id          <- Product2.Department_ID_DID__c ("did")
             #   project_id       <- left blank for now
             #   journal_line_ref <- TransactionJournal.UsageType (marked "?" — tentative)
             #   journal_line_desc <- TransactionJournal.TransactionType (marked "?" — tentative)
             lines.append(journal_line(
                 business_unit=bu,
-                account=row.get("account", row.get("account_name", "")),
+                account=row.get("account", row.get("account_number", "")),
                 dept_id=row.get("dept_id", row.get("did", "")),
                 project_id=row.get("project_id", ""),
                 journal_line_ref=row.get("journal_line_ref", row.get("usage_type", "")),

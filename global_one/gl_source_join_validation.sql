@@ -1,10 +1,19 @@
 -- =============================================================================
 -- GL Journal Source Join — SQL reference for validation
--- Mirrors gl_source_join.py exactly. Each CTE below corresponds to one
--- Python function, in the same order, so this can be checked line-by-line
--- against the pipeline code.
+-- Regenerated to match helpers/gl_source_join.py as of this date. Mirrors
+-- build_source_dataframe(), resolve_bu_did(), and
+-- build_reference_to_account_lookup() exactly — each CTE below corresponds
+-- to one Python function, in the same order, so this can be checked
+-- line-by-line against the pipeline code.
 --
 -- Confirmed TransactionType values: InvoiceLineTax, Payment, CreditMemo, InvoiceLine
+--
+-- Output column names match build_source_dataframe()'s current Table.Column
+-- naming exactly:
+--   InvoiceLine.Business_Unit, InvoiceLine.Department_Id,
+--   TransactionJournal.ActivityDate, TransactionJournal.TransactionType,
+--   Account.AccountNumber, TransactionJournal.UsageType,
+--   TransactionJournal.CreditDebit, TransactionJournal.Name
 --
 -- Table names below assume cadet.bronze.revcloud_* naming, matching the
 -- validation queries already run against this environment. Adjust schema
@@ -14,7 +23,8 @@
 
 -- -----------------------------------------------------------------------------
 -- CTE 1: resolve_bu_did()
---   Resolves Business Unit / Department ID / Product2Id per TransactionType.
+--   Resolves InvoiceLine.Business_Unit / .Department_Id / Product2Id per
+--   TransactionType.
 --
 --   InvoiceLine     -> ReferenceTransactionRecordId = InvoiceLine.Id directly
 --   InvoiceLineTax  -> ReferenceTransactionRecordId = InvoiceLineTax.Id,
@@ -31,15 +41,25 @@
 --                           CONFIRMED 42 rows (matches CreditMemo row count) —
 --                           this is what resolves CreditMemo rows today
 --
+--   NOTE: an earlier design routed bu/did through
+--   TransactionJournal -> UsageResource -> RateCardEntry -> Product2, but
+--   that was abandoned — UsageResourceId/Product2Id were confirmed to
+--   always point to the same product regardless of transaction, a dead end
+--   for differentiating bu/did. Not included below; not used by the
+--   current pipeline at all.
+--
 --   PRIORITY: line-level paths win over header-level paths when both exist
---   for the same header id (kept in case line-level tables get populated later).
+--   for the same header id (kept in case line-level tables get populated
+--   later).
 --
 --   CAVEAT: both header-level fallbacks join through Invoice -> InvoiceLine,
 --   and one Invoice can have multiple InvoiceLines. Where those lines span
 --   more than one bu/did, this takes the FIRST match (arbitrary tiebreak,
 --   not a "correct" one — there isn't a single correct answer at header
---   level). Validator should check whether that fan-out actually happens:
---   see the two "-- FAN-OUT CHECK" queries at the bottom of this file.
+--   level). See the two "-- FAN-OUT CHECK" queries at the bottom of this
+--   file — these were run against real data and came back showing this
+--   fan-out does NOT currently happen, but worth rerunning periodically as
+--   data volume grows.
 -- -----------------------------------------------------------------------------
 
 with il_direct as (
@@ -47,8 +67,8 @@ with il_direct as (
     select
         id as reference_transaction_record_id,
         product2id,
-        business_unit_bu__c as bu,
-        department_id_did__c as did,
+        business_unit_bu__c as business_unit,
+        department_id_did__c as department_id,
         1 as source_priority  -- line-level
     from cadet.bronze.revcloud_invoice_line
 ),
@@ -58,8 +78,8 @@ il_via_tax as (
     select
         ilt.id as reference_transaction_record_id,
         il.product2id,
-        il.business_unit_bu__c as bu,
-        il.department_id_did__c as did,
+        il.business_unit_bu__c as business_unit,
+        il.department_id_did__c as department_id,
         1 as source_priority  -- line-level
     from cadet.bronze.revcloud_invoice_line_tax ilt
     left join cadet.bronze.revcloud_invoice_line il
@@ -71,8 +91,8 @@ payment_via_line as (
     select
         pli.paymentid as reference_transaction_record_id,
         il.product2id,
-        il.business_unit_bu__c as bu,
-        il.department_id_did__c as did,
+        il.business_unit_bu__c as business_unit,
+        il.department_id_did__c as department_id,
         1 as source_priority  -- line-level
     from cadet.bronze.revcloud_payment_line_invoice_line pli
     left join cadet.bronze.revcloud_invoice_line il
@@ -84,8 +104,8 @@ payment_via_header as (
     select
         pli.paymentid as reference_transaction_record_id,
         il.product2id,
-        il.business_unit_bu__c as bu,
-        il.department_id_did__c as did,
+        il.business_unit_bu__c as business_unit,
+        il.department_id_did__c as department_id,
         2 as source_priority  -- header-level fallback
     from cadet.bronze.revcloud_payment_line_invoice pli
     left join cadet.bronze.revcloud_invoice_line il
@@ -97,8 +117,8 @@ credit_memo_via_line as (
     select
         cml.creditmemoid as reference_transaction_record_id,
         il.product2id,
-        il.business_unit_bu__c as bu,
-        il.department_id_did__c as did,
+        il.business_unit_bu__c as business_unit,
+        il.department_id_did__c as department_id,
         1 as source_priority  -- line-level
     from cadet.bronze.revcloud_credit_memo_line cml
     left join cadet.bronze.revcloud_credit_memo_line_invoice_line cmli
@@ -112,8 +132,8 @@ credit_memo_via_header as (
     select
         cmia.creditmemoid as reference_transaction_record_id,
         il.product2id,
-        il.business_unit_bu__c as bu,
-        il.department_id_did__c as did,
+        il.business_unit_bu__c as business_unit,
+        il.department_id_did__c as department_id,
         2 as source_priority  -- header-level fallback
     from cadet.bronze.revcloud_credit_memo_inv_application cmia
     left join cadet.bronze.revcloud_invoice_line il
@@ -152,8 +172,8 @@ bu_did_lookup as (
     select
         reference_transaction_record_id,
         product2id,
-        bu,
-        did
+        business_unit,
+        department_id
     from bu_did_ranked
     where rn = 1
 ),
@@ -161,14 +181,22 @@ bu_did_lookup as (
 
 -- -----------------------------------------------------------------------------
 -- CTE 2: build_reference_to_account_lookup()
---   Resolves Account Name per TransactionType, via the same polymorphic
---   ReferenceTransactionRecordId. Header-level types (Payment, CreditMemo,
---   Refund, Invoice) resolve directly. Line-level types (InvoiceLine,
---   InvoiceLineTax) need to walk up to Invoice first — this was a BUG in
---   the original implementation (fixed): InvoiceLine.Id/InvoiceLineTax.Id
---   were being matched directly against Invoice.Id, which never matches
---   since Salesforce record IDs are unique per object. Every InvoiceLine/
---   InvoiceLineTax row was getting a null account name until this was fixed.
+--   Resolves Account.AccountNumber per TransactionType, via the same
+--   polymorphic ReferenceTransactionRecordId. Header-level types (Payment,
+--   CreditMemo, Refund, Invoice) resolve directly. Line-level types
+--   (InvoiceLine, InvoiceLineTax) need to walk up to Invoice first — this
+--   was a BUG in the original implementation (fixed): InvoiceLine.Id/
+--   InvoiceLineTax.Id were being matched directly against Invoice.Id,
+--   which never matches since Salesforce record IDs are unique per object.
+--   Every InvoiceLine/InvoiceLineTax row was getting a null account until
+--   this was fixed.
+--
+--   CONFIRMED FIELD: Account.AccountNumber, NOT Account.Name. Real values
+--   look like "A00000213" (confirmed via Salesforce API response) —
+--   stripping the leading "A" gives an 8-digit code that fits the Journal
+--   Line Account field's 10-character width. Account.Name was originally
+--   used here but routinely exceeds 10 characters and was silently
+--   truncating in the actual output file.
 --
 --   Salesforce IDs are globally unique across objects, so unioning all
 --   (id -> account_id) pairs and matching once is safe — no risk of an
@@ -230,12 +258,12 @@ ref_to_account_deduped as (
 account_lookup as (
     select
         r.reference_transaction_record_id,
-        -- clean_account_name(): strip a single leading "A" character only
-        -- (NOT an "A-" prefix) per Dakota's confirmation
+        -- clean_account_number(): strip a single leading "A" character only
+        -- (confirmed via real AccountNumber values like "A00000213")
         case
-            when a.name like 'A%' then substring(a.name, 2)
-            else a.name
-        end as account_name
+            when a.accountnumber like 'A%' then substring(a.accountnumber, 2)
+            else a.accountnumber
+        end as account_number
     from ref_to_account_deduped r
     left join cadet.bronze.revcloud_account a
         on r.account_id = a.id
@@ -244,9 +272,10 @@ account_lookup as (
 
 -- -----------------------------------------------------------------------------
 -- CTE 3: resolve_amount()
---   Credit (negative) or Debit (positive), whichever is populated.
---   If both are populated, Credit takes priority (matches pandas
---   combine_first behavior in resolve_amount()).
+--   TransactionJournal.CreditDebit: Credit (negative) or Debit (positive),
+--   whichever is populated. If both are populated, Credit takes priority
+--   (matches pandas combine_first behavior in resolve_amount()). This is a
+--   DERIVED value, not a literal field on TransactionJournal.
 -- -----------------------------------------------------------------------------
 
 tj_with_amount as (
@@ -255,29 +284,26 @@ tj_with_amount as (
         case
             when credit is not null then -credit
             else debit
-        end as amount
+        end as creditdebit
     from cadet.bronze.revcloud_transaction_journal
 )
 
 
 -- -----------------------------------------------------------------------------
 -- FINAL: build_source_dataframe()
---   Joins TransactionJournal to both lookups above. Column names on the
---   right match gl_source_join.build_source_dataframe()'s final output.
+--   Joins TransactionJournal to both lookups above. Output column names
+--   match the Python's current Table.Column naming exactly.
 -- -----------------------------------------------------------------------------
 
 select
-    bd.bu as business_unit,
-    bd.did,
-    tj.activitydate as activity_date,
-    tj.transactiontype as transaction_type,
-    al.account_name,
-    tj.usagetype as usage_type,
-    tj.amount,
-    tj.name as tj_name  -- TransactionJournal.Name -> Journal Header Description
-                         -- (currently a placeholder "RevCloud Batch" is used
-                         -- instead in the file builder — see build_gl_file()
-                         -- follow-up note)
+    bd.business_unit as "InvoiceLine.Business_Unit",
+    bd.department_id as "InvoiceLine.Department_Id",
+    tj.activitydate as "TransactionJournal.ActivityDate",
+    tj.transactiontype as "TransactionJournal.TransactionType",
+    al.account_number as "Account.AccountNumber",
+    tj.usagetype as "TransactionJournal.UsageType",
+    tj.creditdebit as "TransactionJournal.CreditDebit",
+    tj.name as "TransactionJournal.Name"
 from tj_with_amount tj
 left join bu_did_lookup bd
     on tj.referencetransactionrecordid = bd.reference_transaction_record_id
@@ -289,35 +315,40 @@ left join account_lookup al
 -- VALIDATION QUERIES — run these separately to sanity-check the join above
 -- =============================================================================
 
--- 1. How many TransactionJournal rows end up with a NULL bu/did after the
---    join? Should be low/zero given TransactionType is fully covered by the
---    four CTEs above. Any nulls here mean either a data gap (e.g. an
---    Invoice/InvoiceLine with no matching record) or a fifth TransactionType
---    value that isn't handled yet — check transactiontype on any null rows.
--- select transactiontype, count(*) as null_bu_did_count
+-- 1. How many TransactionJournal rows end up with a NULL business_unit
+--    after the join? Should be low/zero given TransactionType is fully
+--    covered by the CTEs above. Any nulls here mean either a data gap
+--    (e.g. an Invoice/InvoiceLine with no matching record) or a fifth
+--    TransactionType value that isn't handled yet — check transactiontype
+--    on any null rows.
+-- select transactiontype, count(*) as null_bu_count
 -- from tj_with_amount tj
 -- left join bu_did_lookup bd on tj.referencetransactionrecordid = bd.reference_transaction_record_id
--- where bd.bu is null
+-- where bd.business_unit is null
 -- group by transactiontype;
 
--- 2. Same check for account_name nulls.
--- select tj.transactiontype, count(*) as null_account_name_count
+-- 2. Same check for account_number nulls.
+-- select tj.transactiontype, count(*) as null_account_count
 -- from tj_with_amount tj
 -- left join account_lookup al on tj.referencetransactionrecordid = al.reference_transaction_record_id
--- where al.account_name is null
+-- where al.account_number is null
 -- group by tj.transactiontype;
 
 -- 3. FAN-OUT CHECK — Payment: does a single Payment's applied invoice ever
---    span multiple DIDs? (Only DID varies meaningfully in this data; BU is
---    currently constant across the whole org.)
--- select pli.paymentid, count(distinct il.department_id_did__c) as distinct_dids_touched
+--    span multiple department_ids? (Only department_id varies meaningfully
+--    in this data; business_unit is currently constant across the whole
+--    org.) CONFIRMED as of the last check: this does NOT currently happen —
+--    rerun periodically as data volume grows.
+-- select pli.paymentid, count(distinct il.department_id_did__c) as distinct_depts_touched
 -- from cadet.bronze.revcloud_payment_line_invoice pli
 -- left join cadet.bronze.revcloud_invoice_line il on pli.invoiceid = il.invoiceid
 -- group by pli.paymentid
 -- having count(distinct il.department_id_did__c) > 1;
 
 -- 4. FAN-OUT CHECK — CreditMemo: same check via CreditMemoInvApplication.
--- select cmia.creditmemoid, count(distinct il.department_id_did__c) as distinct_dids_touched
+--    CONFIRMED as of the last check: this does NOT currently happen —
+--    rerun periodically as data volume grows.
+-- select cmia.creditmemoid, count(distinct il.department_id_did__c) as distinct_depts_touched
 -- from cadet.bronze.revcloud_credit_memo_inv_application cmia
 -- left join cadet.bronze.revcloud_invoice_line il on cmia.invoiceid = il.invoiceid
 -- group by cmia.creditmemoid
@@ -330,3 +361,9 @@ left join account_lookup al
 -- select
 --   (select count(*) from cadet.bronze.revcloud_transaction_journal) as tj_row_count,
 --   (select count(*) from ( <paste the FINAL select above> ) x) as output_row_count;
+
+-- 6. Sanity check on Account.AccountNumber format — confirms the "strip
+--    leading A" logic is actually matching real data shape.
+-- select accountnumber, substring(accountnumber, 2) as stripped
+-- from cadet.bronze.revcloud_account
+-- limit 20;

@@ -142,10 +142,10 @@ def build_gl_file(df: pd.DataFrame, business_unit: str = None, source: str = "",
 
     if business_unit is not None:
         bu_groups = [(business_unit, df)]
-    elif "business_unit" in df.columns and not df.empty:
+    elif "InvoiceLine.Business_Unit" in df.columns and not df.empty:
         bu_groups = [
-            (bu, df[df["business_unit"] == bu])
-            for bu in sorted(df["business_unit"].dropna().unique().tolist())
+            (bu, df[df["InvoiceLine.Business_Unit"] == bu])
+            for bu in sorted(df["InvoiceLine.Business_Unit"].dropna().unique().tolist())
         ]
     else:
         bu_groups = []
@@ -160,9 +160,10 @@ def build_gl_file(df: pd.DataFrame, business_unit: str = None, source: str = "",
                                      description=header_description))
 
         for _, row in group_df.iterrows():
-            # "amount" is what gl_source_join.build_source_dataframe produces;
+            # "TransactionJournal.CreditDebit" is what
+            # gl_source_join.build_source_dataframe produces;
             # "txn_monetary_amount" supported for direct/manual calls.
-            raw_amt = row.get("amount", row.get("txn_monetary_amount", 0))
+            raw_amt = row.get("TransactionJournal.CreditDebit", row.get("txn_monetary_amount", 0))
             amt = Decimal(str(raw_amt)) if pd.notna(raw_amt) else Decimal("0")
             if amt >= 0:
                 total_debits += amt
@@ -175,17 +176,18 @@ def build_gl_file(df: pd.DataFrame, business_unit: str = None, source: str = "",
             #                       API response, not Account.Name (which routinely
             #                       exceeds this field's 10-char width and was
             #                       silently truncating in the actual output)
-            #   dept_id          <- Product2.Department_ID_DID__c ("did")
+            #   dept_id          <- InvoiceLine.Department_Id
             #   project_id       <- left blank for now
             #   journal_line_ref <- TransactionJournal.UsageType (marked "?" — tentative)
             #   journal_line_desc <- TransactionJournal.TransactionType (marked "?" — tentative)
             lines.append(journal_line(
                 business_unit=bu,
-                account=row.get("account", row.get("account_number", "")),
-                dept_id=row.get("dept_id", row.get("did", "")),
+                account=row.get("account", row.get("Account.AccountNumber", "")),
+                dept_id=row.get("dept_id", row.get("InvoiceLine.Department_Id", "")),
                 project_id=row.get("project_id", ""),
-                journal_line_ref=row.get("journal_line_ref", row.get("usage_type", "")),
-                journal_line_desc=row.get("journal_line_desc", row.get("transaction_type", "")),
+                journal_line_ref=row.get("journal_line_ref", row.get("TransactionJournal.UsageType", "")),
+                journal_line_desc=row.get("journal_line_desc",
+                                           row.get("TransactionJournal.TransactionType", "")),
                 txn_currency_code=row.get("txn_currency_code", ""),
                 txn_monetary_amount=amt,
             ))
@@ -250,11 +252,13 @@ def run(log, s3_client, bucket, output_key_prefix, filename_prefix,
 
     if business_unit is not None:
         log.info(f"filtering to business_unit={business_unit}...")
-        df = df[df["business_unit"] == business_unit]
+        df = df[df["InvoiceLine.Business_Unit"] == business_unit]
         log.info(f"filtering to business_unit={business_unit}...complete ({len(df)} rows)")
 
     if validation_key_prefix:
         log.info(f"saving validation file ({validation_file_type})...")
+        # df already comes out of build_source_dataframe with Table.Column
+        # names, so no separate relabeling step is needed here anymore.
         validation_url = save_validation_file(s3_client, df, bucket, validation_key_prefix,
                                                file_type=validation_file_type, creation_dt=creation_dt)
         log.info(f"saving validation file...complete ({validation_url})")

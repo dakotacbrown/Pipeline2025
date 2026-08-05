@@ -526,11 +526,11 @@ class TestBuildSourceDataframeOrchestration:
 
         assert len(result) == 1
         row = result.iloc[0]
-        assert row["business_unit"] == "US001"
-        assert row["did"] == "10500"
-        assert row["account_number"] == "-Test Account"  # leading "A" stripped
-        assert row["amount"] == 100.0
-        assert row["tj_name"] == "Batch 1"
+        assert row["InvoiceLine.Business_Unit"] == "US001"
+        assert row["InvoiceLine.Department_Id"] == "10500"
+        assert row["Account.AccountNumber"] == "-Test Account"  # leading "A" stripped
+        assert row["TransactionJournal.CreditDebit"] == 100.0
+        assert row["TransactionJournal.Name"] == "Batch 1"
 
     def test_end_to_end_with_payment_transaction_via_header_fallback(self, monkeypatch):
         table_data = {
@@ -553,9 +553,9 @@ class TestBuildSourceDataframeOrchestration:
         result = build_source_dataframe(MagicMock(), "bucket")
 
         row = result.iloc[0]
-        assert row["business_unit"] == "US002"
-        assert row["account_number"] == "Beta LLC"
-        assert row["amount"] == -50.0  # credit -> negative
+        assert row["InvoiceLine.Business_Unit"] == "US002"
+        assert row["Account.AccountNumber"] == "Beta LLC"
+        assert row["TransactionJournal.CreditDebit"] == -50.0  # credit -> negative
 
     def test_end_to_end_with_credit_memo_transaction_via_header_fallback(self, monkeypatch):
         table_data = {
@@ -578,9 +578,9 @@ class TestBuildSourceDataframeOrchestration:
         result = build_source_dataframe(MagicMock(), "bucket")
 
         row = result.iloc[0]
-        assert row["business_unit"] == "US003"
-        assert row["account_number"] == "Gamma Corp"
-        assert row["amount"] == -25.0
+        assert row["InvoiceLine.Business_Unit"] == "US003"
+        assert row["Account.AccountNumber"] == "Gamma Corp"
+        assert row["TransactionJournal.CreditDebit"] == -25.0
 
     def test_missing_tables_still_produce_output_with_nulls(self, monkeypatch):
         # Only transaction_journal provided — everything else empty
@@ -598,15 +598,15 @@ class TestBuildSourceDataframeOrchestration:
 
         assert len(result) == 1
         row = result.iloc[0]
-        assert pd.isna(row["business_unit"])
-        assert pd.isna(row["account_number"])
-        assert row["amount"] == 10.0  # amount still resolves independent of bu/account
+        assert pd.isna(row["InvoiceLine.Business_Unit"])
+        assert pd.isna(row["Account.AccountNumber"])
+        assert row["TransactionJournal.CreditDebit"] == 10.0  # amount still resolves independent of bu/account
 
     def test_empty_transaction_journal_produces_empty_result(self, monkeypatch):
         self._patch_read_table(monkeypatch, {})
         result = build_source_dataframe(MagicMock(), "bucket")
         assert len(result) == 0
-        assert "business_unit" in result.columns
+        assert "InvoiceLine.Business_Unit" in result.columns
 
     def test_result_has_expected_final_columns(self, monkeypatch):
         table_data = {
@@ -626,8 +626,10 @@ class TestBuildSourceDataframeOrchestration:
         result = build_source_dataframe(MagicMock(), "bucket")
 
         expected_cols = {
-            "business_unit", "did", "activity_date", "transaction_type",
-            "account_number", "usage_type", "amount", "tj_name",
+            "InvoiceLine.Business_Unit", "InvoiceLine.Department_Id",
+            "TransactionJournal.ActivityDate", "TransactionJournal.TransactionType",
+            "Account.AccountNumber", "TransactionJournal.UsageType",
+            "TransactionJournal.CreditDebit", "TransactionJournal.Name",
         }
         assert expected_cols == set(result.columns)
 

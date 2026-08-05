@@ -253,7 +253,7 @@ def build_reference_to_account_lookup(invoice: pd.DataFrame, credit_memo: pd.Dat
       Refund.AccountId -> Account.Id
       InvoiceLine.InvoiceId -> Invoice.Id -> Invoice.BillingAccountId -> Account.Id
       InvoiceLineTax.InvoiceLineId -> InvoiceLine.Id -> (same as above)
-      Account.Name
+      Account.AccountNumber
     """
     def prep(df, id_col_source, rename_to="AccountId"):
         if df.empty:
@@ -412,16 +412,29 @@ def build_source_dataframe(s3_client, bucket: str, source_prefix: str = "salesfo
     tj["AccountNumber"] = tj["AccountNumber"].apply(clean_account_number)
     tj["amount"] = resolve_amount(tj)
 
+    # Column names are Table.Column style directly — moved upstream from a
+    # separate validation-only relabeling step, per Dakota, since keeping one
+    # consistent naming scheme everywhere was preferred over a two-step
+    # rename. Two of these aren't strict 1:1 source mappings, worth knowing:
+    #   InvoiceLine.Business_Unit / .Department_Id: resolved
+    #     polymorphically (InvoiceLine directly, or via Payment/CreditMemo
+    #     fallback chains) but always ultimately InvoiceLine's own fields
+    #     regardless of path.
+    #   TransactionJournal.CreditDebit: derived from EITHER
+    #     TransactionJournal.Credit or .Debit (whichever is populated,
+    #     sign-flipped for Credit) — not a single literal field.
     result = tj[[
         "bu", "did", "ActivityDate", "TransactionType",
         "AccountNumber", "UsageType", "amount", "Name",
     ]].rename(columns={
-        "bu": "business_unit",
-        "ActivityDate": "activity_date",
-        "TransactionType": "transaction_type",
-        "AccountNumber": "account_number",
-        "UsageType": "usage_type",
-        "Name": "tj_name",  # TransactionJournal.Name -> Journal Header Description
+        "bu": "InvoiceLine.Business_Unit",
+        "did": "InvoiceLine.Department_Id",
+        "ActivityDate": "TransactionJournal.ActivityDate",
+        "TransactionType": "TransactionJournal.TransactionType",
+        "AccountNumber": "Account.AccountNumber",
+        "UsageType": "TransactionJournal.UsageType",
+        "amount": "TransactionJournal.CreditDebit",
+        "Name": "TransactionJournal.Name",  # -> Journal Header Description
     })
 
     return result

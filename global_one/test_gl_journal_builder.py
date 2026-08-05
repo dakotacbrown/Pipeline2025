@@ -316,7 +316,7 @@ class TestBuildGlFile:
     def test_multi_bu_mode_with_no_business_unit_column_produces_header_only(self):
         # business_unit=None but the dataframe doesn't even have a
         # business_unit column — covers the "else: bu_groups = []" branch
-        df = pd.DataFrame([{"account": "123", "amount": 5.0}])
+        df = pd.DataFrame([{"account": "123", "TransactionJournal.CreditDebit": 5.0}])
         content = build_gl_file(df, business_unit=None, source="CS1",
                                  creation_dt=datetime(2026, 8, 4))
         lines = content.split("\n")
@@ -327,10 +327,10 @@ class TestBuildGlFile:
 
     def test_multi_bu_mode_groups_by_distinct_business_unit(self):
         df = pd.DataFrame([
-            {"business_unit": "US001", "did": "10500", "account_number": "A", "amount": 10.0,
-             "usage_type": "", "transaction_type": "", "tj_name": "Batch A"},
-            {"business_unit": "EU002", "did": "20500", "account_number": "B", "amount": 20.0,
-             "usage_type": "", "transaction_type": "", "tj_name": "Batch B"},
+            {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500", "Account.AccountNumber": "A", "TransactionJournal.CreditDebit": 10.0,
+             "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": "Batch A"},
+            {"InvoiceLine.Business_Unit": "EU002", "InvoiceLine.Department_Id": "20500", "Account.AccountNumber": "B", "TransactionJournal.CreditDebit": 20.0,
+             "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": "Batch B"},
         ])
         content = build_gl_file(df, business_unit=None, source="CS1",
                                  creation_dt=datetime(2026, 8, 4))
@@ -342,10 +342,10 @@ class TestBuildGlFile:
 
     def test_multi_bu_groups_sorted_alphabetically(self):
         df = pd.DataFrame([
-            {"business_unit": "US002", "did": "1", "account_number": "", "amount": 1.0,
-             "usage_type": "", "transaction_type": "", "tj_name": ""},
-            {"business_unit": "EU001", "did": "2", "account_number": "", "amount": 1.0,
-             "usage_type": "", "transaction_type": "", "tj_name": ""},
+            {"InvoiceLine.Business_Unit": "US002", "InvoiceLine.Department_Id": "1", "Account.AccountNumber": "", "TransactionJournal.CreditDebit": 1.0,
+             "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": ""},
+            {"InvoiceLine.Business_Unit": "EU001", "InvoiceLine.Department_Id": "2", "Account.AccountNumber": "", "TransactionJournal.CreditDebit": 1.0,
+             "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": ""},
         ])
         content = build_gl_file(df, business_unit=None, source="CS1",
                                  creation_dt=datetime(2026, 8, 4))
@@ -356,10 +356,10 @@ class TestBuildGlFile:
 
     def test_filtering_to_single_business_unit_excludes_others(self):
         df = pd.DataFrame([
-            {"business_unit": "US001", "did": "1", "account_number": "", "amount": 1.0,
-             "usage_type": "", "transaction_type": "", "tj_name": ""},
-            {"business_unit": "EU002", "did": "2", "account_number": "", "amount": 1.0,
-             "usage_type": "", "transaction_type": "", "tj_name": ""},
+            {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "1", "Account.AccountNumber": "", "TransactionJournal.CreditDebit": 1.0,
+             "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": ""},
+            {"InvoiceLine.Business_Unit": "EU002", "InvoiceLine.Department_Id": "2", "Account.AccountNumber": "", "TransactionJournal.CreditDebit": 1.0,
+             "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": ""},
         ])
         content = build_gl_file(df, business_unit="US001", source="CS1",
                                  creation_dt=datetime(2026, 8, 4))
@@ -398,9 +398,9 @@ class TestBuildFilename:
 class TestRunOrchestration:
     def _sample_df(self):
         return pd.DataFrame([
-            {"business_unit": "US001", "did": "10500", "account_number": "Acme",
-             "amount": 100.0, "usage_type": "Storage", "transaction_type": "InvoiceLine",
-             "tj_name": "Batch"},
+            {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500", "Account.AccountNumber": "Acme",
+             "TransactionJournal.CreditDebit": 100.0, "TransactionJournal.UsageType": "Storage", "TransactionJournal.TransactionType": "InvoiceLine",
+             "TransactionJournal.Name": "Batch"},
         ])
 
     def test_calls_build_source_dataframe_and_uploads(self, monkeypatch):
@@ -417,10 +417,10 @@ class TestRunOrchestration:
 
     def test_filters_by_business_unit_when_given(self, monkeypatch):
         fake_df = pd.DataFrame([
-            {"business_unit": "US001", "did": "10500", "account_number": "A", "amount": 1.0,
-             "usage_type": "", "transaction_type": "", "tj_name": ""},
-            {"business_unit": "US002", "did": "20500", "account_number": "B", "amount": 2.0,
-             "usage_type": "", "transaction_type": "", "tj_name": ""},
+            {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500", "Account.AccountNumber": "A", "TransactionJournal.CreditDebit": 1.0,
+             "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": ""},
+            {"InvoiceLine.Business_Unit": "US002", "InvoiceLine.Department_Id": "20500", "Account.AccountNumber": "B", "TransactionJournal.CreditDebit": 2.0,
+             "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": ""},
         ])
         monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: fake_df)
 
@@ -522,6 +522,29 @@ class TestRunOrchestration:
         keys_written = [call.kwargs["Key"] for call in s3.put_object.call_args_list]
         assert any(k.endswith(".parquet") for k in keys_written)
 
+    def test_validation_file_uses_table_dot_column_headers(self, monkeypatch):
+        # Table.Column naming now comes directly from build_source_dataframe
+        # (moved upstream from a separate validation-only relabeling step),
+        # so the same dataframe used to build the GL file is also what gets
+        # written to the validation file — this just confirms it flows
+        # through end-to-end.
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
+        s3 = MagicMock()
+        log = MagicMock()
+
+        gljb.run(log, s3, "bucket", "outbound", "BX1",
+                 validation_key_prefix="validation", validation_file_type="csv")
+
+        validation_calls = [
+            call for call in s3.put_object.call_args_list
+            if call.kwargs["Key"].endswith(".csv")
+        ]
+        assert len(validation_calls) == 1
+        body = validation_calls[0].kwargs["Body"]
+        assert b"Account.AccountNumber" in body
+        assert b"InvoiceLine.Business_Unit" in body
+        assert b"TransactionJournal.CreditDebit" in body
+
     def test_logs_progress_through_run(self, monkeypatch):
         monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
         s3 = MagicMock()
@@ -537,7 +560,7 @@ class TestRunOrchestration:
 
     def test_run_with_empty_result_still_produces_valid_file(self, monkeypatch):
         monkeypatch.setattr(glsj, "build_source_dataframe",
-                             lambda *a, **k: pd.DataFrame(columns=["business_unit"]))
+                             lambda *a, **k: pd.DataFrame(columns=["InvoiceLine.Business_Unit"]))
         s3 = MagicMock()
         log = MagicMock()
 
@@ -642,9 +665,9 @@ VALID_ARGV = [
 
 def sample_df():
     return pd.DataFrame([
-        {"business_unit": "US001", "did": "10500", "account_number": "Acme",
-         "amount": 100.0, "usage_type": "Storage", "transaction_type": "InvoiceLine",
-         "tj_name": "Batch"},
+        {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500", "Account.AccountNumber": "Acme",
+         "TransactionJournal.CreditDebit": 100.0, "TransactionJournal.UsageType": "Storage", "TransactionJournal.TransactionType": "InvoiceLine",
+         "TransactionJournal.Name": "Batch"},
     ])
 
 

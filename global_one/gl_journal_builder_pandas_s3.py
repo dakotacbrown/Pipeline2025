@@ -74,21 +74,7 @@ def read_table_by_dataset_id(s3_client, bucket: str, dataset_id: str, expected_c
 
 
 # ---------------------------------------------------------------------------
-# 2. Load + join sources
-# ---------------------------------------------------------------------------
-
-def load_and_join(bucket: str, txn_prefix: str, dept_prefix: str, project_prefix: str) -> pd.DataFrame:
-    txns = read_jsonl_prefix_from_s3(bucket, txn_prefix)
-    depts = read_jsonl_prefix_from_s3(bucket, dept_prefix)
-    projects = read_jsonl_prefix_from_s3(bucket, project_prefix)
-
-    df = txns.merge(depts, on="dept_id", how="left", suffixes=("", "_dept"))
-    df = df.merge(projects, on="project_id", how="left", suffixes=("", "_proj"))
-    return df
-
-
-# ---------------------------------------------------------------------------
-# 3. Fixed-width formatting helpers
+# 2. Fixed-width formatting helpers
 # ---------------------------------------------------------------------------
 
 def fmt(value, length, justify="left", fill=" "):
@@ -176,7 +162,7 @@ def file_trailer(row_count, total_debits, total_credits, total_stat=0):
 
 
 # ---------------------------------------------------------------------------
-# 4. Assemble full file from the joined dataframe
+# 3. Assemble full file from the joined dataframe
 # ---------------------------------------------------------------------------
 
 def build_gl_file(df: pd.DataFrame, business_unit: str = None, source: str = "",
@@ -247,7 +233,7 @@ def build_gl_file(df: pd.DataFrame, business_unit: str = None, source: str = "",
 
 
 # ---------------------------------------------------------------------------
-# 5. Filename + upload
+# 4. Filename + upload
 # ---------------------------------------------------------------------------
 
 def build_filename(prefix: str, creation_dt: datetime) -> str:

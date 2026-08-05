@@ -1,22 +1,37 @@
 """
-Tests for the GL Journal Entry Interface builder.
+Tests for gl_journal_builder_pandas_s3.py — fixed-width formatting, the S3
+read/write boundary, run() orchestration, and main() (the Databricks entry
+point).
 
 Run with: pytest test_gl_journal_builder.py -v
 
 Covers:
-  - fixed-width formatting primitives (fmt, build_line)
-  - each record builder against the exact field lengths from the spec
-  - full file assembly (newline delimiting, trailer totals, row count)
+  - fmt() / build_line(): fixed-width formatting primitives
+  - each record builder (#H, H, L, #T) against the exact field lengths
+  - full file assembly (newline delimiting, trailer totals, row count,
+    multi-BU grouping)
   - filename convention
-  - source-join logic (account resolution, bu/did resolution, amount sign)
+  - S3 boundary functions (find_dataset_prefix, read_jsonl_from_s3,
+    read_jsonl_prefix_from_s3, read_table_by_dataset_id, upload_to_s3,
+    write_success_file, save_validation_parquet), all mocked
+  - run(): full orchestration with a mocked build_source_dataframe
+  - main(): the Databricks entry point, with the three environment-only
+    dependencies (asvc1scoredataservices_common, pyspark, helpers) faked
+    via sys.modules injection
 """
 
+import sys
+import types
 from datetime import datetime
 from decimal import Decimal
+from io import BytesIO
+from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
 
+import gl_journal_builder_pandas_s3 as gljb
+import gl_source_join as glsj
 from gl_journal_builder_pandas_s3 import (
     fmt,
     build_line,
@@ -26,12 +41,13 @@ from gl_journal_builder_pandas_s3 import (
     file_trailer,
     build_gl_file,
     build_filename,
-)
-from gl_source_join import (
-    resolve_bu_did,
-    build_reference_to_account_lookup,
-    clean_account_name,
-    resolve_amount,
+    find_dataset_prefix,
+    read_jsonl_from_s3,
+    read_jsonl_prefix_from_s3,
+    read_table_by_dataset_id,
+    upload_to_s3,
+    write_success_file,
+    save_validation_parquet,
 )
 
 
@@ -62,6 +78,12 @@ class TestFmt:
         for val in ["", "x", "xxxxxxxxxx", None, 123, 45.6]:
             assert len(fmt(val, 6)) == 6
 
+    def test_integer_value_formatted(self):
+        assert fmt(42, 5) == "42   "
+
+    def test_zero_length_field_returns_empty_string(self):
+        assert fmt("anything", 0) == ""
+
 
 class TestBuildLine:
     def test_concatenates_fields_in_order(self):
@@ -74,6 +96,9 @@ class TestBuildLine:
     def test_total_length_matches_sum_of_field_lengths(self):
         fields = [("x", 5, "left", " "), ("y", 10, "left", " "), ("z", 3, "right", " ")]
         assert len(build_line(fields)) == 5 + 10 + 3
+
+    def test_empty_field_list_returns_empty_string(self):
+        assert build_line([]) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +118,14 @@ class TestFileHeader:
         line = file_header(datetime(2026, 8, 4, 14, 32, 30))
         assert line[2:10] == "20260804"
         assert line[10:16] == "143230"
+
+    def test_custom_transmit_id_included(self):
+        line = file_header(datetime(2026, 8, 4), transmit_id="TX1")
+        assert line[16:24] == "TX1     "
+
+    def test_blank_transmit_id_by_default(self):
+        line = file_header(datetime(2026, 8, 4))
+        assert line[16:24] == " " * 8
 
 
 class TestJournalHeader:
@@ -123,6 +156,15 @@ class TestJournalHeader:
     def test_blank_description_by_default(self):
         line = journal_header("US001", "08042026", "RCL")
         assert line[78:108] == " " * 30
+
+    def test_source_field_in_correct_position(self):
+        line = journal_header("US001", "08042026", "CS1")
+        # position 68-70 (1-indexed) -> [67:70] zero-indexed
+        assert line[67:70] == "CS1"
+
+    def test_business_unit_in_correct_position(self):
+        line = journal_header("US042", "08042026", "RCL")
+        assert line[1:6] == "US042"
 
 
 class TestJournalLine:
@@ -159,12 +201,23 @@ class TestJournalLine:
                              txn_monetary_amount=99.999)
         assert "100.00" in line or "100" in line  # rounds up to 100.00
 
+    def test_account_field_in_correct_position(self):
+        line = journal_line(business_unit="US001", account="87654321")
+        # position 26-35 (1-indexed) -> [25:35]
+        assert line[25:35] == "87654321  "
+
+    def test_currency_rate_type_standard_value(self):
+        line = journal_line(business_unit="US001", account="12345678")
+        # position 277-281 (1-indexed) -> [276:281]
+        assert line[276:281] == "USDLY"
+
+    def test_us_lowercase_still_matches_corp(self):
+        line = journal_line(business_unit="us001", account="12345678")
+        assert line[15:25] == "CORP      "
+
 
 class TestFileTrailer:
     def test_length_matches_spec(self):
-        # 2+9+28+25+25+5 = 94... wait, per spec File Trailer Filler is 96-100 (5 chars)
-        # Record Type(2) + Row Count(9) + Total Debits(28) + Total Credits(25)
-        # + Total Statistical Amount(25) + Filler(5) = 94... check against spec positions
         line = file_trailer(3, Decimal("1500.00"), Decimal("-1500.00"), 0)
         assert len(line) == 2 + 9 + 28 + 25 + 25 + 5
 
@@ -180,6 +233,14 @@ class TestFileTrailer:
         line = file_trailer(1, Decimal("1500"), Decimal("-500"), 0)
         assert "1500.00" in line
         assert "-500.00" in line
+
+    def test_total_statistical_amount_included(self):
+        line = file_trailer(1, Decimal("0"), Decimal("0"), Decimal("42.50"))
+        assert "42.50" in line
+
+    def test_large_row_count_still_fits(self):
+        line = file_trailer(999999999, Decimal("0"), Decimal("0"), 0)
+        assert line[2:11] == "999999999"
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +309,58 @@ class TestBuildGlFile:
         journal_header_line = content.split("\n")[1]
         assert journal_header_line[78:108] == "RevCloud Batch".ljust(30)
 
+    def test_multi_bu_mode_with_no_business_unit_column_produces_header_only(self):
+        # business_unit=None but the dataframe doesn't even have a
+        # business_unit column — covers the "else: bu_groups = []" branch
+        df = pd.DataFrame([{"account": "123", "amount": 5.0}])
+        content = build_gl_file(df, business_unit=None, source="CS1",
+                                 creation_dt=datetime(2026, 8, 4))
+        lines = content.split("\n")
+        # file_header + file_trailer + trailing blank = 3 (no journal groups at all)
+        assert len(lines) == 3
+        assert lines[0].startswith("#H")
+        assert lines[1].startswith("#T")
+
+    def test_multi_bu_mode_groups_by_distinct_business_unit(self):
+        df = pd.DataFrame([
+            {"business_unit": "US001", "did": "10500", "account_name": "A", "amount": 10.0,
+             "usage_type": "", "transaction_type": "", "tj_name": "Batch A"},
+            {"business_unit": "EU002", "did": "20500", "account_name": "B", "amount": 20.0,
+             "usage_type": "", "transaction_type": "", "tj_name": "Batch B"},
+        ])
+        content = build_gl_file(df, business_unit=None, source="CS1",
+                                 creation_dt=datetime(2026, 8, 4))
+        lines = content.split("\n")
+        # #H + 2x(H + L) + #T + trailing blank = 7
+        assert len(lines) == 7
+        h_lines = [l for l in lines if l.startswith("H")]
+        assert len(h_lines) == 2
+
+    def test_multi_bu_groups_sorted_alphabetically(self):
+        df = pd.DataFrame([
+            {"business_unit": "US002", "did": "1", "account_name": "", "amount": 1.0,
+             "usage_type": "", "transaction_type": "", "tj_name": ""},
+            {"business_unit": "EU001", "did": "2", "account_name": "", "amount": 1.0,
+             "usage_type": "", "transaction_type": "", "tj_name": ""},
+        ])
+        content = build_gl_file(df, business_unit=None, source="CS1",
+                                 creation_dt=datetime(2026, 8, 4))
+        lines = content.split("\n")
+        h_lines = [l for l in lines if l.startswith("H")]
+        assert h_lines[0][1:6] == "EU001"
+        assert h_lines[1][1:6] == "US002"
+
+    def test_filtering_to_single_business_unit_excludes_others(self):
+        df = pd.DataFrame([
+            {"business_unit": "US001", "did": "1", "account_name": "", "amount": 1.0,
+             "usage_type": "", "transaction_type": "", "tj_name": ""},
+            {"business_unit": "EU002", "did": "2", "account_name": "", "amount": 1.0,
+             "usage_type": "", "transaction_type": "", "tj_name": ""},
+        ])
+        content = build_gl_file(df, business_unit="US001", source="CS1",
+                                 creation_dt=datetime(2026, 8, 4))
+        assert "EU002" not in content
+
 
 # ---------------------------------------------------------------------------
 # Filename convention
@@ -264,278 +377,697 @@ class TestBuildFilename:
         with pytest.raises(ValueError):
             build_filename("BXYZ", datetime(2026, 1, 30))
 
+    def test_rejects_empty_prefix(self):
+        with pytest.raises(ValueError):
+            build_filename("", datetime(2026, 1, 30))
+
+    def test_filename_ends_with_txt(self):
+        name = build_filename("CS1", datetime(2026, 1, 1))
+        assert name.endswith(".txt")
+
 
 # ---------------------------------------------------------------------------
-# Source join logic
+# find_dataset_prefix() — pure function
 # ---------------------------------------------------------------------------
 
-class TestResolveAmount:
-    def test_credit_becomes_negative(self):
-        tj = pd.DataFrame([{"Credit": 100.0, "Debit": None}])
-        result = resolve_amount(tj)
-        assert result.iloc[0] == -100.0
+class TestFindDatasetPrefix:
+    def test_default_pattern(self):
+        result = find_dataset_prefix("my-bucket", "abc-123")
+        assert result == "salesforce/abc-123/"
 
-    def test_debit_stays_positive(self):
-        tj = pd.DataFrame([{"Credit": None, "Debit": 250.0}])
-        result = resolve_amount(tj)
-        assert result.iloc[0] == 250.0
+    def test_with_base_prefix(self):
+        result = find_dataset_prefix("my-bucket", "abc-123", base_prefix="raw")
+        assert result == "raw/salesforce/abc-123/"
 
-    def test_credit_takes_priority_when_both_populated(self):
-        # per spec: "if one is null chose the other" — credit checked first
-        tj = pd.DataFrame([{"Credit": 50.0, "Debit": 75.0}])
-        result = resolve_amount(tj)
-        assert result.iloc[0] == -50.0
+    def test_base_prefix_with_leading_and_trailing_slashes_stripped(self):
+        result = find_dataset_prefix("my-bucket", "abc-123", base_prefix="/raw/")
+        assert result == "raw/salesforce/abc-123/"
 
-    def test_both_null_returns_null(self):
-        tj = pd.DataFrame([{"Credit": None, "Debit": None}])
-        result = resolve_amount(tj)
-        assert pd.isna(result.iloc[0])
+    def test_custom_vendor(self):
+        result = find_dataset_prefix("my-bucket", "abc-123", vendor="other_vendor")
+        assert result == "other_vendor/abc-123/"
 
+    def test_empty_base_prefix_omitted_from_path(self):
+        result = find_dataset_prefix("my-bucket", "abc-123", base_prefix="")
+        assert "//" not in result
+        assert result == "salesforce/abc-123/"
 
-class TestCleanAccountName:
-    def test_strips_single_leading_a_only(self):
-        # per Dakota: "removed the leading A" — one character, not "A-".
-        # Using a non-word example so the stripping behavior itself is
-        # unambiguous (real account names may legitimately start with "A").
-        assert clean_account_name("A9999-TestAccount") == "9999-TestAccount"
-
-    def test_does_not_strip_if_no_leading_a(self):
-        assert clean_account_name("Beta LLC") == "Beta LLC"
-
-    def test_nan_passthrough(self):
-        assert pd.isna(clean_account_name(float("nan")))
+    def test_always_ends_with_trailing_slash(self):
+        result = find_dataset_prefix("my-bucket", "abc-123", base_prefix="raw", vendor="v")
+        assert result.endswith("/")
 
 
-class TestBuildReferenceToAccountLookup:
-    def _empty_il(self):
-        return pd.DataFrame([], columns=["Id", "InvoiceId"])
+# ---------------------------------------------------------------------------
+# read_jsonl_from_s3() — mocked S3 client
+# ---------------------------------------------------------------------------
 
-    def _empty_ilt(self):
-        return pd.DataFrame([], columns=["Id", "InvoiceLineId"])
+class TestReadJsonlFromS3:
+    def _make_s3_client(self, jsonl_bytes):
+        s3 = MagicMock()
+        s3.get_object.return_value = {"Body": BytesIO(jsonl_bytes)}
+        return s3
 
-    def test_resolves_account_name_via_invoice(self):
-        invoice = pd.DataFrame([{"Id": "INV1", "BillingAccountId": "ACC1"}])
-        credit_memo = pd.DataFrame([], columns=["Id", "BillingAccountId"])
-        payment = pd.DataFrame([], columns=["Id", "AccountId"])
-        refund = pd.DataFrame([], columns=["Id", "AccountId"])
-        account = pd.DataFrame([{"Id": "ACC1", "Name": "A-Acme Corp"}])
+    def test_reads_single_line_jsonl(self):
+        content = b'{"Id": "A1", "Name": "Test"}\n'
+        s3 = self._make_s3_client(content)
+        df = read_jsonl_from_s3(s3, "bucket", "key.jsonl")
+        assert len(df) == 1
+        assert df.iloc[0]["Id"] == "A1"
 
-        lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
-                                                     self._empty_il(), self._empty_ilt(), account)
-        row = lookup[lookup["ReferenceTransactionRecordId"] == "INV1"].iloc[0]
-        assert row["AccountName"] == "A-Acme Corp"
+    def test_reads_multi_line_jsonl(self):
+        content = b'{"Id": "A1"}\n{"Id": "A2"}\n{"Id": "A3"}\n'
+        s3 = self._make_s3_client(content)
+        df = read_jsonl_from_s3(s3, "bucket", "key.jsonl")
+        assert len(df) == 3
+        assert list(df["Id"]) == ["A1", "A2", "A3"]
 
-    def test_resolves_account_name_via_payment(self):
-        invoice = pd.DataFrame([], columns=["Id", "BillingAccountId"])
-        credit_memo = pd.DataFrame([], columns=["Id", "BillingAccountId"])
-        payment = pd.DataFrame([{"Id": "PAY1", "AccountId": "ACC2"}])
-        refund = pd.DataFrame([], columns=["Id", "AccountId"])
-        account = pd.DataFrame([{"Id": "ACC2", "Name": "Beta LLC"}])
+    def test_calls_get_object_with_correct_bucket_and_key(self):
+        s3 = self._make_s3_client(b'{"Id": "A1"}\n')
+        read_jsonl_from_s3(s3, "my-bucket", "path/to/file.jsonl")
+        s3.get_object.assert_called_once_with(Bucket="my-bucket", Key="path/to/file.jsonl")
 
-        lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
-                                                     self._empty_il(), self._empty_ilt(), account)
-        row = lookup[lookup["ReferenceTransactionRecordId"] == "PAY1"].iloc[0]
-        assert row["AccountName"] == "Beta LLC"
 
-    def test_resolves_account_name_via_invoice_line_bug_fix(self):
-        # This is the bug: TransactionType='InvoiceLine' means
-        # ReferenceTransactionRecordId = InvoiceLine.Id, NOT Invoice.Id.
-        # Before the fix, this returned a null account name for every
-        # InvoiceLine/InvoiceLineTax row — likely the bulk of the data.
-        invoice = pd.DataFrame([{"Id": "INV1", "BillingAccountId": "ACC1"}])
-        credit_memo = pd.DataFrame([], columns=["Id", "BillingAccountId"])
-        payment = pd.DataFrame([], columns=["Id", "AccountId"])
-        refund = pd.DataFrame([], columns=["Id", "AccountId"])
-        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1"}])
-        account = pd.DataFrame([{"Id": "ACC1", "Name": "A-Gamma Inc"}])
+# ---------------------------------------------------------------------------
+# read_jsonl_prefix_from_s3() — mocked paginator
+# ---------------------------------------------------------------------------
 
-        lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
-                                                     invoice_line, self._empty_ilt(), account)
-        row = lookup[lookup["ReferenceTransactionRecordId"] == "IL1"].iloc[0]
-        assert row["AccountName"] == "A-Gamma Inc"
+class TestReadJsonlPrefixFromS3:
+    def _make_s3_client(self, pages, file_contents):
+        """
+        pages: list of {"Contents": [{"Key": ...}, ...]} dicts
+        file_contents: dict of key -> jsonl bytes
+        """
+        s3 = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = pages
+        s3.get_paginator.return_value = paginator
 
-    def test_resolves_account_name_via_invoice_line_tax_bug_fix(self):
-        # Same bug, one hop further: TransactionType='InvoiceLineTax' means
-        # ReferenceTransactionRecordId = InvoiceLineTax.Id.
-        invoice = pd.DataFrame([{"Id": "INV1", "BillingAccountId": "ACC1"}])
-        credit_memo = pd.DataFrame([], columns=["Id", "BillingAccountId"])
-        payment = pd.DataFrame([], columns=["Id", "AccountId"])
-        refund = pd.DataFrame([], columns=["Id", "AccountId"])
-        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1"}])
-        invoice_line_tax = pd.DataFrame([{"Id": "ILT1", "InvoiceLineId": "IL1"}])
-        account = pd.DataFrame([{"Id": "ACC1", "Name": "A-Delta Co"}])
+        def get_object(Bucket, Key):
+            return {"Body": BytesIO(file_contents[Key])}
 
-        lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
-                                                     invoice_line, invoice_line_tax, account)
-        row = lookup[lookup["ReferenceTransactionRecordId"] == "ILT1"].iloc[0]
-        assert row["AccountName"] == "A-Delta Co"
+        s3.get_object.side_effect = get_object
+        return s3
 
-    def test_ids_are_globally_unique_no_collisions(self):
-        # Salesforce IDs are unique across objects — confirms union approach is safe
-        invoice = pd.DataFrame([{"Id": "REC1", "BillingAccountId": "ACC1"}])
-        credit_memo = pd.DataFrame([{"Id": "REC2", "BillingAccountId": "ACC2"}])
-        payment = pd.DataFrame([{"Id": "REC3", "AccountId": "ACC3"}])
-        refund = pd.DataFrame([{"Id": "REC4", "AccountId": "ACC4"}])
-        account = pd.DataFrame([
-            {"Id": "ACC1", "Name": "One"}, {"Id": "ACC2", "Name": "Two"},
-            {"Id": "ACC3", "Name": "Three"}, {"Id": "ACC4", "Name": "Four"},
+    def test_concats_multiple_files_under_prefix(self):
+        pages = [{"Contents": [{"Key": "p/part1.jsonl"}, {"Key": "p/part2.jsonl"}]}]
+        contents = {
+            "p/part1.jsonl": b'{"Id": "A1"}\n',
+            "p/part2.jsonl": b'{"Id": "A2"}\n',
+        }
+        s3 = self._make_s3_client(pages, contents)
+        df = read_jsonl_prefix_from_s3(s3, "bucket", "p/")
+        assert len(df) == 2
+        assert set(df["Id"]) == {"A1", "A2"}
+
+    def test_handles_multiple_pages(self):
+        pages = [
+            {"Contents": [{"Key": "p/part1.jsonl"}]},
+            {"Contents": [{"Key": "p/part2.jsonl"}]},
+        ]
+        contents = {
+            "p/part1.jsonl": b'{"Id": "A1"}\n',
+            "p/part2.jsonl": b'{"Id": "A2"}\n',
+        }
+        s3 = self._make_s3_client(pages, contents)
+        df = read_jsonl_prefix_from_s3(s3, "bucket", "p/")
+        assert len(df) == 2
+
+    def test_ignores_non_jsonl_files(self):
+        pages = [{"Contents": [{"Key": "p/data.jsonl"}, {"Key": "p/_SUCCESS"}, {"Key": "p/README.txt"}]}]
+        contents = {"p/data.jsonl": b'{"Id": "A1"}\n'}
+        s3 = self._make_s3_client(pages, contents)
+        df = read_jsonl_prefix_from_s3(s3, "bucket", "p/")
+        assert len(df) == 1
+
+    def test_accepts_json_extension_too(self):
+        pages = [{"Contents": [{"Key": "p/data.json"}]}]
+        contents = {"p/data.json": b'{"Id": "A1"}\n'}
+        s3 = self._make_s3_client(pages, contents)
+        df = read_jsonl_prefix_from_s3(s3, "bucket", "p/")
+        assert len(df) == 1
+
+    def test_empty_prefix_returns_empty_df_with_expected_columns(self):
+        pages = [{"Contents": []}]
+        s3 = self._make_s3_client(pages, {})
+        df = read_jsonl_prefix_from_s3(s3, "bucket", "p/", expected_columns=["Id", "Name"])
+        assert len(df) == 0
+        assert list(df.columns) == ["Id", "Name"]
+
+    def test_empty_prefix_no_expected_columns_returns_empty_df(self):
+        pages = [{"Contents": []}]
+        s3 = self._make_s3_client(pages, {})
+        df = read_jsonl_prefix_from_s3(s3, "bucket", "p/")
+        assert len(df) == 0
+
+    def test_page_with_no_contents_key_handled_gracefully(self):
+        # Contents key can be absent entirely (e.g. a truly empty listing)
+        pages = [{}]
+        s3 = self._make_s3_client(pages, {})
+        df = read_jsonl_prefix_from_s3(s3, "bucket", "p/", expected_columns=["Id"])
+        assert len(df) == 0
+
+
+# ---------------------------------------------------------------------------
+# read_table_by_dataset_id() — combines find_dataset_prefix + prefix read
+# ---------------------------------------------------------------------------
+
+class TestReadTableByDatasetId:
+    def test_builds_correct_prefix_and_reads(self):
+        s3 = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [{"Contents": [{"Key": "salesforce/DSID1/data.jsonl"}]}]
+        s3.get_paginator.return_value = paginator
+        s3.get_object.return_value = {"Body": BytesIO(b'{"Id": "X1"}\n')}
+
+        df = read_table_by_dataset_id(s3, "bucket", "DSID1")
+
+        paginator.paginate.assert_called_once_with(Bucket="bucket", Prefix="salesforce/DSID1/")
+        assert len(df) == 1
+
+    def test_passes_through_expected_columns_on_empty_result(self):
+        s3 = MagicMock()
+        paginator = MagicMock()
+        paginator.paginate.return_value = [{"Contents": []}]
+        s3.get_paginator.return_value = paginator
+
+        df = read_table_by_dataset_id(s3, "bucket", "DSID1", expected_columns=["Id", "Name"])
+        assert list(df.columns) == ["Id", "Name"]
+
+
+# ---------------------------------------------------------------------------
+# upload_to_s3() / write_success_file()
+# ---------------------------------------------------------------------------
+
+class TestUploadToS3:
+    def test_uploads_with_correct_key(self):
+        s3 = MagicMock()
+        url = upload_to_s3(s3, "file content", "my-bucket", "outbound", "BX1_20260804.txt")
+        s3.put_object.assert_called_once_with(
+            Bucket="my-bucket", Key="outbound/BX1_20260804.txt", Body=b"file content"
+        )
+        assert url == "s3://my-bucket/outbound/BX1_20260804.txt"
+
+    def test_strips_trailing_slash_from_prefix(self):
+        s3 = MagicMock()
+        upload_to_s3(s3, "x", "bucket", "outbound/", "file.txt")
+        s3.put_object.assert_called_once_with(Bucket="bucket", Key="outbound/file.txt", Body=b"x")
+
+    def test_encodes_content_as_utf8_bytes(self):
+        s3 = MagicMock()
+        upload_to_s3(s3, "héllo", "bucket", "prefix", "file.txt")
+        call_kwargs = s3.put_object.call_args.kwargs
+        assert call_kwargs["Body"] == "héllo".encode("utf-8")
+
+
+class TestWriteSuccessFile:
+    def test_writes_empty_success_marker(self):
+        s3 = MagicMock()
+        url = write_success_file(s3, "my-bucket", "outbound")
+        s3.put_object.assert_called_once_with(Bucket="my-bucket", Key="outbound/_SUCCESS", Body=b"")
+        assert url == "s3://my-bucket/outbound/_SUCCESS"
+
+    def test_strips_trailing_slash(self):
+        s3 = MagicMock()
+        write_success_file(s3, "bucket", "outbound/")
+        s3.put_object.assert_called_once_with(Bucket="bucket", Key="outbound/_SUCCESS", Body=b"")
+
+
+# ---------------------------------------------------------------------------
+# save_validation_parquet()
+# ---------------------------------------------------------------------------
+
+class TestSaveValidationParquet:
+    def test_key_follows_year_month_day_partition_pattern(self):
+        s3 = MagicMock()
+        df = pd.DataFrame([{"a": 1}])
+        dt = datetime(2026, 8, 4, 14, 32, 30)
+        url = save_validation_parquet(s3, df, "bucket", "validation", creation_dt=dt)
+        assert "year=2026/month=08/day=04/" in url
+        assert url.startswith("s3://bucket/validation/year=2026/month=08/day=04/general_ledger_")
+        assert url.endswith(".parquet")
+
+    def test_filename_uses_epoch_timestamp(self):
+        s3 = MagicMock()
+        df = pd.DataFrame([{"a": 1}])
+        dt = datetime(2026, 1, 30, 14, 2, 30)
+        url = save_validation_parquet(s3, df, "bucket", "validation", creation_dt=dt)
+        expected_epoch = int(dt.timestamp())
+        assert f"general_ledger_{expected_epoch}.parquet" in url
+
+    def test_strips_trailing_slash_from_base_prefix(self):
+        s3 = MagicMock()
+        df = pd.DataFrame([{"a": 1}])
+        dt = datetime(2026, 1, 1)
+        url = save_validation_parquet(s3, df, "bucket", "validation/", creation_dt=dt)
+        assert "//" not in url.replace("s3://", "")
+
+    def test_calls_put_object_with_parquet_bytes(self):
+        s3 = MagicMock()
+        df = pd.DataFrame([{"a": 1, "b": "x"}])
+        save_validation_parquet(s3, df, "bucket", "validation", creation_dt=datetime(2026, 1, 1))
+        call_kwargs = s3.put_object.call_args.kwargs
+        assert call_kwargs["Bucket"] == "bucket"
+        assert isinstance(call_kwargs["Body"], bytes)
+        assert len(call_kwargs["Body"]) > 0
+
+    def test_different_dates_produce_different_partitions(self):
+        s3 = MagicMock()
+        df = pd.DataFrame([{"a": 1}])
+        url1 = save_validation_parquet(s3, df, "bucket", "validation", creation_dt=datetime(2026, 1, 1))
+        url2 = save_validation_parquet(s3, df, "bucket", "validation", creation_dt=datetime(2026, 12, 25))
+        assert "month=01/day=01" in url1
+        assert "month=12/day=25" in url2
+
+
+# ---------------------------------------------------------------------------
+# run() — full orchestration, mocked S3 + mocked build_source_dataframe
+# ---------------------------------------------------------------------------
+
+class TestRunOrchestration:
+    def _sample_df(self):
+        return pd.DataFrame([
+            {"business_unit": "US001", "did": "10500", "account_name": "Acme",
+             "amount": 100.0, "usage_type": "Storage", "transaction_type": "InvoiceLine",
+             "tj_name": "Batch"},
         ])
 
-        lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
-                                                     self._empty_il(), self._empty_ilt(), account)
-        assert len(lookup) == 4
-        assert set(lookup["AccountName"]) == {"One", "Two", "Three", "Four"}
+    def test_calls_build_source_dataframe_and_uploads(self, monkeypatch):
+        fake_df = self._sample_df()
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: fake_df)
 
-    def test_missing_account_returns_null_name(self):
-        invoice = pd.DataFrame([{"Id": "INV1", "BillingAccountId": "ACC_MISSING"}])
-        credit_memo = pd.DataFrame([], columns=["Id", "BillingAccountId"])
-        payment = pd.DataFrame([], columns=["Id", "AccountId"])
-        refund = pd.DataFrame([], columns=["Id", "AccountId"])
-        account = pd.DataFrame([], columns=["Id", "Name"])
+        s3 = MagicMock()
+        log = MagicMock()
 
-        lookup = build_reference_to_account_lookup(invoice, credit_memo, payment, refund,
-                                                     self._empty_il(), self._empty_ilt(), account)
-        row = lookup[lookup["ReferenceTransactionRecordId"] == "INV1"].iloc[0]
-        assert pd.isna(row["AccountName"])
+        url, row_count = gljb.run(log, s3, "bucket", "outbound", "BX1")
+
+        assert row_count == 1
+        assert s3.put_object.called
+
+    def test_filters_by_business_unit_when_given(self, monkeypatch):
+        fake_df = pd.DataFrame([
+            {"business_unit": "US001", "did": "10500", "account_name": "A", "amount": 1.0,
+             "usage_type": "", "transaction_type": "", "tj_name": ""},
+            {"business_unit": "US002", "did": "20500", "account_name": "B", "amount": 2.0,
+             "usage_type": "", "transaction_type": "", "tj_name": ""},
+        ])
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: fake_df)
+
+        s3 = MagicMock()
+        log = MagicMock()
+
+        url, row_count = gljb.run(log, s3, "bucket", "outbound", "BX1", business_unit="US001")
+        assert row_count == 1
+
+    def test_skips_validation_parquet_when_prefix_not_given(self, monkeypatch):
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
+        s3 = MagicMock()
+        log = MagicMock()
+
+        gljb.run(log, s3, "bucket", "outbound", "BX1", validation_key_prefix=None)
+
+        # put_object should only be called for the main file + _SUCCESS, not a parquet
+        keys_written = [call.kwargs["Key"] for call in s3.put_object.call_args_list]
+        assert not any(k.endswith(".parquet") for k in keys_written)
+
+    def test_saves_validation_parquet_when_prefix_given(self, monkeypatch):
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
+        s3 = MagicMock()
+        log = MagicMock()
+
+        gljb.run(log, s3, "bucket", "outbound", "BX1", validation_key_prefix="validation")
+
+        keys_written = [call.kwargs["Key"] for call in s3.put_object.call_args_list]
+        assert any(k.endswith(".parquet") for k in keys_written)
+
+    def test_writes_success_marker(self, monkeypatch):
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
+        s3 = MagicMock()
+        log = MagicMock()
+
+        gljb.run(log, s3, "bucket", "outbound", "BX1")
+
+        keys_written = [call.kwargs["Key"] for call in s3.put_object.call_args_list]
+        assert any(k.endswith("_SUCCESS") for k in keys_written)
+
+    def test_returns_s3_url_string(self, monkeypatch):
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
+        s3 = MagicMock()
+        log = MagicMock()
+
+        url, _ = gljb.run(log, s3, "bucket", "outbound", "BX1")
+        assert url.startswith("s3://bucket/outbound/BX1_")
+        assert url.endswith(".txt")
+
+    def test_logs_progress_through_run(self, monkeypatch):
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
+        s3 = MagicMock()
+        log = MagicMock()
+
+        gljb.run(log, s3, "bucket", "outbound", "BX1")
+
+        assert log.info.called
+        messages = [call.args[0] for call in log.info.call_args_list]
+        assert any("building source dataframe" in m for m in messages)
+        assert any("building GL journal file" in m for m in messages)
+        assert any("uploading GL journal file" in m for m in messages)
+
+    def test_run_with_empty_result_still_produces_valid_file(self, monkeypatch):
+        monkeypatch.setattr(glsj, "build_source_dataframe",
+                             lambda *a, **k: pd.DataFrame(columns=["business_unit"]))
+        s3 = MagicMock()
+        log = MagicMock()
+
+        url, row_count = gljb.run(log, s3, "bucket", "outbound", "BX1")
+        assert row_count == 0
 
 
-class TestResolveBuDid:
+# ---------------------------------------------------------------------------
+# main() — the Databricks entry point
+# ---------------------------------------------------------------------------
+#
+# main() does deferred imports of three packages that only exist inside the
+# actual Databricks environment: asvc1scoredataservices_common, pyspark, and
+# helpers.helper_functions. Since those imports happen at call-time (inside
+# the function body, not at module load), we can inject fake versions into
+# sys.modules before calling main() and they'll be picked up instead of
+# raising ImportError. This tests main()'s actual control flow (success
+# path, argument validation, error wrapping, execution-log-on-both-paths)
+# without needing a real cluster.
+
+def install_fake_databricks_modules(monkeypatch, logger_mock=None, new_session_mock=None,
+                                     write_execution_log_mock=None, spark_session_mock=None):
     """
-    All fixtures now include InvoiceId on invoice_line (needed for the
-    header-level fallback paths) and empty frames for payment_line_invoice /
-    credit_memo_inv_application unless a test specifically exercises them.
+    Registers fake asvc1scoredataservices_common / pyspark / helpers packages
+    into sys.modules for the duration of a test. monkeypatch.setitem cleans
+    these up automatically at teardown (removing keys that didn't exist
+    before, restoring ones that did).
     """
+    logger_mock = logger_mock or MagicMock()
+    new_session_mock = new_session_mock or MagicMock()
+    write_execution_log_mock = write_execution_log_mock or MagicMock()
+    spark_session_mock = spark_session_mock or MagicMock()
 
-    def _empties(self):
-        return dict(
-            ilt=pd.DataFrame([], columns=["Id", "InvoiceLineId"]),
-            pli_line=pd.DataFrame([], columns=["PaymentId", "InvoiceLineId"]),
-            pli_header=pd.DataFrame([], columns=["PaymentId", "InvoiceId"]),
-            cml=pd.DataFrame([], columns=["Id", "CreditMemoId"]),
-            cmli=pd.DataFrame([], columns=["CreditMemoLineId", "InvoiceLineId"]),
-            cmia=pd.DataFrame([], columns=["CreditMemoId", "InvoiceId"]),
+    # asvc1scoredataservices_common.logger.basic_logger / .logger
+    basic_logger_mod = types.ModuleType("asvc1scoredataservices_common.logger.basic_logger")
+    basic_logger_mod.setup_logger = MagicMock(return_value=logger_mock)
+
+    logger_logger_mod = types.ModuleType("asvc1scoredataservices_common.logger.logger")
+    logger_logger_mod.write_execution_log_to_s3 = write_execution_log_mock
+
+    logger_pkg = types.ModuleType("asvc1scoredataservices_common.logger")
+    logger_pkg.basic_logger = basic_logger_mod
+    logger_pkg.logger = logger_logger_mod
+
+    top_pkg = types.ModuleType("asvc1scoredataservices_common")
+    top_pkg.logger = logger_pkg
+
+    monkeypatch.setitem(sys.modules, "asvc1scoredataservices_common", top_pkg)
+    monkeypatch.setitem(sys.modules, "asvc1scoredataservices_common.logger", logger_pkg)
+    monkeypatch.setitem(sys.modules, "asvc1scoredataservices_common.logger.basic_logger", basic_logger_mod)
+    monkeypatch.setitem(sys.modules, "asvc1scoredataservices_common.logger.logger", logger_logger_mod)
+
+    # pyspark.sql.SparkSession
+    sql_mod = types.ModuleType("pyspark.sql")
+    fake_spark_session_class = MagicMock()
+    fake_spark_session_class.builder.getOrCreate.return_value = spark_session_mock
+    sql_mod.SparkSession = fake_spark_session_class
+
+    pyspark_pkg = types.ModuleType("pyspark")
+    pyspark_pkg.sql = sql_mod
+
+    monkeypatch.setitem(sys.modules, "pyspark", pyspark_pkg)
+    monkeypatch.setitem(sys.modules, "pyspark.sql", sql_mod)
+
+    # helpers.helper_functions.new_session
+    helper_functions_mod = types.ModuleType("helpers.helper_functions")
+    helper_functions_mod.new_session = new_session_mock
+
+    helpers_pkg = types.ModuleType("helpers")
+    helpers_pkg.helper_functions = helper_functions_mod
+
+    monkeypatch.setitem(sys.modules, "helpers", helpers_pkg)
+    monkeypatch.setitem(sys.modules, "helpers.helper_functions", helper_functions_mod)
+
+    return {
+        "logger": logger_mock,
+        "setup_logger": basic_logger_mod.setup_logger,
+        "new_session": new_session_mock,
+        "write_execution_log_to_s3": write_execution_log_mock,
+        "spark_session": spark_session_mock,
+    }
+
+
+VALID_ARGV = [
+    "gl_journal_builder_pandas_s3.py",
+    "prod",                # env
+    "some_chamber_role",   # chamber_role
+    "some_service_cred",   # service_credential
+    "my-bucket",           # bucket
+    "gl-interface/outbound",       # output_key_prefix
+    "gl-interface/validation",     # validation_key_prefix
+    "BX1",                 # filename_prefix
+]
+
+
+def sample_df():
+    return pd.DataFrame([
+        {"business_unit": "US001", "did": "10500", "account_name": "Acme",
+         "amount": 100.0, "usage_type": "Storage", "transaction_type": "InvoiceLine",
+         "tj_name": "Batch"},
+    ])
+
+
+class TestMainSuccessPath:
+    def test_returns_success_response(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", VALID_ARGV)
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: sample_df())
+        mocks = install_fake_databricks_modules(monkeypatch)
+        mocks["new_session"].return_value.client.return_value = MagicMock()
+
+        result = gljb.main()
+
+        assert result["status_code"] == 200
+        assert result["num_records"] == 1
+        assert result["message"] == "SUCCESS"
+        assert result["s3_url"].startswith("s3://my-bucket/gl-interface/outbound/BX1_")
+
+    def test_calls_new_session_with_service_credential(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", VALID_ARGV)
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: sample_df())
+        mocks = install_fake_databricks_modules(monkeypatch)
+        mocks["new_session"].return_value.client.return_value = MagicMock()
+
+        gljb.main()
+
+        mocks["new_session"].assert_called_once_with("some_service_cred")
+
+    def test_writes_execution_log_with_success_state(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", VALID_ARGV)
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: sample_df())
+        mocks = install_fake_databricks_modules(monkeypatch)
+        mocks["new_session"].return_value.client.return_value = MagicMock()
+
+        gljb.main()
+
+        mocks["write_execution_log_to_s3"].assert_called_once()
+        call_kwargs = mocks["write_execution_log_to_s3"].call_args.kwargs
+        assert call_kwargs["final_state"] == "SUCCESS"
+        assert call_kwargs["failure_message"] is None
+        assert call_kwargs["records_published"] == 1
+        assert call_kwargs["job_name"] == "salesforce_global_one"
+        assert call_kwargs["job_family"] == "salesforce"
+        assert call_kwargs["environment"] == "prod"
+        assert call_kwargs["severity_text"] == "info"
+
+    def test_execution_log_s3_path_includes_env_and_job_name(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", VALID_ARGV)
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: sample_df())
+        mocks = install_fake_databricks_modules(monkeypatch)
+        mocks["new_session"].return_value.client.return_value = MagicMock()
+
+        gljb.main()
+
+        call_kwargs = mocks["write_execution_log_to_s3"].call_args.kwargs
+        assert "c1scoredataservices-prod-east" in call_kwargs["s3_path"]
+        assert "job_family=salesforce" in call_kwargs["s3_path"]
+        assert "job_name=salesforce_global_one" in call_kwargs["s3_path"]
+
+    def test_logs_info_messages_through_success_path(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", VALID_ARGV)
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: sample_df())
+        mocks = install_fake_databricks_modules(monkeypatch)
+        mocks["new_session"].return_value.client.return_value = MagicMock()
+
+        gljb.main()
+
+        messages = [c.args[0] for c in mocks["logger"].info.call_args_list]
+        assert any("retrieving aws credentials" in m for m in messages)
+        assert any("running gl journal builder...complete" in m for m in messages)
+
+    def test_uses_setup_logger_return_value(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", VALID_ARGV)
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: sample_df())
+        mocks = install_fake_databricks_modules(monkeypatch)
+        mocks["new_session"].return_value.client.return_value = MagicMock()
+
+        gljb.main()
+
+        mocks["setup_logger"].assert_called_once()
+
+
+class TestMainArgumentValidation:
+    def test_raises_valueerror_with_too_few_args(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", ["script.py", "prod", "role"])
+        mocks = install_fake_databricks_modules(monkeypatch)
+
+        with pytest.raises(ValueError, match="Usage:"):
+            gljb.main()
+
+    def test_no_execution_log_written_on_argument_error(self, monkeypatch):
+        # the argv-length check happens before the try/finally, so a bad
+        # invocation shouldn't attempt to write an execution log at all
+        monkeypatch.setattr(sys, "argv", ["script.py", "prod"])
+        mocks = install_fake_databricks_modules(monkeypatch)
+
+        with pytest.raises(ValueError):
+            gljb.main()
+
+        mocks["write_execution_log_to_s3"].assert_not_called()
+
+    def test_setup_logger_still_called_before_validation(self, monkeypatch):
+        # logger = setup_logger() happens before the argv check
+        monkeypatch.setattr(sys, "argv", ["script.py"])
+        mocks = install_fake_databricks_modules(monkeypatch)
+
+        with pytest.raises(ValueError):
+            gljb.main()
+
+        mocks["setup_logger"].assert_called_once()
+
+
+class TestMainErrorPath:
+    def test_wraps_and_reraises_exception(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", VALID_ARGV)
+
+        def failing_build_source_dataframe(*a, **k):
+            raise RuntimeError("simulated S3 read failure")
+
+        monkeypatch.setattr(glsj, "build_source_dataframe", failing_build_source_dataframe)
+        mocks = install_fake_databricks_modules(monkeypatch)
+        mocks["new_session"].return_value.client.return_value = MagicMock()
+
+        with pytest.raises(Exception, match="Unhandled error during gl journal builder execution"):
+            gljb.main()
+
+    def test_writes_execution_log_with_failed_state(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", VALID_ARGV)
+
+        def failing_build_source_dataframe(*a, **k):
+            raise RuntimeError("simulated S3 read failure")
+
+        monkeypatch.setattr(glsj, "build_source_dataframe", failing_build_source_dataframe)
+        mocks = install_fake_databricks_modules(monkeypatch)
+        mocks["new_session"].return_value.client.return_value = MagicMock()
+
+        with pytest.raises(Exception):
+            gljb.main()
+
+        mocks["write_execution_log_to_s3"].assert_called_once()
+        call_kwargs = mocks["write_execution_log_to_s3"].call_args.kwargs
+        assert call_kwargs["final_state"] == "FAILED"
+        assert "simulated S3 read failure" in call_kwargs["failure_message"]
+        assert call_kwargs["records_published"] == 0
+        assert call_kwargs["severity_text"] == "error"
+
+    def test_logs_error_with_stack_trace(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", VALID_ARGV)
+
+        def failing_build_source_dataframe(*a, **k):
+            raise RuntimeError("simulated S3 read failure")
+
+        monkeypatch.setattr(glsj, "build_source_dataframe", failing_build_source_dataframe)
+        mocks = install_fake_databricks_modules(monkeypatch)
+        mocks["new_session"].return_value.client.return_value = MagicMock()
+
+        with pytest.raises(Exception):
+            gljb.main()
+
+        mocks["logger"].error.assert_called_once()
+        error_message = mocks["logger"].error.call_args.args[0]
+        assert "simulated S3 read failure" in error_message
+        assert "RuntimeError" in error_message
+
+    def test_failure_message_body_mentions_job_name(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", VALID_ARGV)
+
+        def failing_build_source_dataframe(*a, **k):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(glsj, "build_source_dataframe", failing_build_source_dataframe)
+        mocks = install_fake_databricks_modules(monkeypatch)
+        mocks["new_session"].return_value.client.return_value = MagicMock()
+
+        with pytest.raises(Exception):
+            gljb.main()
+
+        call_kwargs = mocks["write_execution_log_to_s3"].call_args.kwargs
+        assert "salesforce_global_one" in call_kwargs["body"]
+        assert "boom" in call_kwargs["body"]
+
+    def test_new_session_failure_also_wrapped_and_logged(self, monkeypatch):
+        # a credential failure should be caught by the same try/except as
+        # any other failure in the run
+        monkeypatch.setattr(sys, "argv", VALID_ARGV)
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: sample_df())
+
+        def failing_new_session(service_credential):
+            raise PermissionError("chamber access denied")
+
+        mocks = install_fake_databricks_modules(
+            monkeypatch, new_session_mock=MagicMock(side_effect=failing_new_session)
         )
 
-    def test_resolves_via_invoice_line_directly(self):
-        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "IL1", "TransactionType": "InvoiceLine"}])
-        invoice_line = pd.DataFrame([{
-            "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1",
-            "Business_Unit_BU__c": "US001", "Department_ID_DID__c": "10500",
-        }])
-        e = self._empties()
+        with pytest.raises(Exception, match="Unhandled error"):
+            gljb.main()
 
-        result = resolve_bu_did(tj, invoice_line, e["ilt"], e["pli_line"], e["pli_header"],
-                                 e["cml"], e["cmli"], e["cmia"])
-        assert result.iloc[0]["bu"] == "US001"
-        assert result.iloc[0]["did"] == "10500"
+        call_kwargs = mocks["write_execution_log_to_s3"].call_args.kwargs
+        assert call_kwargs["final_state"] == "FAILED"
+        assert "chamber access denied" in call_kwargs["failure_message"]
 
-    def test_resolves_via_invoice_line_tax_indirectly(self):
-        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "ILT1", "TransactionType": "InvoiceLineTax"}])
-        invoice_line = pd.DataFrame([{
-            "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD2",
-            "Business_Unit_BU__c": "EU002", "Department_ID_DID__c": "20999",
-        }])
-        invoice_line_tax = pd.DataFrame([{"Id": "ILT1", "InvoiceLineId": "IL1"}])
-        e = self._empties()
 
-        result = resolve_bu_did(tj, invoice_line, invoice_line_tax, e["pli_line"], e["pli_header"],
-                                 e["cml"], e["cmli"], e["cmia"])
-        assert result.iloc[0]["bu"] == "EU002"
-        assert result.iloc[0]["did"] == "20999"
+class TestMainEnvironmentPassthrough:
+    def test_different_env_value_reflected_in_log_path_and_environment_field(self, monkeypatch):
+        argv = list(VALID_ARGV)
+        argv[1] = "qa"
+        monkeypatch.setattr(sys, "argv", argv)
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: sample_df())
+        mocks = install_fake_databricks_modules(monkeypatch)
+        mocks["new_session"].return_value.client.return_value = MagicMock()
 
-    def test_resolves_payment_via_line_level_when_present(self):
-        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "PAY1", "TransactionType": "Payment"}])
-        invoice_line = pd.DataFrame([{
-            "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD3",
-            "Business_Unit_BU__c": "US002", "Department_ID_DID__c": "30500",
-        }])
-        payment_line_invoice_line = pd.DataFrame([{"PaymentId": "PAY1", "InvoiceLineId": "IL1"}])
-        e = self._empties()
+        gljb.main()
 
-        result = resolve_bu_did(tj, invoice_line, e["ilt"], payment_line_invoice_line, e["pli_header"],
-                                 e["cml"], e["cmli"], e["cmia"])
-        assert result.iloc[0]["bu"] == "US002"
-        assert result.iloc[0]["did"] == "30500"
+        call_kwargs = mocks["write_execution_log_to_s3"].call_args.kwargs
+        assert call_kwargs["environment"] == "qa"
+        assert "c1scoredataservices-qa-east" in call_kwargs["s3_path"]
 
-    def test_resolves_payment_via_header_level_fallback(self):
-        # This is the path that actually works today — PaymentLineInvoiceLine
-        # is confirmed 0 rows in real data, PaymentLineInvoice has 837.
-        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "PAY1", "TransactionType": "Payment"}])
-        invoice_line = pd.DataFrame([{
-            "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD3",
-            "Business_Unit_BU__c": "US002", "Department_ID_DID__c": "30500",
-        }])
-        payment_line_invoice = pd.DataFrame([{"PaymentId": "PAY1", "InvoiceId": "INV1"}])
-        e = self._empties()
+    def test_run_start_and_end_timestamps_are_ordered(self, monkeypatch):
+        monkeypatch.setattr(sys, "argv", VALID_ARGV)
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: sample_df())
+        mocks = install_fake_databricks_modules(monkeypatch)
+        mocks["new_session"].return_value.client.return_value = MagicMock()
 
-        result = resolve_bu_did(tj, invoice_line, e["ilt"], e["pli_line"], payment_line_invoice,
-                                 e["cml"], e["cmli"], e["cmia"])
-        assert result.iloc[0]["bu"] == "US002"
-        assert result.iloc[0]["did"] == "30500"
+        gljb.main()
 
-    def test_resolves_credit_memo_via_line_level_when_present(self):
-        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "CM1", "TransactionType": "CreditMemo"}])
-        invoice_line = pd.DataFrame([{
-            "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD4",
-            "Business_Unit_BU__c": "US003", "Department_ID_DID__c": "40500",
-        }])
-        credit_memo_line = pd.DataFrame([{"Id": "CML1", "CreditMemoId": "CM1"}])
-        credit_memo_line_invoice_line = pd.DataFrame([{"CreditMemoLineId": "CML1", "InvoiceLineId": "IL1"}])
-        e = self._empties()
+        call_kwargs = mocks["write_execution_log_to_s3"].call_args.kwargs
+        assert call_kwargs["run_start_timestamp"] <= call_kwargs["run_end_timestamp"]
+        assert call_kwargs["data_interval_end_timestamp"] == call_kwargs["run_end_timestamp"]
+        assert call_kwargs["data_interval_start_timestamp"] is None
 
-        result = resolve_bu_did(tj, invoice_line, e["ilt"], e["pli_line"], e["pli_header"],
-                                 credit_memo_line, credit_memo_line_invoice_line, e["cmia"])
-        assert result.iloc[0]["bu"] == "US003"
-        assert result.iloc[0]["did"] == "40500"
 
-    def test_resolves_credit_memo_via_header_level_fallback(self):
-        # This is the path that actually works today — CreditMemoLineInvoiceLine
-        # is confirmed 0 rows in real data, CreditMemoInvApplication has 42.
-        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "CM1", "TransactionType": "CreditMemo"}])
-        invoice_line = pd.DataFrame([{
-            "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD4",
-            "Business_Unit_BU__c": "US003", "Department_ID_DID__c": "40500",
-        }])
-        credit_memo_inv_application = pd.DataFrame([{"CreditMemoId": "CM1", "InvoiceId": "INV1"}])
-        e = self._empties()
-
-        result = resolve_bu_did(tj, invoice_line, e["ilt"], e["pli_line"], e["pli_header"],
-                                 e["cml"], e["cmli"], credit_memo_inv_application)
-        assert result.iloc[0]["bu"] == "US003"
-        assert result.iloc[0]["did"] == "40500"
-
-    def test_line_level_wins_over_header_level_when_both_present(self):
-        # If line-level data ever gets populated, it should take priority
-        # over the header-level fallback for the same header id.
-        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "PAY1", "TransactionType": "Payment"}])
-        invoice_line = pd.DataFrame([
-            {"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1",
-             "Business_Unit_BU__c": "LINE_LEVEL_BU", "Department_ID_DID__c": "10500"},
-            {"Id": "IL2", "InvoiceId": "INV1", "Product2Id": "PROD2",
-             "Business_Unit_BU__c": "HEADER_LEVEL_BU", "Department_ID_DID__c": "20500"},
-        ])
-        payment_line_invoice_line = pd.DataFrame([{"PaymentId": "PAY1", "InvoiceLineId": "IL1"}])
-        payment_line_invoice = pd.DataFrame([{"PaymentId": "PAY1", "InvoiceId": "INV1"}])
-        e = self._empties()
-
-        result = resolve_bu_did(tj, invoice_line, e["ilt"], payment_line_invoice_line, payment_line_invoice,
-                                 e["cml"], e["cmli"], e["cmia"])
-        assert result.iloc[0]["bu"] == "LINE_LEVEL_BU"
-
-    def test_payment_fan_out_takes_first_match(self):
-        # a payment header applied to an invoice with lines from different
-        # BUs — documents that this takes the first match rather than erroring
-        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "PAY1", "TransactionType": "Payment"}])
-        invoice_line = pd.DataFrame([
-            {"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1",
-             "Business_Unit_BU__c": "US001", "Department_ID_DID__c": "10500"},
-            {"Id": "IL2", "InvoiceId": "INV1", "Product2Id": "PROD2",
-             "Business_Unit_BU__c": "US002", "Department_ID_DID__c": "20500"},
-        ])
-        payment_line_invoice = pd.DataFrame([{"PaymentId": "PAY1", "InvoiceId": "INV1"}])
-        e = self._empties()
-
-        result = resolve_bu_did(tj, invoice_line, e["ilt"], e["pli_line"], payment_line_invoice,
-                                 e["cml"], e["cmli"], e["cmia"])
-        assert len(result) == 1  # one TJ row in, one row out — no accidental fan-out of tj itself
-        assert result.iloc[0]["bu"] == "US001"  # first match wins
+class TestDunderMain:
+    def test_module_has_main_guard_calling_main(self):
+        # sanity check the __main__ guard exists and points at main()
+        import inspect
+        source = inspect.getsource(gljb)
+        assert 'if __name__ == "__main__":' in source
+        assert "main()" in source.split('if __name__ == "__main__":')[1]

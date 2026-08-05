@@ -298,8 +298,16 @@ def clean_account_name(name: str, prefix_pattern: str = r"^A") -> str:
 # ---------------------------------------------------------------------------
 
 def resolve_amount(tj: pd.DataFrame) -> pd.Series:
-    credit = pd.to_numeric(tj.get("Credit"), errors="coerce")
-    debit = pd.to_numeric(tj.get("Debit"), errors="coerce")
+    # tj.get() returns None (not an empty Series) when the column is missing
+    # entirely — that breaks pd.to_numeric/.apply downstream, so fall back to
+    # an all-null Series of the right length in that case.
+    def numeric_column_or_nulls(col_name):
+        if col_name in tj.columns:
+            return pd.to_numeric(tj[col_name], errors="coerce")
+        return pd.Series([None] * len(tj), index=tj.index, dtype="float64")
+
+    credit = numeric_column_or_nulls("Credit")
+    debit = numeric_column_or_nulls("Debit")
     return credit.apply(lambda v: -v if pd.notna(v) else None).combine_first(debit)
 
 

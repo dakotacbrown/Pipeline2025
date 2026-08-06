@@ -2,16 +2,16 @@
 GL Journal Entry Interface — pandas version.
 
 Reads JSONL source files from S3 (as landed by api_ingester), joins them,
-formats fixed-width rows, and uploads the assembled file back to S3.
-
-S3 I/O functions (read_jsonl_from_s3, upload_to_s3, etc.) now live in
-s3_utils.py, imported below and re-exported here — see that module's
-docstring for why this got split out (it removes a fragile near-circular
-dependency that used to exist between this file and gl_source_join.py).
+formats fixed-width rows, and writes + submits the assembled file to
+OneLake. Uses write_and_submit_file (helper_functions.py) for the
+outbound/validation-write + OneLake-submission step, the same shared
+function salesforce_ofac.py uses — see that function's docstring in
+helper_functions.py for what it does.
 """
 
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
+import json
 import pandas as pd
 
 from helpers.s3_utils import (
@@ -19,12 +19,44 @@ from helpers.s3_utils import (
     read_jsonl_prefix_from_s3,
     find_dataset_prefix,
     read_table_by_dataset_id,
-    upload_to_s3,
-    write_success_file,
-    save_validation_file,
-    build_partitioned_prefix,
 )
+from helpers.helper_functions import build_execution_log_s3_path, write_and_submit_file
 import helpers.gl_source_join as gl_source_join
+
+
+# Confirmed against the actual field layout in build_gl_file() below — see
+# decode_metadata.json / the OneStream decodeMetadata discussion for how
+# this was derived and verified (each record type's total width checked
+# against the real fixed-width spec).
+DECODE_METADATA = json.loads(r'''{"fieldDefinitions": [{"fieldName": "record_type_1", "position": 0, "width": 1, "isRecordTypeKey": true}], "multiRecordDefinitions": [{"recordName": "file_header", "recordType": "#", "fieldDefinitions": [{"fieldName": "header_indicator", "position": 1, "width": 1}, {"fieldName": "creation_date", "position": 2, "width": 8}, {"fieldName": "creation_time", "position": 10, "width": 6}, {"fieldName": "transmit_id", "position": 16, "width": 8}, {"fieldName": "filler", "position": 24, "width": 76}]}, {"recordName": "journal_header", "recordType": "H", "fieldDefinitions": [{"fieldName": "business_unit", "position": 1, "width": 5}, {"fieldName": "journal_id", "position": 6, "width": 10}, {"fieldName": "journal_date", "position": 16, "width": 8}, {"fieldName": "adjusting_entry_info", "position": 24, "width": 4}, {"fieldName": "avg_daily_balance_date", "position": 28, "width": 8}, {"fieldName": "ledger_group", "position": 36, "width": 10}, {"fieldName": "reversal_info", "position": 46, "width": 21}, {"fieldName": "source", "position": 67, "width": 3}, {"fieldName": "transaction_reference_number", "position": 70, "width": 8}, {"fieldName": "header_description", "position": 78, "width": 30}, {"fieldName": "default_currency_info", "position": 108, "width": 33}, {"fieldName": "filler", "position": 141, "width": 39}]}, {"recordName": "journal_line_detail", "recordType": "L", "fieldDefinitions": [{"fieldName": "business_unit", "position": 1, "width": 5}, {"fieldName": "journal_line_number", "position": 6, "width": 9}, {"fieldName": "ledger", "position": 15, "width": 10}, {"fieldName": "journal_account", "position": 25, "width": 10}, {"fieldName": "alternate_account", "position": 35, "width": 10}, {"fieldName": "department_id", "position": 45, "width": 10}, {"fieldName": "unused_chartfields_1", "position": 55, "width": 37}, {"fieldName": "affiliate", "position": 92, "width": 5}, {"fieldName": "unused_chartfields_2", "position": 97, "width": 30}, {"fieldName": "reg_code", "position": 127, "width": 10}, {"fieldName": "unused_chartfields_3", "position": 137, "width": 10}, {"fieldName": "project_id", "position": 147, "width": 15}, {"fieldName": "filler_1", "position": 162, "width": 25}, {"fieldName": "base_currency_amount", "position": 187, "width": 28}, {"fieldName": "movement_flag", "position": 215, "width": 1}, {"fieldName": "statistics_amount", "position": 216, "width": 17}, {"fieldName": "journal_line_reference", "position": 233, "width": 10}, {"fieldName": "journal_line_description", "position": 243, "width": 30}, {"fieldName": "transaction_currency_code", "position": 273, "width": 3}, {"fieldName": "currency_rate_type", "position": 276, "width": 5}, {"fieldName": "transaction_monetary_amount", "position": 281, "width": 28}, {"fieldName": "currency_exchange_rate", "position": 309, "width": 17}, {"fieldName": "filler_2", "position": 326, "width": 92}]}, {"recordName": "file_trailer", "recordType": "#", "fieldDefinitions": [{"fieldName": "trailer_indicator", "position": 1, "width": 1}, {"fieldName": "row_count", "position": 2, "width": 9}, {"fieldName": "total_debits", "position": 11, "width": 28}, {"fieldName": "total_credits", "position": 39, "width": 25}, {"fieldName": "total_statistical_amount", "position": 64, "width": 25}, {"fieldName": "filler", "position": 89, "width": 5}]}]}''')
+
+
+def choose_gl_identity(env: str):
+    """
+    GL journal builder's own job identity — the OneStream schema_name.
+    Local to this file rather than helper_functions.py, for the same
+    reason salesforce_ofac.py has its own choose_ofac_identity(): it's
+    job-specific, not shared infrastructure.
+
+    No 'source' value here (unlike choose_ofac_identity()) — confirmed
+    by Dakota: OFAC's source was only ever used for S3 file naming, not
+    part of the actual Exchange submission payload (the payload is just
+    businessApplication/schemaName/fileSubmissions — no source field at
+    all). GL already has filename_prefix/output_key_prefix filling that
+    same S3-naming role, so there's nothing for a GL 'source' to do.
+
+    PLACEHOLDER VALUE BELOW — unlike choose_ofac_identity() (which
+    preserves real, previously-confirmed values), this is NOT a confirmed
+    real prod/qa value. Fill in the actual OneStream schema_name once the
+    GL journal's OneStream schema is registered. Do not deploy with this
+    placeholder still in place.
+    """
+    if env == "prod":
+        return "PLACEHOLDER_GL_SCHEMA_PROD"
+    elif env == "qa":
+        return "PLACEHOLDER_GL_SCHEMA_QA"
+    else:
+        raise ValueError(f"Invalid environment: {env}. Must be one of ['prod', 'qa'].")
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +243,8 @@ def build_filename(prefix: str, creation_dt: datetime) -> str:
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def run(log, s3_client, bucket, output_key_prefix, filename_prefix,
+def run(log, s3_client, oauth_token, bucket, output_key_prefix, filename_prefix,
+        writer_config,
         business_unit=None, source="CS1",
         validation_key_prefix=None, validation_file_type="parquet",
         source_prefix="salesforce/reports"):
@@ -219,6 +252,15 @@ def run(log, s3_client, bucket, output_key_prefix, filename_prefix,
     s3_client must come from an authenticated session (e.g.
     new_session(service_credential).client("s3") — see helpers.helper_functions,
     same pattern used in salesforce_ofac.py), not a bare boto3.client("s3").
+
+    oauth_token: Exchange OAuth token used to authenticate the OneLake
+    submission — see helpers.helper_functions.retrieve_oauth_token, same
+    pattern salesforce_ofac.py uses.
+
+    writer_config: dict with ba/schema_name/iam_role/base_url/env/region —
+    passed straight through to write_and_submit_file / s3_to_onelake.
+    bucket and file_name get set/overwritten inside write_and_submit_file,
+    so don't rely on any values already present under those two keys.
 
     bucket is used for both reading source Salesforce datasets (by dataset_id,
     see gl_source_join.DATASET_IDS) and writing the output file + validation
@@ -255,26 +297,31 @@ def run(log, s3_client, bucket, output_key_prefix, filename_prefix,
         df = df[df["InvoiceLine.Business_Unit"] == business_unit]
         log.info(f"filtering to business_unit={business_unit}...complete ({len(df)} rows)")
 
-    if validation_key_prefix:
-        log.info(f"saving validation file ({validation_file_type})...")
-        # df already comes out of build_source_dataframe with Table.Column
-        # names, so no separate relabeling step is needed here anymore.
-        validation_url = save_validation_file(s3_client, df, bucket, validation_key_prefix,
-                                               file_type=validation_file_type, creation_dt=creation_dt)
-        log.info(f"saving validation file...complete ({validation_url})")
-
     log.info("building GL journal file...")
     content = build_gl_file(df, business_unit=business_unit, source=source, creation_dt=creation_dt)
     filename = build_filename(filename_prefix, creation_dt)
     log.info(f"building GL journal file...complete ({filename})")
 
-    log.info("uploading GL journal file to s3...")
-    partitioned_output_prefix = build_partitioned_prefix(output_key_prefix, creation_dt)
-    url = upload_to_s3(s3_client, content, bucket, partitioned_output_prefix, filename)
-    write_success_file(s3_client, bucket, partitioned_output_prefix)
-    log.info(f"uploading GL journal file to s3...complete ({url})")
+    log.info("writing outbound + validation files and submitting to onelake...")
+    outbound_url, validation_url = write_and_submit_file(
+        log, s3_client, oauth_token, bucket,
+        content=content,
+        filename=filename,
+        file_type="MULTI_RECORD_FIXED_WIDTH",
+        output_key_prefix=output_key_prefix,
+        writer_config=writer_config,
+        creation_dt=creation_dt,
+        validation_df=df,
+        validation_key_prefix=validation_key_prefix,
+        validation_file_type=validation_file_type,
+        decode_metadata=DECODE_METADATA,
+    )
+    log.info(
+        f"writing outbound + validation files and submitting to onelake...complete "
+        f"(outbound={outbound_url}, validation={validation_url})"
+    )
 
-    return url, len(df)
+    return outbound_url, len(df)
 
 
 def main():
@@ -284,12 +331,13 @@ def main():
 
     from asvc1scoredataservices_common.logger.basic_logger import setup_logger
     from asvc1scoredataservices_common.logger.logger import write_execution_log_to_s3
+    from asvc1scoredataservices_common.utils.helper_functions import read_secret_from_chamber
     from pyspark.sql import SparkSession
-    from helpers.helper_functions import new_session  # same helper salesforce_ofac.py uses
+    from helpers.helper_functions import new_session, retrieve_oauth_token, choose_exchange_env
 
     logger = setup_logger()
 
-    if len(sys.argv) < 10:
+    if len(sys.argv) < 9:
         raise ValueError(
             "Usage: script.py <env> <chamber_role> <service_credential> <bucket> "
             "<output_key_prefix> <validation_key_prefix> <filename_prefix> "
@@ -307,11 +355,15 @@ def main():
     source_key_prefix = args[7]
     validation_file_type = args[8]
 
-    # NOTE: chamber_role isn't used yet — it's only needed if this script
-    # ever calls read_secret_from_chamber() directly for its own secrets.
-    # Right now the only credential this script needs is AWS, which
-    # new_session() handles. Keeping it as an accepted arg in case that
-    # changes (e.g. if Salesforce API calls get added here directly).
+    # schema_name resolved by env, not passed in via YAML — see
+    # choose_gl_identity()'s docstring (placeholder value pending real
+    # OneStream schema registration — do not deploy until filled in).
+    schema_name = choose_gl_identity(env)
+
+    # BAC1SCOREDATASERVICES / us-west-2: same Exchange app + region OFAC
+    # uses, hardcoded here rather than passed in — matches
+    # salesforce_ofac.py's own WRITER_CONFIG literals, not job-specific.
+    business_application = "BAC1SCOREDATASERVICES"
 
     job_name = "salesforce_global_one"
     run_start_timestamp = datetime.now(tz=timezone.utc)
@@ -338,9 +390,46 @@ def main():
         )
         logger.info("retrieving aws credentials...complete")
 
+        # Same Exchange app registration as salesforce_ofac.py (confirmed
+        # by Dakota) — not a per-job YAML parameter, one shared source of
+        # truth in choose_exchange_env() instead.
+        exchange_oauth_url, iam_role, base_url = choose_exchange_env(env)
+
+        logger.info("retrieving exchange secrets...")
+        exchange_client_id = read_secret_from_chamber(
+            env, chamber_role, "c1scoredataservices/exchange/id", "c1scoredataservices_exchange_id"
+        )
+        exchange_client_secret = read_secret_from_chamber(
+            env, chamber_role, "c1scoredataservices/exchange/secret", "c1scoredataservices_exchange_secret"
+        )
+        logger.info("retrieving exchange secrets...complete")
+
+        logger.info("generating oauth token...")
+        oauth_token = retrieve_oauth_token(
+            logger,
+            exchange_oauth_url,
+            {"Content-Type": "application/x-www-form-urlencoded"},
+            {
+                "client_id": exchange_client_id,
+                "client_secret": exchange_client_secret,
+                "grant_type": "client_credentials",
+            },
+        )
+        logger.info("generating oauth token...complete")
+
+        writer_config = {
+            "ba": business_application,
+            "schema_name": schema_name,
+            "iam_role": iam_role,
+            "base_url": base_url,
+            "env": env,
+            "region": "us-west-2",
+        }
+
         url, record_count = run(
-            logger, s3_client, bucket,
+            logger, s3_client, oauth_token, bucket,
             output_key_prefix=output_key_prefix,
+            writer_config=writer_config,
             validation_key_prefix=validation_key_prefix,
             validation_file_type=validation_file_type,
             filename_prefix=filename_prefix,
@@ -371,12 +460,7 @@ def main():
     finally:
         run_end_timestamp = datetime.now(tz=timezone.utc)
         current_date_str = run_end_timestamp.strftime("%Y-%m-%d")
-        log_s3_path = (
-            f"s3a://c1scoredataservices-{env}-east/databricks_job_logs/"
-            f"job_run_date={current_date_str}/"
-            f"job_family=salesforce/"
-            f"job_name={job_name}/"
-        )
+        log_s3_path = build_execution_log_s3_path(env, "salesforce", job_name, current_date_str)
         spark = SparkSession.builder.getOrCreate()
         write_execution_log_to_s3(
             logger=logger,

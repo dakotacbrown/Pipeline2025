@@ -396,12 +396,32 @@ class TestBuildFilename:
 # ---------------------------------------------------------------------------
 
 class TestRunOrchestration:
+    @pytest.fixture(autouse=True)
+    def _patch_s3_to_onelake(self, monkeypatch):
+        # write_and_submit_file (called by run()) resolves s3_to_onelake
+        # through helper_functions.py's own bare "helpers.helper_functions"
+        # namespace — same reasoning as patching glsj at the bare form for
+        # gljb's internals: this has to be the exact module object gljb's
+        # call chain actually resolves, or the patch is a silent no-op.
+        self.s3_to_onelake_mock = MagicMock()
+        monkeypatch.setattr("helpers.helper_functions.s3_to_onelake", self.s3_to_onelake_mock)
+
     def _sample_df(self):
         return pd.DataFrame([
             {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500", "Account.AccountNumber": "Acme",
              "TransactionJournal.CreditDebit": 100.0, "TransactionJournal.UsageType": "Storage", "TransactionJournal.TransactionType": "InvoiceLine",
              "TransactionJournal.Name": "Batch"},
         ])
+
+    def _writer_config(self):
+        return {
+            "ba": "app", "schema_name": "schema", "iam_role": "role",
+            "base_url": "https://exchange.example.com/api", "env": "qa", "region": "west",
+        }
+
+    def _run(self, log, s3, bucket="bucket", output_key_prefix="outbound", filename_prefix="BX1", **kwargs):
+        return gljb.run(log, s3, "token", bucket, output_key_prefix, filename_prefix,
+                         self._writer_config(), **kwargs)
 
     def test_calls_build_source_dataframe_and_uploads(self, monkeypatch):
         fake_df = self._sample_df()
@@ -410,10 +430,25 @@ class TestRunOrchestration:
         s3 = MagicMock()
         log = MagicMock()
 
-        url, row_count = gljb.run(log, s3, "bucket", "outbound", "BX1")
+        url, row_count = self._run(log, s3)
 
         assert row_count == 1
         assert s3.put_object.called
+
+    def test_submits_outbound_file_to_onelake(self, monkeypatch):
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
+        s3 = MagicMock()
+        log = MagicMock()
+
+        self._run(log, s3)
+
+        self.s3_to_onelake_mock.assert_called_once()
+        call_args = self.s3_to_onelake_mock.call_args
+        assert call_args.args[1] == "token"  # oauth_token passed through
+        file_submissions = call_args.args[3]
+        assert len(file_submissions) == 1
+        assert file_submissions[0]["fileType"] == "MULTI_RECORD_FIXED_WIDTH"
+        assert "decodeMetadata" in file_submissions[0]
 
     def test_filters_by_business_unit_when_given(self, monkeypatch):
         fake_df = pd.DataFrame([
@@ -427,26 +462,26 @@ class TestRunOrchestration:
         s3 = MagicMock()
         log = MagicMock()
 
-        url, row_count = gljb.run(log, s3, "bucket", "outbound", "BX1", business_unit="US001")
+        url, row_count = self._run(log, s3, business_unit="US001")
         assert row_count == 1
 
-    def test_skips_validation_parquet_when_prefix_not_given(self, monkeypatch):
+    def test_skips_validation_file_when_prefix_not_given(self, monkeypatch):
         monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
         s3 = MagicMock()
         log = MagicMock()
 
-        gljb.run(log, s3, "bucket", "outbound", "BX1", validation_key_prefix=None)
+        self._run(log, s3, validation_key_prefix=None)
 
         # put_object should only be called for the main file + _SUCCESS, not a parquet
         keys_written = [call.kwargs["Key"] for call in s3.put_object.call_args_list]
         assert not any(k.endswith(".parquet") for k in keys_written)
 
-    def test_saves_validation_parquet_when_prefix_given(self, monkeypatch):
+    def test_saves_validation_file_when_prefix_given(self, monkeypatch):
         monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
         s3 = MagicMock()
         log = MagicMock()
 
-        gljb.run(log, s3, "bucket", "outbound", "BX1", validation_key_prefix="validation")
+        self._run(log, s3, validation_key_prefix="validation")
 
         keys_written = [call.kwargs["Key"] for call in s3.put_object.call_args_list]
         assert any(k.endswith(".parquet") for k in keys_written)
@@ -456,7 +491,7 @@ class TestRunOrchestration:
         s3 = MagicMock()
         log = MagicMock()
 
-        gljb.run(log, s3, "bucket", "outbound", "BX1")
+        self._run(log, s3)
 
         keys_written = [call.kwargs["Key"] for call in s3.put_object.call_args_list]
         assert any(k.endswith("_SUCCESS") for k in keys_written)
@@ -466,7 +501,7 @@ class TestRunOrchestration:
         s3 = MagicMock()
         log = MagicMock()
 
-        url, _ = gljb.run(log, s3, "bucket", "outbound", "BX1")
+        url, _ = self._run(log, s3)
         # output path is now partitioned: outbound/year=/month=/day=/hour=/BX1_....txt
         assert url.startswith("s3://bucket/outbound/year=")
         assert "/BX1_" in url
@@ -477,7 +512,7 @@ class TestRunOrchestration:
         s3 = MagicMock()
         log = MagicMock()
 
-        gljb.run(log, s3, "bucket", "outbound", "BX1")
+        self._run(log, s3)
 
         keys_written = [call.kwargs["Key"] for call in s3.put_object.call_args_list]
         data_file_keys = [k for k in keys_written if k.endswith(".txt")]
@@ -492,7 +527,7 @@ class TestRunOrchestration:
         s3 = MagicMock()
         log = MagicMock()
 
-        gljb.run(log, s3, "bucket", "outbound", "BX1")
+        self._run(log, s3)
 
         keys_written = [call.kwargs["Key"] for call in s3.put_object.call_args_list]
         data_file_key = next(k for k in keys_written if k.endswith(".txt"))
@@ -505,8 +540,7 @@ class TestRunOrchestration:
         s3 = MagicMock()
         log = MagicMock()
 
-        gljb.run(log, s3, "bucket", "outbound", "BX1",
-                 validation_key_prefix="validation", validation_file_type="csv")
+        self._run(log, s3, validation_key_prefix="validation", validation_file_type="csv")
 
         keys_written = [call.kwargs["Key"] for call in s3.put_object.call_args_list]
         assert any(k.endswith(".csv") for k in keys_written)
@@ -517,23 +551,20 @@ class TestRunOrchestration:
         s3 = MagicMock()
         log = MagicMock()
 
-        gljb.run(log, s3, "bucket", "outbound", "BX1", validation_key_prefix="validation")
+        self._run(log, s3, validation_key_prefix="validation")
 
         keys_written = [call.kwargs["Key"] for call in s3.put_object.call_args_list]
         assert any(k.endswith(".parquet") for k in keys_written)
 
     def test_validation_file_uses_table_dot_column_headers(self, monkeypatch):
-        # Table.Column naming now comes directly from build_source_dataframe
-        # (moved upstream from a separate validation-only relabeling step),
-        # so the same dataframe used to build the GL file is also what gets
-        # written to the validation file — this just confirms it flows
-        # through end-to-end.
+        # Table.Column naming comes directly from build_source_dataframe,
+        # so the same dataframe used to build the GL file is also what
+        # gets written to the validation file.
         monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
         s3 = MagicMock()
         log = MagicMock()
 
-        gljb.run(log, s3, "bucket", "outbound", "BX1",
-                 validation_key_prefix="validation", validation_file_type="csv")
+        self._run(log, s3, validation_key_prefix="validation", validation_file_type="csv")
 
         validation_calls = [
             call for call in s3.put_object.call_args_list
@@ -550,13 +581,13 @@ class TestRunOrchestration:
         s3 = MagicMock()
         log = MagicMock()
 
-        gljb.run(log, s3, "bucket", "outbound", "BX1")
+        self._run(log, s3)
 
         assert log.info.called
         messages = [call.args[0] for call in log.info.call_args_list]
         assert any("building source dataframe" in m for m in messages)
         assert any("building GL journal file" in m for m in messages)
-        assert any("uploading GL journal file" in m for m in messages)
+        assert any("submitting to onelake" in m for m in messages)
 
     def test_run_with_empty_result_still_produces_valid_file(self, monkeypatch):
         monkeypatch.setattr(glsj, "build_source_dataframe",
@@ -564,7 +595,7 @@ class TestRunOrchestration:
         s3 = MagicMock()
         log = MagicMock()
 
-        url, row_count = gljb.run(log, s3, "bucket", "outbound", "BX1")
+        url, row_count = self._run(log, s3)
         assert row_count == 0
 
 
@@ -587,11 +618,13 @@ class TestRunOrchestration:
 # attribute on the actual module object main() will look up at call time.
 
 def install_fake_databricks_deps(monkeypatch, logger_mock=None, new_session_mock=None,
-                                  write_execution_log_mock=None, spark_session_mock=None):
+                                  write_execution_log_mock=None, spark_session_mock=None,
+                                  read_secret_from_chamber_mock=None, retrieve_oauth_token_mock=None):
     """
     Patches setup_logger / write_execution_log_to_s3 / new_session /
-    SparkSession.builder.getOrCreate directly on the real (installed)
-    packages. Requires asvc1scoredataservices_common, pyspark, and
+    SparkSession.builder.getOrCreate / read_secret_from_chamber /
+    retrieve_oauth_token directly on the real (installed) packages.
+    Requires asvc1scoredataservices_common, pyspark, and
     helpers.helper_functions to actually be importable in the environment
     running these tests — true in the real repo. monkeypatch.setattr
     reverts all of this automatically at test teardown.
@@ -600,6 +633,8 @@ def install_fake_databricks_deps(monkeypatch, logger_mock=None, new_session_mock
     new_session_mock = new_session_mock or MagicMock()
     write_execution_log_mock = write_execution_log_mock or MagicMock()
     spark_session_mock = spark_session_mock or MagicMock()
+    read_secret_from_chamber_mock = read_secret_from_chamber_mock or MagicMock(return_value="fake-secret")
+    retrieve_oauth_token_mock = retrieve_oauth_token_mock or MagicMock(return_value="fake-oauth-token")
 
     setup_logger_mock = MagicMock(return_value=logger_mock)
 
@@ -610,6 +645,12 @@ def install_fake_databricks_deps(monkeypatch, logger_mock=None, new_session_mock
         "asvc1scoredataservices_common.logger.logger.write_execution_log_to_s3", write_execution_log_mock
     )
     monkeypatch.setattr("helpers.helper_functions.new_session", new_session_mock)
+    monkeypatch.setattr(
+        "asvc1scoredataservices_common.utils.helper_functions.read_secret_from_chamber",
+        read_secret_from_chamber_mock,
+    )
+    monkeypatch.setattr("helpers.helper_functions.retrieve_oauth_token", retrieve_oauth_token_mock)
+    monkeypatch.setattr("helpers.helper_functions.s3_to_onelake", MagicMock())
 
     from pyspark.sql import SparkSession
     # SparkSession.builder returns a NEW Builder instance on every access —
@@ -642,6 +683,8 @@ def install_fake_databricks_deps(monkeypatch, logger_mock=None, new_session_mock
         "new_session": new_session_mock,
         "write_execution_log_to_s3": write_execution_log_mock,
         "spark_session": spark_session_mock,
+        "read_secret_from_chamber": read_secret_from_chamber_mock,
+        "retrieve_oauth_token": retrieve_oauth_token_mock,
     }
 
 
@@ -906,3 +949,29 @@ class TestDunderMain:
         source = inspect.getsource(gljb)
         assert 'if __name__ == "__main__":' in source
         assert "main()" in source.split('if __name__ == "__main__":')[1]
+
+
+# ---------------------------------------------------------------------------
+# choose_gl_identity()
+# ---------------------------------------------------------------------------
+
+class TestChooseGlIdentity:
+    def test_returns_schema_name_string(self):
+        schema_name = gljb.choose_gl_identity("qa")
+        assert isinstance(schema_name, str)
+        assert schema_name
+
+    def test_prod_and_qa_return_different_values(self):
+        assert gljb.choose_gl_identity("prod") != gljb.choose_gl_identity("qa")
+
+    def test_invalid_env_raises(self):
+        with pytest.raises(ValueError, match="Invalid environment"):
+            gljb.choose_gl_identity("staging")
+
+    def test_currently_placeholder_value_not_yet_real(self):
+        # This test exists specifically to fail loudly once a real value
+        # is filled in — at that point, delete this test rather than
+        # update it, since it's only here to make the placeholder status
+        # impossible to miss.
+        schema_name = gljb.choose_gl_identity("prod")
+        assert "PLACEHOLDER" in schema_name

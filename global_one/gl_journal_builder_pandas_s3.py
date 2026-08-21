@@ -28,7 +28,8 @@ import helpers.gl_source_join as gl_source_join
 # decode_metadata.json / the OneStream decodeMetadata discussion for how
 # this was derived and verified (each record type's total width checked
 # against the real fixed-width spec).
-DECODE_METADATA = json.loads(r'''{"fieldDefinitions": [{"fieldName": "record_type", "position": 0, "width": 1, "isRecordTypeKey": true}], "multiRecordDefinitions": [{"recordName": "file_header", "recordType": "#", "fieldDefinitions": [{"fieldName": "header_indicator", "position": 1, "width": 1}, {"fieldName": "creation_date", "position": 2, "width": 8}, {"fieldName": "creation_time", "position": 10, "width": 6}, {"fieldName": "transmit_id", "position": 16, "width": 8}, {"fieldName": "filler", "position": 24, "width": 76}]}, {"recordName": "journal_header", "recordType": "h", "fieldDefinitions": [{"fieldName": "business_unit", "position": 1, "width": 5}, {"fieldName": "journal_id", "position": 6, "width": 10}, {"fieldName": "journal_date", "position": 16, "width": 8}, {"fieldName": "adjusting_entry_info", "position": 24, "width": 4}, {"fieldName": "average_daily_balance_date", "position": 28, "width": 8}, {"fieldName": "ledger_group", "position": 36, "width": 10}, {"fieldName": "reversal_info", "position": 46, "width": 21}, {"fieldName": "source", "position": 67, "width": 3}, {"fieldName": "transaction_reference_number", "position": 70, "width": 8}, {"fieldName": "description", "position": 78, "width": 30}, {"fieldName": "default_currency", "position": 108, "width": 33}, {"fieldName": "filler", "position": 141, "width": 39}]}, {"recordName": "journal_line_detail", "recordType": "l", "fieldDefinitions": [{"fieldName": "business_unit", "position": 1, "width": 5}, {"fieldName": "journal_line_number", "position": 6, "width": 9}, {"fieldName": "ledger", "position": 15, "width": 10}, {"fieldName": "journal_account", "position": 25, "width": 10}, {"fieldName": "alternate_account", "position": 35, "width": 10}, {"fieldName": "department_id", "position": 45, "width": 10}, {"fieldName": "filler1", "position": 55, "width": 37}, {"fieldName": "affiliate", "position": 92, "width": 5}, {"fieldName": "filler2", "position": 97, "width": 30}, {"fieldName": "reg_code", "position": 127, "width": 10}, {"fieldName": "filler3", "position": 137, "width": 10}, {"fieldName": "project_id", "position": 147, "width": 15}, {"fieldName": "filler4", "position": 162, "width": 25}, {"fieldName": "base_currency_amount", "position": 187, "width": 28}, {"fieldName": "movement_flag", "position": 215, "width": 1}, {"fieldName": "statistics_amount", "position": 216, "width": 17}, {"fieldName": "journal_line_reference", "position": 233, "width": 10}, {"fieldName": "journal_line_description", "position": 243, "width": 30}, {"fieldName": "transaction_currency_code", "position": 273, "width": 3}, {"fieldName": "currency_rate_type", "position": 276, "width": 5}, {"fieldName": "transaction_monetary_amount", "position": 281, "width": 28}, {"fieldName": "currency_exchange_rate", "position": 309, "width": 17}, {"fieldName": "filler5", "position": 326, "width": 92}]}, {"recordName": "file_trailer", "recordType": "#", "fieldDefinitions": [{"fieldName": "trailer_indicator", "position": 1, "width": 1}, {"fieldName": "row_count", "position": 2, "width": 9}, {"fieldName": "total_debits", "position": 11, "width": 28}, {"fieldName": "total_credits", "position": 39, "width": 25}, {"fieldName": "total_statistics_amount", "position": 64, "width": 25}, {"fieldName": "filler6", "position": 89, "width": 5}]}]}''')
+DECODE_METADATA = json.loads(r'''{"fieldDefinitions": [{"fieldName": "record_type_1", "position": 0, "width": 1, "isRecordTypeKey": true}], "multiRecordDefinitions": [{"recordName": "file_header", "recordType": "#", "fieldDefinitions": [{"fieldName": "header_indicator", "position": 1, "width": 1}, {"fieldName": "creation_date", "position": 2, "width": 8}, {"fieldName": "creation_time", "position": 10, "width": 6}, {"fieldName": "transmit_id", "position": 16, "width": 8}, {"fieldName": "filler", "position": 24, "width": 76}]}, {"recordName": "journal_header", "recordType": "H", "fieldDefinitions": [{"fieldName": "business_unit", "position": 1, "width": 5}, {"fieldName": "journal_id", "position": 6, "width": 10}, {"fieldName": "journal_date", "position": 16, "width": 8}, {"fieldName": "adjusting_entry_info", "position": 24, "width": 4}, {"fieldName": "avg_daily_balance_date", "position": 28, "width": 8}, {"fieldName": "ledger_group", "position": 36, "width": 10}, {"fieldName": "reversal_info", "position": 46, "width": 21}, {"fieldName": "source", "position": 67, "width": 3}, {"fieldName": "transaction_reference_number", "position": 70, "width": 8}, {"fieldName": "header_description", "position": 78, "width": 30}, {"fieldName": "default_currency_info", "position": 108, "width": 33}, {"fieldName": "filler", "position": 141, "width": 39}]}, {"recordName": "journal_line_detail", "recordType": "L", "fieldDefinitions": [{"fieldName": "business_unit", "position": 1, "width": 5}, {"fieldName": "journal_line_number", "position": 6, "width": 9}, {"fieldName": "ledger", "position": 15, "width": 10}, {"fieldName": "journal_account", "position": 25, "width": 10}, {"fieldName": "alternate_account", "position": 35, "width": 10}, {"fieldName": "department_id", "position": 45, "width": 10}, {"fieldName": "unused_chartfields_1", "position": 55, "width": 37}, {"fieldName": "affiliate", "position": 92, "width": 5}, {"fieldName": "unused_chartfields_2", "position": 97, "width": 30}, {"fieldName": "reg_code", "position": 127, "width": 10}, {"fieldName": "unused_chartfields_3", "position": 137, "width": 10}, {"fieldName": "project_id", "position": 147, "width": 15}, {"fieldName": "filler_1", "position": 162, "width": 25}, {"fieldName": "base_currency_amount", "position": 187, "width": 28}, {"fieldName": "movement_flag", "position": 215, "width": 1}, {"fieldName": "statistics_amount", "position": 216, "width": 17}, {"fieldName": "journal_line_reference", "position": 233, "width": 10}, {"fieldName": "journal_line_description", "position": 243, "width": 30}, {"fieldName": "transaction_currency_code", "position": 273, "width": 3}, {"fieldName": "currency_rate_type", "position": 276, "width": 5}, {"fieldName": "transaction_monetary_amount", "position": 281, "width": 28}, {"fieldName": "currency_exchange_rate", "position": 309, "width": 17}, {"fieldName": "filler_2", "position": 326, "width": 92}]}, {"recordName": "file_trailer", "recordType": "#", "fieldDefinitions": [{"fieldName": "trailer_indicator", "position": 1, "width": 1}, {"fieldName": "row_count", "position": 2, "width": 9}, {"fieldName": "total_debits", "position": 11, "width": 28}, {"fieldName": "total_credits", "position": 39, "width": 25}, {"fieldName": "total_statistical_amount", "position": 64, "width": 25}, {"fieldName": "filler", "position": 89, "width": 5}]}]}''')
+
 
 def choose_gl_identity(env: str):
     """
@@ -63,7 +64,19 @@ def choose_gl_identity(env: str):
 # ---------------------------------------------------------------------------
 
 def fmt(value, length, justify="left", fill=" "):
-    s = "" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value)
+    """
+    pd.isna() (not isinstance(value, float) and pd.isna(value)) — the
+    narrower float-only check misses pd.NA, which is what a missing value
+    actually looks like now that read_jsonl_from_s3() reads every column
+    as pandas' nullable StringDtype (see s3_utils.py). Confirmed via an
+    end-to-end run against realistic data with genuinely-null fields
+    (e.g. UsageType on a Payment/CreditMemo transaction, which
+    legitimately has none): the old check let pd.NA fall through to
+    str(value), writing the literal text "<NA>" into the fixed-width
+    output instead of blank spaces. pd.isna() alone correctly catches
+    None, float NaN, pd.NA, and pd.NaT in one check.
+    """
+    s = "" if pd.isna(value) else str(value)
     s = s[:length]
     return s.ljust(length, fill) if justify == "left" else s.rjust(length, fill)
 
@@ -158,12 +171,45 @@ def file_trailer(row_count, total_debits, total_credits, total_stat=0):
 def build_gl_file(df: pd.DataFrame, business_unit: str = None, source: str = "",
                    creation_dt: datetime = None) -> str:
     """
-    business_unit=None (default): file covers every business unit present in
-    df — one journal_header + its journal_lines per distinct business_unit,
-    all wrapped in a single file_header/file_trailer. Matches the "Multi-
-    Record Fixed Width" structure from the spec.
-    business_unit="US001" (etc.): filters to just that BU, single journal
-    header block — original single-BU behavior, unchanged.
+    One journal_header is emitted per (business_unit, activity_date) pair,
+    not per business_unit alone. journal_header()'s Journal Date is a
+    header-level field meaning "Transaction Date from Source" (per spec) —
+    a single date, not a range — so a business unit whose transactions
+    span multiple days needs one header per day, not one header covering
+    all of them. Per Dakota: this applies across a run's whole date
+    window (month-to-date by default, via gl_source_join.resolve_date_window()),
+    not just a single day — a BU with three distinct activity dates in the
+    window gets three separate journal headers, each with only that day's
+    transactions under it.
+
+    business_unit=None (default): covers every (business_unit,
+    activity_date) pair present in df. Matches the "Multi-Record Fixed
+    Width" structure from the spec.
+    business_unit="US001" (etc.): every row gets labeled with this BU
+    regardless of its own InvoiceLine.Business_Unit value (unchanged from
+    before this date-grouping change — run() already filters df to one BU
+    before calling this when it wants that), still split into one header
+    per distinct activity_date within it.
+
+    Journal Date resolution, per row: TransactionJournal.ActivityDate if
+    present and non-null, else creation_dt's date — the same
+    "TransactionJournal.X, else a manual-call fallback" pattern used
+    elsewhere in this function (e.g. the amount field). This means a
+    direct/manual call that doesn't supply ActivityDate at all still gets
+    one consistent header (dated by creation_dt), same as before this
+    change.
+
+    Rows with a null business_unit are dropped from grouping entirely
+    (pandas groupby's default dropna=True) — there's no valid header to
+    put them under.
+
+    NOTE: creation_date/creation_time in the FILE header (see
+    file_header()) are unrelated to this — those stay tied to when the
+    file was actually built (creation_dt), not any transaction's date.
+    Also note the format difference: file_header's creation_date is
+    YYYYMMDD, but journal_header's journal_date below is MMDDYYYY — easy
+    to transpose by accident, so worth double-checking if either ever
+    changes.
     """
     creation_dt = creation_dt or datetime.now()
 
@@ -171,23 +217,49 @@ def build_gl_file(df: pd.DataFrame, business_unit: str = None, source: str = "",
     total_debits = Decimal("0")
     total_credits = Decimal("0")
 
-    if business_unit is not None:
-        bu_groups = [(business_unit, df)]
-    elif "InvoiceLine.Business_Unit" in df.columns and not df.empty:
-        bu_groups = [
-            (bu, df[df["InvoiceLine.Business_Unit"] == bu])
-            for bu in sorted(df["InvoiceLine.Business_Unit"].dropna().unique().tolist())
-        ]
-    else:
-        bu_groups = []
+    working = df
 
-    for bu, group_df in bu_groups:
+    if business_unit is None and (working.empty or "InvoiceLine.Business_Unit" not in working.columns):
+        bu_date_groups = []
+    elif business_unit is not None and working.empty:
+        # Explicit business_unit requested but zero matching rows — still
+        # emit one empty header for that BU, dated by creation_dt (no
+        # per-row ActivityDate to draw from). Matches the original
+        # behavior: business_unit=X always produced at least one header
+        # block, even with 0 rows under it.
+        fallback_ts = pd.Timestamp(creation_dt)
+        if fallback_ts.tzinfo is None:
+            fallback_ts = fallback_ts.tz_localize("UTC")
+        bu_date_groups = [(business_unit, fallback_ts.date(), working)]
+    else:
+        working = working.copy()
+
+        if "TransactionJournal.ActivityDate" in working.columns:
+            raw_dates = pd.to_datetime(working["TransactionJournal.ActivityDate"], utc=True, errors="coerce")
+        else:
+            raw_dates = pd.Series(
+                pd.NaT, index=working.index, dtype="datetime64[ns, UTC]"
+            )
+
+        fallback_ts = pd.Timestamp(creation_dt)
+        if fallback_ts.tzinfo is None:
+            fallback_ts = fallback_ts.tz_localize("UTC")
+        working["_journal_date_key"] = raw_dates.fillna(fallback_ts).dt.date
+        working["_bu_key"] = business_unit if business_unit is not None else working["InvoiceLine.Business_Unit"]
+
+        bu_date_groups = [
+            (bu, journal_date, group_df.drop(columns=["_journal_date_key", "_bu_key"]))
+            for (bu, journal_date), group_df in working.groupby(["_bu_key", "_journal_date_key"])
+        ]
+        bu_date_groups.sort(key=lambda g: (str(g[0]), g[1]))
+
+    for bu, journal_date, group_df in bu_date_groups:
         # Journal Header Description: placeholder "RevCloud Batch" per Dakota —
         # follow-up needed on what this should actually be when a BU's batch
         # spans multiple TransactionJournal.Name values.
         header_description = "RevCloud Batch"
 
-        lines.append(journal_header(bu, creation_dt.strftime("%m%d%Y"), source,
+        lines.append(journal_header(bu, journal_date.strftime("%m%d%Y"), source,
                                      description=header_description))
 
         for _, row in group_df.iterrows():
@@ -202,18 +274,24 @@ def build_gl_file(df: pd.DataFrame, business_unit: str = None, source: str = "",
                 total_credits += amt
 
             # Field mapping confirmed by Dakota:
-            #   account          <- Account.AccountNumber, leading "A" stripped
-            #                       (clean_account_number) — CONFIRMED via Salesforce
-            #                       API response, not Account.Name (which routinely
-            #                       exceeds this field's 10-char width and was
-            #                       silently truncating in the actual output)
-            #   dept_id          <- InvoiceLine.Department_Id
+            #   account          <- GeneralLedgerAccount.GL_Accounting_Number__c
+            #                       directly, no stripping/cleaning applied.
+            #                       Replaces the old Account.AccountNumber
+            #                       source (which stripped a leading "A" via
+            #                       clean_account_number) — per Dakota,
+            #                       Account is no longer used for the GL
+            #                       journal; GL_Accounting_Number__c isn't a
+            #                       Salesforce Account ID, so that "A"-prefix
+            #                       quirk doesn't apply to it.
+            #   dept_id          <- InvoiceLine.Department_Id (bu default /
+            #                       did overrides already applied upstream
+            #                       in gl_source_join.apply_did_overrides())
             #   project_id       <- left blank for now
             #   journal_line_ref <- TransactionJournal.UsageType (marked "?" — tentative)
             #   journal_line_desc <- TransactionJournal.TransactionType (marked "?" — tentative)
             lines.append(journal_line(
                 business_unit=bu,
-                account=row.get("account", row.get("Account.AccountNumber", "")),
+                account=row.get("account", row.get("GeneralLedgerAccount.GL_Accounting_Number__c", "")),
                 dept_id=row.get("dept_id", row.get("InvoiceLine.Department_Id", "")),
                 project_id=row.get("project_id", ""),
                 journal_line_ref=row.get("journal_line_ref", row.get("TransactionJournal.UsageType", "")),
@@ -246,7 +324,8 @@ def run(log, s3_client, oauth_token, bucket, output_key_prefix, filename_prefix,
         writer_config,
         business_unit=None, source="CS1",
         validation_key_prefix=None, validation_file_type="parquet",
-        source_prefix="salesforce/reports"):
+        source_prefix="salesforce/reports",
+        start_date=None, end_date=None):
     """
     s3_client must come from an authenticated session (e.g.
     new_session(service_credential).client("s3") — see helpers.helper_functions,
@@ -274,6 +353,12 @@ def run(log, s3_client, oauth_token, bucket, output_key_prefix, filename_prefix,
     validation_file_type: "parquet" (default) or "csv" — comes from the
     YAML job's validation_file_type parameter.
 
+    start_date / end_date: optional YYYY-MM-DD strings bounding
+    TransactionJournal.ActivityDate — passed straight through to
+    gl_source_join.build_source_dataframe() (see
+    gl_source_join.resolve_date_window()). Both omitted (the default)
+    filters to month-to-date.
+
     Both the main GL output file and the validation file land under the
     same year=/month=/day=/hour=/ partition (computed once from this run's
     creation_dt), so a given run's outputs are easy to find together and to
@@ -288,7 +373,10 @@ def run(log, s3_client, oauth_token, bucket, output_key_prefix, filename_prefix,
     creation_dt = datetime.now()
 
     log.info("building source dataframe...")
-    df = gl_source_join.build_source_dataframe(s3_client, bucket, source_prefix=source_prefix, log=log)
+    df = gl_source_join.build_source_dataframe(
+        s3_client, bucket, source_prefix=source_prefix, log=log,
+        start_date=start_date, end_date=end_date,
+    )
     log.info(f"building source dataframe...complete ({len(df)} rows)")
 
     if business_unit is not None:
@@ -340,7 +428,8 @@ def main():
         raise ValueError(
             "Usage: script.py <env> <chamber_role> <service_credential> <bucket> "
             "<output_key_prefix> <validation_key_prefix> <filename_prefix> "
-            "<source_key_prefix> <validation_file_type>"  # noqa
+            "<source_key_prefix> <validation_file_type> "
+            "[<start_date> <end_date>]"  # noqa
         )
 
     args = sys.argv[1:]
@@ -353,6 +442,12 @@ def main():
     filename_prefix = args[6]
     source_key_prefix = args[7]
     validation_file_type = args[8]
+    # Optional trailing positional args — both omitted (the default) means
+    # month-to-date (see gl_source_join.resolve_date_window()). Trailing
+    # rather than inserted earlier in the list so existing job YAML
+    # invocations that don't pass them keep working unchanged.
+    start_date = args[9] if len(sys.argv) > 10 else None
+    end_date = args[10] if len(sys.argv) > 11 else None
 
     # schema_name resolved by env, not passed in via YAML — see
     # choose_gl_identity()'s docstring (placeholder value pending real
@@ -433,6 +528,8 @@ def main():
             validation_file_type=validation_file_type,
             filename_prefix=filename_prefix,
             source_prefix=source_key_prefix,
+            start_date=start_date,
+            end_date=end_date,
         )
 
         logger.info("running gl journal builder...complete")

@@ -77,6 +77,24 @@ class TestFmt:
     def test_nan_becomes_blank_field(self):
         assert fmt(float("nan"), 4) == "    "
 
+    def test_pandas_na_becomes_blank_field(self):
+        # REGRESSION: pd.NA (pandas' nullable-dtype missing marker) is NOT
+        # `isinstance(value, float)`, so the old check
+        # `isinstance(value, float) and pd.isna(value)` silently missed it
+        # -- confirmed via an end-to-end run against realistic data with a
+        # genuinely-null field (UsageType on a Payment/CreditMemo
+        # transaction): pd.NA fell through to str(value), writing the
+        # literal text "<NA>" into the fixed-width output instead of
+        # blank spaces. Now that read_jsonl_from_s3() reads everything as
+        # pandas' nullable StringDtype, pd.NA is exactly what a missing
+        # value looks like in practice, not float NaN.
+        assert fmt(pd.NA, 4) == "    "
+
+    def test_nat_becomes_blank_field(self):
+        # Same family of missing-value marker as pd.NA, for a missing
+        # datetime specifically -- confirmed pd.isna() catches this too.
+        assert fmt(pd.NaT, 4) == "    "
+
     def test_output_always_exact_length(self):
         for val in ["", "x", "xxxxxxxxxx", None, 123, 45.6]:
             assert len(fmt(val, 6)) == 6
@@ -327,9 +345,9 @@ class TestBuildGlFile:
 
     def test_multi_bu_mode_groups_by_distinct_business_unit(self):
         df = pd.DataFrame([
-            {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500", "Account.AccountNumber": "A", "TransactionJournal.CreditDebit": 10.0,
+            {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500", "GeneralLedgerAccount.GL_Accounting_Number__c": "A", "TransactionJournal.CreditDebit": 10.0,
              "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": "Batch A"},
-            {"InvoiceLine.Business_Unit": "EU002", "InvoiceLine.Department_Id": "20500", "Account.AccountNumber": "B", "TransactionJournal.CreditDebit": 20.0,
+            {"InvoiceLine.Business_Unit": "EU002", "InvoiceLine.Department_Id": "20500", "GeneralLedgerAccount.GL_Accounting_Number__c": "B", "TransactionJournal.CreditDebit": 20.0,
              "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": "Batch B"},
         ])
         content = build_gl_file(df, business_unit=None, source="CS1",
@@ -342,9 +360,9 @@ class TestBuildGlFile:
 
     def test_multi_bu_groups_sorted_alphabetically(self):
         df = pd.DataFrame([
-            {"InvoiceLine.Business_Unit": "US002", "InvoiceLine.Department_Id": "1", "Account.AccountNumber": "", "TransactionJournal.CreditDebit": 1.0,
+            {"InvoiceLine.Business_Unit": "US002", "InvoiceLine.Department_Id": "1", "GeneralLedgerAccount.GL_Accounting_Number__c": "", "TransactionJournal.CreditDebit": 1.0,
              "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": ""},
-            {"InvoiceLine.Business_Unit": "EU001", "InvoiceLine.Department_Id": "2", "Account.AccountNumber": "", "TransactionJournal.CreditDebit": 1.0,
+            {"InvoiceLine.Business_Unit": "EU001", "InvoiceLine.Department_Id": "2", "GeneralLedgerAccount.GL_Accounting_Number__c": "", "TransactionJournal.CreditDebit": 1.0,
              "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": ""},
         ])
         content = build_gl_file(df, business_unit=None, source="CS1",
@@ -356,9 +374,9 @@ class TestBuildGlFile:
 
     def test_filtering_to_single_business_unit_excludes_others(self):
         df = pd.DataFrame([
-            {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "1", "Account.AccountNumber": "", "TransactionJournal.CreditDebit": 1.0,
+            {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "1", "GeneralLedgerAccount.GL_Accounting_Number__c": "", "TransactionJournal.CreditDebit": 1.0,
              "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": ""},
-            {"InvoiceLine.Business_Unit": "EU002", "InvoiceLine.Department_Id": "2", "Account.AccountNumber": "", "TransactionJournal.CreditDebit": 1.0,
+            {"InvoiceLine.Business_Unit": "EU002", "InvoiceLine.Department_Id": "2", "GeneralLedgerAccount.GL_Accounting_Number__c": "", "TransactionJournal.CreditDebit": 1.0,
              "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": ""},
         ])
         content = build_gl_file(df, business_unit="US001", source="CS1",
@@ -366,9 +384,114 @@ class TestBuildGlFile:
         assert "EU002" not in content
 
 
-# ---------------------------------------------------------------------------
-# Filename convention
-# ---------------------------------------------------------------------------
+class TestBuildGlFileDateGrouping:
+    """
+    journal_header()'s Journal Date is "Transaction Date from Source" per
+    the real spec (confirmed via screenshot) — a single date, not a range.
+    build_gl_file() groups by (business_unit, activity_date), not just
+    business_unit, so a BU whose transactions span multiple days gets one
+    header per day.
+    """
+
+    def _row(self, bu, activity_date, amt=1.0, name=""):
+        return {
+            "InvoiceLine.Business_Unit": bu, "InvoiceLine.Department_Id": "1",
+            "GeneralLedgerAccount.GL_Accounting_Number__c": "20011111",
+            "TransactionJournal.CreditDebit": amt,
+            "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "",
+            "TransactionJournal.Name": name,
+            "TransactionJournal.ActivityDate": activity_date,
+        }
+
+    def test_one_bu_two_dates_produces_two_headers(self):
+        df = pd.DataFrame([
+            self._row("US001", "2026-08-05T10:00:00.000+0000"),
+            self._row("US001", "2026-08-06T10:00:00.000+0000"),
+        ])
+        content = build_gl_file(df, business_unit=None, source="CS1",
+                                 creation_dt=datetime(2026, 8, 20))
+        h_lines = [line for line in content.split("\n") if line.startswith("H")]
+        assert len(h_lines) == 2
+
+    def test_same_bu_same_date_different_times_produces_one_header(self):
+        # Different times on the same calendar day should still merge into
+        # a single journal_header — grouping is by date, not full timestamp.
+        df = pd.DataFrame([
+            self._row("US001", "2026-08-05T08:00:00.000+0000"),
+            self._row("US001", "2026-08-05T22:00:00.000+0000"),
+        ])
+        content = build_gl_file(df, business_unit=None, source="CS1",
+                                 creation_dt=datetime(2026, 8, 20))
+        h_lines = [line for line in content.split("\n") if line.startswith("H")]
+        assert len(h_lines) == 1
+
+    def test_journal_date_uses_activity_date_not_creation_dt(self):
+        df = pd.DataFrame([self._row("US001", "2026-08-05T10:00:00.000+0000")])
+        content = build_gl_file(df, business_unit=None, source="CS1",
+                                 creation_dt=datetime(2026, 8, 20))
+        h_line = next(line for line in content.split("\n") if line.startswith("H"))
+        # journal_date field is at position 17-24 (1-indexed) = chars 16:24
+        assert h_line[16:24] == "08052026"  # MMDDYYYY for Aug 5, 2026 — NOT creation_dt's Aug 20
+
+    def test_journal_date_format_is_mmddyyyy_not_yyyymmdd(self):
+        # Distinct from the FILE header's creation_date, which is YYYYMMDD
+        # — deliberately different formats, easy to transpose by accident.
+        df = pd.DataFrame([self._row("US001", "2026-01-31T10:00:00.000+0000")])
+        content = build_gl_file(df, business_unit=None, source="CS1",
+                                 creation_dt=datetime(2026, 8, 20))
+        h_line = next(line for line in content.split("\n") if line.startswith("H"))
+        assert h_line[16:24] == "01312026"  # MMDDYYYY, not 20260131 (YYYYMMDD)
+
+    def test_file_header_creation_date_unaffected_by_activity_date(self):
+        df = pd.DataFrame([self._row("US001", "2026-01-31T10:00:00.000+0000")])
+        content = build_gl_file(df, business_unit=None, source="CS1",
+                                 creation_dt=datetime(2026, 8, 20, 9, 0, 0))
+        file_header_line = content.split("\n")[0]
+        assert file_header_line.startswith("#H20260820")  # creation_dt's date, YYYYMMDD
+
+    def test_two_business_units_each_with_own_dates_produce_correct_header_count(self):
+        df = pd.DataFrame([
+            self._row("US001", "2026-08-05T10:00:00.000+0000"),
+            self._row("US001", "2026-08-06T10:00:00.000+0000"),
+            self._row("EU002", "2026-08-05T10:00:00.000+0000"),
+        ])
+        content = build_gl_file(df, business_unit=None, source="CS1",
+                                 creation_dt=datetime(2026, 8, 20))
+        h_lines = [line for line in content.split("\n") if line.startswith("H")]
+        # US001/08-05, US001/08-06, EU002/08-05 -> 3 distinct headers
+        assert len(h_lines) == 3
+
+    def test_missing_activity_date_falls_back_to_creation_dt_one_header(self):
+        # Direct/manual call style (no ActivityDate at all) — should still
+        # produce exactly one header per BU, dated by creation_dt, same as
+        # before this change.
+        df = pd.DataFrame([
+            {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "1",
+             "GeneralLedgerAccount.GL_Accounting_Number__c": "1", "TransactionJournal.CreditDebit": 1.0,
+             "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": ""},
+            {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "2",
+             "GeneralLedgerAccount.GL_Accounting_Number__c": "2", "TransactionJournal.CreditDebit": 2.0,
+             "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": ""},
+        ])
+        content = build_gl_file(df, business_unit=None, source="CS1",
+                                 creation_dt=datetime(2026, 8, 20))
+        h_lines = [line for line in content.split("\n") if line.startswith("H")]
+        assert len(h_lines) == 1
+        assert h_lines[0][16:24] == "08202026"  # falls back to creation_dt
+
+    def test_row_count_and_totals_correct_across_multiple_headers(self):
+        df = pd.DataFrame([
+            self._row("US001", "2026-08-05T10:00:00.000+0000", amt=100.0),
+            self._row("US001", "2026-08-06T10:00:00.000+0000", amt=-50.0),
+        ])
+        content = build_gl_file(df, business_unit=None, source="CS1",
+                                 creation_dt=datetime(2026, 8, 20))
+        trailer = next(line for line in content.split("\n") if line.startswith("#T"))
+        # row_count = 2 headers + 2 lines = 4
+        assert trailer[2:11] == "000000004"
+        assert "100.00" in trailer
+        assert "-50.00" in trailer
+
 
 class TestBuildFilename:
     def test_matches_spec_pattern(self):
@@ -408,7 +531,7 @@ class TestRunOrchestration:
 
     def _sample_df(self):
         return pd.DataFrame([
-            {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500", "Account.AccountNumber": "Acme",
+            {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500", "GeneralLedgerAccount.GL_Accounting_Number__c": "Acme",
              "TransactionJournal.CreditDebit": 100.0, "TransactionJournal.UsageType": "Storage", "TransactionJournal.TransactionType": "InvoiceLine",
              "TransactionJournal.Name": "Batch"},
         ])
@@ -452,9 +575,9 @@ class TestRunOrchestration:
 
     def test_filters_by_business_unit_when_given(self, monkeypatch):
         fake_df = pd.DataFrame([
-            {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500", "Account.AccountNumber": "A", "TransactionJournal.CreditDebit": 1.0,
+            {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500", "GeneralLedgerAccount.GL_Accounting_Number__c": "A", "TransactionJournal.CreditDebit": 1.0,
              "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": ""},
-            {"InvoiceLine.Business_Unit": "US002", "InvoiceLine.Department_Id": "20500", "Account.AccountNumber": "B", "TransactionJournal.CreditDebit": 2.0,
+            {"InvoiceLine.Business_Unit": "US002", "InvoiceLine.Department_Id": "20500", "GeneralLedgerAccount.GL_Accounting_Number__c": "B", "TransactionJournal.CreditDebit": 2.0,
              "TransactionJournal.UsageType": "", "TransactionJournal.TransactionType": "", "TransactionJournal.Name": ""},
         ])
         monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: fake_df)
@@ -572,7 +695,7 @@ class TestRunOrchestration:
         ]
         assert len(validation_calls) == 1
         body = validation_calls[0].kwargs["Body"]
-        assert b"Account.AccountNumber" in body
+        assert b"GeneralLedgerAccount.GL_Accounting_Number__c" in body
         assert b"InvoiceLine.Business_Unit" in body
         assert b"TransactionJournal.CreditDebit" in body
 
@@ -597,6 +720,38 @@ class TestRunOrchestration:
 
         url, row_count = self._run(log, s3)
         assert row_count == 0
+
+    def test_start_end_date_passed_through_to_build_source_dataframe(self, monkeypatch):
+        captured = {}
+
+        def fake_build_source_dataframe(*args, **kwargs):
+            captured.update(kwargs)
+            return self._sample_df()
+
+        monkeypatch.setattr(glsj, "build_source_dataframe", fake_build_source_dataframe)
+        s3 = MagicMock()
+        log = MagicMock()
+
+        self._run(log, s3, start_date="2026-08-01", end_date="2026-08-15")
+
+        assert captured["start_date"] == "2026-08-01"
+        assert captured["end_date"] == "2026-08-15"
+
+    def test_start_end_date_default_to_none_when_not_given(self, monkeypatch):
+        captured = {}
+
+        def fake_build_source_dataframe(*args, **kwargs):
+            captured.update(kwargs)
+            return self._sample_df()
+
+        monkeypatch.setattr(glsj, "build_source_dataframe", fake_build_source_dataframe)
+        s3 = MagicMock()
+        log = MagicMock()
+
+        self._run(log, s3)
+
+        assert captured["start_date"] is None
+        assert captured["end_date"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -708,7 +863,7 @@ VALID_ARGV = [
 
 def sample_df():
     return pd.DataFrame([
-        {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500", "Account.AccountNumber": "Acme",
+        {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500", "GeneralLedgerAccount.GL_Accounting_Number__c": "Acme",
          "TransactionJournal.CreditDebit": 100.0, "TransactionJournal.UsageType": "Storage", "TransactionJournal.TransactionType": "InvoiceLine",
          "TransactionJournal.Name": "Batch"},
     ])
@@ -940,6 +1095,64 @@ class TestMainEnvironmentPassthrough:
         assert call_kwargs["run_start_timestamp"] <= call_kwargs["run_end_timestamp"]
         assert call_kwargs["data_interval_end_timestamp"] == call_kwargs["run_end_timestamp"]
         assert call_kwargs["data_interval_start_timestamp"] is None
+
+
+class TestMainDateArgs:
+    """
+    start_date/end_date are optional trailing positional args (argv indices
+    9 and 10) — both omitted means month-to-date (see
+    gl_source_join.resolve_date_window()). Trailing so existing job YAML
+    invocations using exactly VALID_ARGV's 9 required args keep working
+    unchanged.
+    """
+
+    def test_omitted_date_args_pass_none_through(self, monkeypatch):
+        captured = {}
+
+        def fake_build_source_dataframe(*args, **kwargs):
+            captured.update(kwargs)
+            return sample_df()
+
+        monkeypatch.setattr(sys, "argv", VALID_ARGV)
+        monkeypatch.setattr(glsj, "build_source_dataframe", fake_build_source_dataframe)
+        mocks = install_fake_databricks_modules(monkeypatch)
+        mocks["new_session"].return_value.client.return_value = MagicMock()
+
+        gljb.main()
+
+        assert captured["start_date"] is None
+        assert captured["end_date"] is None
+
+    def test_explicit_date_args_passed_through(self, monkeypatch):
+        captured = {}
+
+        def fake_build_source_dataframe(*args, **kwargs):
+            captured.update(kwargs)
+            return sample_df()
+
+        argv = list(VALID_ARGV) + ["2026-08-01", "2026-08-15"]
+        monkeypatch.setattr(sys, "argv", argv)
+        monkeypatch.setattr(glsj, "build_source_dataframe", fake_build_source_dataframe)
+        mocks = install_fake_databricks_modules(monkeypatch)
+        mocks["new_session"].return_value.client.return_value = MagicMock()
+
+        gljb.main()
+
+        assert captured["start_date"] == "2026-08-01"
+        assert captured["end_date"] == "2026-08-15"
+
+    def test_still_works_with_exactly_nine_required_args(self, monkeypatch):
+        # sanity check: existing job YAML invocations with exactly the 9
+        # required args (no date args at all) still succeed, not just
+        # "don't raise" but produce a normal SUCCESS response
+        monkeypatch.setattr(sys, "argv", VALID_ARGV)
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: sample_df())
+        mocks = install_fake_databricks_modules(monkeypatch)
+        mocks["new_session"].return_value.client.return_value = MagicMock()
+
+        result = gljb.main()
+
+        assert result["status_code"] == 200
 
 
 class TestDunderMain:

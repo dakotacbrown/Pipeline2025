@@ -100,6 +100,87 @@ class TestReadJsonlFromS3:
         read_jsonl_from_s3(s3, "my-bucket", "path/to/file.jsonl")
         s3.get_object.assert_called_once_with(Bucket="my-bucket", Key="path/to/file.jsonl")
 
+    def test_numeric_looking_string_column_stays_a_string(self):
+        # REGRESSION: pandas' default JSON dtype inference silently
+        # converts a column where every value looks like a plain integer
+        # (e.g. a business unit code) into int64 — caught via an
+        # end-to-end run against realistic fixture data, not by a
+        # hand-built test DataFrame (which never round-trips through
+        # pd.read_json and so never hits this coercion). Confirmed this
+        # both drops leading zeros (see the next test) and breaks any
+        # downstream string comparison against that column (e.g.
+        # gl_source_join.py's apply_did_overrides() comparing
+        # gl_accounting_number_c == "10040049").
+        content = b'{"Business_Unit_BU__c": "10902"}\n{"Business_Unit_BU__c": "20450"}\n'
+        s3 = self._make_s3_client(content)
+        df = read_jsonl_from_s3(s3, "bucket", "key.jsonl")
+        assert df["Business_Unit_BU__c"].iloc[0] == "10902"
+        assert isinstance(df["Business_Unit_BU__c"].iloc[0], str)
+
+    def test_leading_zeros_preserved_in_numeric_looking_column(self):
+        content = b'{"Department_ID_DID__c": "00450"}\n'
+        s3 = self._make_s3_client(content)
+        df = read_jsonl_from_s3(s3, "bucket", "key.jsonl")
+        assert df["Department_ID_DID__c"].iloc[0] == "00450"
+
+    def test_all_columns_are_pandas_string_dtype(self):
+        # Per Dakota: everything from these JSON files should be viewed as
+        # dtype string. Actual columnar types (varchar/bool/timestamp_tz/
+        # double/date/int per the DDL spreadsheets) are each downstream
+        # consumer's responsibility to apply, not this reader's.
+        content = b'{"IsDeleted": false, "Amount": 100.5, "Id": "A1", "Count": 3}\n'
+        s3 = self._make_s3_client(content)
+        df = read_jsonl_from_s3(s3, "bucket", "key.jsonl")
+        for col in df.columns:
+            assert df[col].dtype == "string", f"{col} is {df[col].dtype}, expected string"
+
+    def test_native_json_boolean_is_stringified_not_left_as_bool(self):
+        # dtype=False alone doesn't touch this -- a native JSON true/false
+        # comes back as numpy bool without an explicit string cast.
+        content = b'{"IsDeleted": false}\n{"IsDeleted": true}\n'
+        s3 = self._make_s3_client(content)
+        df = read_jsonl_from_s3(s3, "bucket", "key.jsonl")
+        assert isinstance(df["IsDeleted"].iloc[0], str)
+        assert isinstance(df["IsDeleted"].iloc[1], str)
+
+    def test_native_json_number_is_stringified_not_left_as_float(self):
+        content = b'{"Amount": 100.5}\n'
+        s3 = self._make_s3_client(content)
+        df = read_jsonl_from_s3(s3, "bucket", "key.jsonl")
+        assert isinstance(df["Amount"].iloc[0], str)
+        assert df["Amount"].iloc[0] == "100.5"
+
+    def test_null_stays_a_real_null_not_stringified_to_none_text(self):
+        # .astype("string") (StringDtype), not .astype(str) (python str) --
+        # confirmed the latter would turn an actual null into the literal
+        # text "None"/"nan", which would then look like real data
+        # downstream instead of being caught by .isna()/.fillna().
+        content = b'{"Description": null}\n'
+        s3 = self._make_s3_client(content)
+        df = read_jsonl_from_s3(s3, "bucket", "key.jsonl")
+        assert df["Description"].isna().iloc[0]
+
+    def test_downstream_numeric_conversion_still_works_on_string_dtype(self):
+        # pd.to_numeric(errors="coerce") -- resolve_amount()'s own pattern
+        # -- must still work against a StringDtype column with real nulls.
+        content = b'{"Debit": "100.50"}\n{"Debit": null}\n'
+        s3 = self._make_s3_client(content)
+        df = read_jsonl_from_s3(s3, "bucket", "key.jsonl")
+        numeric = pd.to_numeric(df["Debit"], errors="coerce")
+        assert numeric.iloc[0] == 100.50
+        assert pd.isna(numeric.iloc[1])
+
+    def test_downstream_date_conversion_still_works_on_string_dtype(self):
+        # pd.to_datetime() -- resolve_date_window()'s own pattern -- must
+        # still work against a StringDtype ActivityDate column.
+        content = b'{"ActivityDate": "2026-08-12T17:47:25.000+0000"}\n'
+        s3 = self._make_s3_client(content)
+        df = read_jsonl_from_s3(s3, "bucket", "key.jsonl")
+        parsed = pd.to_datetime(df["ActivityDate"], utc=True)
+        assert parsed.iloc[0].year == 2026
+        assert parsed.iloc[0].month == 8
+        assert parsed.iloc[0].day == 12
+
 
 # ---------------------------------------------------------------------------
 # read_jsonl_prefix_from_s3() — mocked paginator

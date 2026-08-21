@@ -37,9 +37,45 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 def read_jsonl_from_s3(s3_client, bucket: str, key: str) -> pd.DataFrame:
+    """
+    Every column is forced to pandas' nullable "string" dtype (StringDtype)
+    here — confirmed with Dakota: everything read from these JSON files
+    should be treated as dtype string and UTF-8 encoding, full stop. The
+    UTF-8 decode already happened below; dtype=False alone wasn't enough
+    for the string part: it stops pandas from converting numeric-LOOKING
+    string columns to int64 (see the leading-zero / "10040049" override
+    bug fixed earlier), but doesn't touch columns that are natively JSON
+    booleans or numbers (e.g. "IsDeleted": false, "Amount": 100.5) — those
+    still came back as native bool/float64 dtype without an explicit cast.
+
+    The DDL spreadsheets Dakota provided define each column's real,
+    eventual type (varchar/bool/timestamp_tz/double/date/int) — but
+    applying that is each downstream consumer's job (pd.to_numeric(),
+    pd.to_datetime(), Decimal(str(...)), etc. — already used throughout
+    this pipeline for exactly this reason, e.g. resolve_amount(),
+    resolve_date_window()), not something this reader should guess at.
+
+    .astype("string") — capital-S StringDtype, NOT python str via
+    .astype(str) — specifically because it preserves actual JSON nulls as
+    pd.NA instead of stringifying them into the literal text
+    "None"/"nan". Confirmed downstream code's existing null handling
+    (.isna(), .fillna(), pd.to_numeric(errors="coerce"),
+    pd.to_datetime(errors="coerce"), merges on string-dtype join keys)
+    all work the same against pd.NA as they did against NaN/None.
+
+    CAVEAT worth knowing: a `==` comparison against a StringDtype column
+    with pd.NA present (e.g. apply_did_overrides()'s
+    gl_accounting_number_c == "10040049") returns pd.NA for those rows,
+    not False. Confirmed this is still safe for pandas' own
+    .loc[mask, ...] boolean-mask assignment (pd.NA there behaves like
+    "don't select this row", same practical effect as False) — but would
+    NOT be safe if that comparison result were ever used in a plain Python
+    `if` statement, which pd.NA doesn't support.
+    """
     obj = s3_client.get_object(Bucket=bucket, Key=key)
     body = obj["Body"].read().decode("utf-8")
-    return pd.read_json(io.StringIO(body), lines=True)
+    df = pd.read_json(io.StringIO(body), lines=True, dtype=False)
+    return df.astype("string")
 
 
 def read_jsonl_prefix_from_s3(s3_client, bucket: str, prefix: str, expected_columns: list = None) -> pd.DataFrame:

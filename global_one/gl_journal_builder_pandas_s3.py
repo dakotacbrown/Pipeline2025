@@ -407,6 +407,12 @@ def run(log, s3_client, oauth_token, bucket, output_key_prefix, filename_prefix,
         validation_key_prefix=validation_key_prefix,
         validation_file_type=validation_file_type,
         decode_metadata=DECODE_METADATA,
+        # Per Dakota: "just the current date in yyyymmdd format" — the
+        # OneStream Direct Write docs mark this as required ("imperative")
+        # for this kind of submission, not just optional in the general
+        # case. See write_and_submit_file()'s docstring for why this
+        # isn't derived inside that shared function itself.
+        data_lake_copy_subfolder=creation_dt.strftime("%Y%m%d"),
     )
     log.info(
         f"writing outbound + validation files and submitting to onelake...complete "

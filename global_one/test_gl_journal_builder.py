@@ -605,6 +605,30 @@ class TestRunOrchestration:
         assert file_submissions[0]["fileType"] == "MULTI_RECORD_FIXED_WIDTH"
         assert "decodeMetadata" in file_submissions[0]
 
+    def test_passes_data_lake_copy_subfolder_as_current_date_yyyymmdd(self, monkeypatch):
+        # Per the OneStream Direct Write docs, confirmed by Dakota: "just
+        # the current date in yyyymmdd format" -- no "instance_id=" prefix.
+        # run() must compute this from the SAME creation_dt used everywhere
+        # else in this pipeline for "when the file was built" (datetime.now(),
+        # computed once inside run() -- no injectable parameter, so this
+        # test fixes the clock instead of passing a value directly).
+        monkeypatch.setattr(glsj, "build_source_dataframe", lambda *a, **k: self._sample_df())
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 8, 24, 9, 0, 0)
+
+        monkeypatch.setattr(gljb, "datetime", _FixedDatetime)
+
+        s3 = MagicMock()
+        log = MagicMock()
+
+        self._run(log, s3)
+
+        call_kwargs = self.s3_to_onelake_mock.call_args.kwargs
+        assert call_kwargs["data_lake_copy_subfolder"] == "20260824"
+
     def test_filters_by_business_unit_when_given(self, monkeypatch):
         fake_df = pd.DataFrame([
             {"InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500", "GeneralLedgerAccount.GL_Accounting_Number__c": "A", "TransactionJournal.CreditDebit": 1.0,

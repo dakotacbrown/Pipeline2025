@@ -157,7 +157,7 @@ class TestWriteAndSubmitFile:
     def test_calls_s3_to_onelake_with_correct_file_submission(self, monkeypatch):
         captured = {}
 
-        def fake_s3_to_onelake(log, oauth_token, writer_config, file_submissions):
+        def fake_s3_to_onelake(log, oauth_token, writer_config, file_submissions, **kwargs):
             captured["oauth_token"] = oauth_token
             captured["writer_config"] = writer_config
             captured["file_submissions"] = file_submissions
@@ -182,7 +182,7 @@ class TestWriteAndSubmitFile:
     def test_decode_metadata_included_when_given(self, monkeypatch):
         captured = {}
 
-        def fake_s3_to_onelake(log, oauth_token, writer_config, file_submissions):
+        def fake_s3_to_onelake(log, oauth_token, writer_config, file_submissions, **kwargs):
             captured["file_submissions"] = file_submissions
 
         monkeypatch.setattr(
@@ -196,6 +196,56 @@ class TestWriteAndSubmitFile:
             decode_metadata={"fieldDefinitions": []},
         )
         assert captured["file_submissions"][0]["decodeMetadata"] == {"fieldDefinitions": []}
+
+    def test_data_lake_copy_subfolder_passed_through_to_s3_to_onelake(self, monkeypatch):
+        # Per the OneStream Direct Write docs (Publishing Data to OneLake
+        # Direct Write via OneStream): "It is imperative to pass a
+        # data_lake_copy_subfolder... within the multipart config."
+        # Confirmed via a real end-to-end code trace that this parameter
+        # existed at the lowest level (s3_to_onelake()/
+        # build_multipart_submission_body()) but this function -- the one
+        # every real caller actually goes through -- never accepted or
+        # forwarded it at all, matching s3_to_onelake()'s own docstring:
+        # "Neither is currently used by any caller in this repo."
+        captured = {}
+
+        def fake_s3_to_onelake(log, oauth_token, writer_config, file_submissions,
+                                data_lake_copy_subfolder=None, **kwargs):
+            captured["data_lake_copy_subfolder"] = data_lake_copy_subfolder
+
+        monkeypatch.setattr(
+            "src.salesforce.resources.scripts.helpers.helper_functions.s3_to_onelake",
+            fake_s3_to_onelake,
+        )
+        s3 = MagicMock()
+        write_and_submit_file(
+            MagicMock(), s3, "token", "bucket", "content", "f.txt", "MULTI_RECORD_FIXED_WIDTH",
+            "outbound", self._writer_config(), datetime(2026, 8, 5),
+            data_lake_copy_subfolder="20260805",
+        )
+        assert captured["data_lake_copy_subfolder"] == "20260805"
+
+    def test_data_lake_copy_subfolder_defaults_to_none(self, monkeypatch):
+        # A caller that doesn't pass this at all (e.g. salesforce_ofac.py,
+        # which does not currently supply it) gets the same behavior as
+        # before this parameter existed -- omitted from the request body
+        # entirely, not defaulted to some guessed value.
+        captured = {}
+
+        def fake_s3_to_onelake(log, oauth_token, writer_config, file_submissions,
+                                data_lake_copy_subfolder=None, **kwargs):
+            captured["data_lake_copy_subfolder"] = data_lake_copy_subfolder
+
+        monkeypatch.setattr(
+            "src.salesforce.resources.scripts.helpers.helper_functions.s3_to_onelake",
+            fake_s3_to_onelake,
+        )
+        s3 = MagicMock()
+        write_and_submit_file(
+            MagicMock(), s3, "token", "bucket", "content", "f.csv", "CSV_WITH_HEADER",
+            "outbound", self._writer_config(), datetime(2026, 8, 5),
+        )
+        assert captured["data_lake_copy_subfolder"] is None
 
     def test_does_not_mutate_caller_writer_config(self, monkeypatch):
         monkeypatch.setattr(

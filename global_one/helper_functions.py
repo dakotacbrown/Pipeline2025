@@ -378,6 +378,7 @@ def write_and_submit_file(
     validation_key_prefix: str = None,
     validation_file_type: str = "parquet",
     decode_metadata: dict = None,
+    data_lake_copy_subfolder: str = None,
 ):
     """
     Shared by salesforce_ofac.py and salesforce_global_one.py: writes the
@@ -396,6 +397,20 @@ def write_and_submit_file(
 
     decode_metadata: required for MULTI_RECORD_FIXED_WIDTH submissions,
     omit for CSV_WITH_HEADER and other self-describing formats.
+
+    data_lake_copy_subfolder: passed straight through to s3_to_onelake()/
+    build_multipart_submission_body() — per the Exchange docs (Publishing
+    Data to OneLake Direct Write via OneStream), "(Optional) The subfolder
+    path for schemas with Direct Write sink instructions, used to control
+    the exact path of the file on OneLake." Per Dakota, for
+    salesforce_global_one.py this should just be the current date in
+    yyyymmdd format (creation_dt.strftime("%Y%m%d")) — the caller computes
+    and passes this; this function doesn't derive it itself, since not
+    every caller necessarily wants the same value (or any value at all —
+    defaults to None, meaning omitted from the request body entirely, same
+    as before this parameter existed). salesforce_ofac.py does NOT
+    currently pass this — worth revisiting if the "imperative" framing in
+    the docs is meant to apply there too, not assumed here.
 
     writer_config must contain: ba, schema_name, iam_role, base_url, env,
     region — bucket and file_name get set/overwritten here, so don't rely
@@ -429,6 +444,7 @@ def write_and_submit_file(
     config["bucket"] = bucket
     config["file_name"] = filename
 
-    s3_to_onelake(log, oauth_token, config, [file_submission])
+    s3_to_onelake(log, oauth_token, config, [file_submission],
+                  data_lake_copy_subfolder=data_lake_copy_subfolder)
 
     return outbound_url, validation_url

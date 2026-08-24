@@ -331,6 +331,38 @@ class TestBuildGlFile:
         journal_header_line = content.split("\n")[1]
         assert journal_header_line[78:108] == "RevCloud Batch".ljust(30)
 
+    def test_journal_line_reference_sources_from_transaction_journal_name(self):
+        # Confirmed by Dakota: journal_line_ref <- TransactionJournal.Name
+        # (previously UsageType, marked "?"/tentative — corrected). Uses
+        # the row.get() fallback path directly (no precomputed
+        # "journal_line_ref" key), same as build_source_dataframe()'s real
+        # output shape would produce.
+        df = pd.DataFrame([{
+            "InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500",
+            "GeneralLedgerAccount.GL_Accounting_Number__c": "12345678",
+            "TransactionJournal.CreditDebit": 100.0,
+            "TransactionJournal.UsageType": "Storage",  # must NOT end up in journal_line_ref
+            "TransactionJournal.TransactionType": "InvoiceLine",
+            "TransactionJournal.Name": "TJ-00001",
+        }])
+        content = build_gl_file(df, "US001", "RCL", datetime(2026, 8, 4))
+        journal_line = content.split("\n")[2]
+        assert journal_line[233:243] == "TJ-00001".ljust(10)
+        assert "Storage" not in journal_line
+
+    def test_journal_line_description_sources_from_transaction_type(self):
+        # Confirmed by Dakota — already coded this way, no longer tentative.
+        df = pd.DataFrame([{
+            "InvoiceLine.Business_Unit": "US001", "InvoiceLine.Department_Id": "10500",
+            "GeneralLedgerAccount.GL_Accounting_Number__c": "12345678",
+            "TransactionJournal.CreditDebit": 100.0, "TransactionJournal.UsageType": "",
+            "TransactionJournal.TransactionType": "CreditMemo",
+            "TransactionJournal.Name": "TJ-00001",
+        }])
+        content = build_gl_file(df, "US001", "RCL", datetime(2026, 8, 4))
+        journal_line = content.split("\n")[2]
+        assert journal_line[243:273] == "CreditMemo".ljust(30)
+
     def test_multi_bu_mode_with_no_business_unit_column_produces_header_only(self):
         # business_unit=None but the dataframe doesn't even have a
         # business_unit column — covers the "else: bu_groups = []" branch

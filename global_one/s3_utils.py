@@ -85,6 +85,21 @@ def read_jsonl_prefix_from_s3(s3_client, bucket: str, prefix: str, expected_colu
     some tables (e.g. Refund, PaymentLineInvoiceLine currently have 0 rows) —
     returns an empty dataframe with expected_columns instead of raising, so
     downstream joins don't break on legitimately-empty source tables.
+
+    Also reshapes to expected_columns if every JSONL object under the
+    prefix turns out to be empty/whitespace-only CONTENT — a distinct case
+    from "no objects at all" above, and confirmed to be a real gap, not
+    just a hypothetical: a 0-byte (or whitespace-only) file still counts
+    as "an object exists" to the paginator, so the `if not frames` check
+    below never fires for it. Confirmed directly:
+    `pd.read_json("", lines=True)` returns a DataFrame with shape (0, 0) —
+    ZERO COLUMNS, not just zero rows — so without this check, any
+    downstream `df["SomeColumn"]` access raises KeyError instead of
+    behaving like any other empty table. A mix of real + empty files under
+    the same prefix is unaffected either way — pd.concat already handles
+    a 0-column frame alongside real ones gracefully (confirmed directly),
+    contributing nothing; this check only matters when EVERY file under
+    the prefix is empty.
     """
     paginator = s3_client.get_paginator("list_objects_v2")
     frames = []
@@ -95,7 +110,10 @@ def read_jsonl_prefix_from_s3(s3_client, bucket: str, prefix: str, expected_colu
                 frames.append(read_jsonl_from_s3(s3_client, bucket, key))
     if not frames:
         return pd.DataFrame(columns=expected_columns or [])
-    return pd.concat(frames, ignore_index=True)
+    result = pd.concat(frames, ignore_index=True)
+    if result.shape[1] == 0:
+        return pd.DataFrame(columns=expected_columns or [])
+    return result
 
 
 def find_dataset_prefix(bucket: str, dataset_id: str, source_prefix: str = "salesforce/reports") -> str:

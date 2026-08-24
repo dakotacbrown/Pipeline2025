@@ -287,14 +287,19 @@ def build_gl_file(df: pd.DataFrame, business_unit: str = None, source: str = "",
             #                       did overrides already applied upstream
             #                       in gl_source_join.apply_did_overrides())
             #   project_id       <- left blank for now
-            #   journal_line_ref <- TransactionJournal.UsageType (marked "?" — tentative)
-            #   journal_line_desc <- TransactionJournal.TransactionType (marked "?" — tentative)
+            #   journal_line_ref <- TransactionJournal.Name — confirmed by
+            #                       Dakota (previously UsageType, marked
+            #                       "?"/tentative; corrected)
+            #   journal_line_desc <- TransactionJournal.TransactionType —
+            #                       confirmed by Dakota (previously marked
+            #                       "?"/tentative alongside journal_line_ref
+            #                       above; this one was already correct)
             lines.append(journal_line(
                 business_unit=bu,
                 account=row.get("account", row.get("GeneralLedgerAccount.GL_Accounting_Number__c", "")),
                 dept_id=row.get("dept_id", row.get("InvoiceLine.Department_Id", "")),
                 project_id=row.get("project_id", ""),
-                journal_line_ref=row.get("journal_line_ref", row.get("TransactionJournal.UsageType", "")),
+                journal_line_ref=row.get("journal_line_ref", row.get("TransactionJournal.Name", "")),
                 journal_line_desc=row.get("journal_line_desc",
                                            row.get("TransactionJournal.TransactionType", "")),
                 txn_currency_code=row.get("txn_currency_code", ""),

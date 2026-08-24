@@ -254,6 +254,51 @@ class TestReadJsonlPrefixFromS3:
         df = read_jsonl_prefix_from_s3(s3, "bucket", "p/")
         assert len(df) == 0
 
+    def test_zero_byte_file_reshapes_to_expected_columns(self):
+        # REGRESSION: a 0-byte (or whitespace-only) file still counts as
+        # "an object exists" to the paginator -- the `if not frames` check
+        # alone doesn't catch this. Confirmed directly:
+        # pd.read_json("", lines=True) returns shape (0, 0), zero COLUMNS
+        # not just zero rows -- without this fix, df["Id"] below would
+        # raise KeyError instead of behaving like any other empty table.
+        pages = [{"Contents": [{"Key": "p/empty.jsonl"}]}]
+        contents = {"p/empty.jsonl": b""}
+        s3 = self._make_s3_client(pages, contents)
+        df = read_jsonl_prefix_from_s3(s3, "bucket", "p/", expected_columns=["Id", "Name"])
+        assert len(df) == 0
+        assert list(df.columns) == ["Id", "Name"]
+        assert len(df["Id"]) == 0  # does not raise KeyError
+
+    def test_whitespace_only_file_reshapes_to_expected_columns(self):
+        # Same failure mode as the 0-byte case above, via a nonzero-size
+        # file (a stray newline/whitespace) rather than a literal 0 bytes
+        # -- confirmed pd.read_json treats both identically (shape (0, 0)).
+        pages = [{"Contents": [{"Key": "p/blank.jsonl"}]}]
+        contents = {"p/blank.jsonl": b"\n"}
+        s3 = self._make_s3_client(pages, contents)
+        df = read_jsonl_prefix_from_s3(s3, "bucket", "p/", expected_columns=["Id", "Name"])
+        assert len(df) == 0
+        assert list(df.columns) == ["Id", "Name"]
+
+    def test_all_files_under_prefix_empty_reshapes_to_expected_columns(self):
+        # Multiple files, ALL empty -- not just a single empty file.
+        pages = [{"Contents": [{"Key": "p/empty1.jsonl"}, {"Key": "p/empty2.jsonl"}]}]
+        contents = {"p/empty1.jsonl": b"", "p/empty2.jsonl": b""}
+        s3 = self._make_s3_client(pages, contents)
+        df = read_jsonl_prefix_from_s3(s3, "bucket", "p/", expected_columns=["Id"])
+        assert len(df) == 0
+        assert list(df.columns) == ["Id"]
+
+    def test_one_empty_file_mixed_with_real_data_does_not_lose_real_rows(self):
+        # A real file alongside an empty one -- the empty file should
+        # contribute nothing, not corrupt the real data's columns.
+        pages = [{"Contents": [{"Key": "p/real.jsonl"}, {"Key": "p/empty.jsonl"}]}]
+        contents = {"p/real.jsonl": b'{"Id": "A1", "Name": "x"}\n', "p/empty.jsonl": b""}
+        s3 = self._make_s3_client(pages, contents)
+        df = read_jsonl_prefix_from_s3(s3, "bucket", "p/", expected_columns=["Id", "Name"])
+        assert len(df) == 1
+        assert df.iloc[0]["Id"] == "A1"
+
     def test_page_with_no_contents_key_handled_gracefully(self):
         # Contents key can be absent entirely (e.g. a truly empty listing)
         pages = [{}]

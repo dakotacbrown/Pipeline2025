@@ -240,3 +240,260 @@ expected output to check it against.
   plain-string comparisons (`==`/`.str.contains`) — if any of these are
   ever meant to be numeric-typed on the Salesforce side, worth double
   checking the comparison still holds.
+
+## New TransactionType support: DebitMemoLine, RefundLinePayment, Refund
+
+Three new TransactionType resolution paths added to `resolve_bu_did()`:
+
+- **DebitMemoLine** — fully live, real dataset_id, single-hop resolution
+  via `ReferenceRecordId` -> InvoiceLine (3 rows in prod).
+- **RefundLinePayment** / **Refund** — structurally complete, same
+  line-level-tried-first / header-level-fallback shape as Payment, via an
+  explicit `Payment` join hop (per Dakota: "keep payment just to make sure
+  there's nothing lost in the joins"). Gated on `refund_line_payment`'s
+  dataset_id, still a PLACEHOLDER as of this note — one intentional test
+  failure (`test_refund_line_payment_dataset_id_still_needs_real_value`)
+  keeps this visible until it's filled in.
+
+New standalone JSONL fixtures for all four new tables
+(`debit_memo_line`, `payment`, `refund`, `refund_line_payment`) added to
+`e2e_demo/table_fixtures/`, deliberately cross-linked to existing fixtures
+so they resolve through real working chains, not just well-formed JSON.
+Three new scenarios (S12–S14) added to `run_table_fixtures_test.py`'s
+transaction journal fixture to exercise all three paths end to end.
+
+## Product2 as the preferred bu/did source
+
+Per Dakota: "it's better to go through product2 than invoice line for the
+bu and did fields, however it's a good fallback as well." Universal
+across every TransactionType — Product2's `Business_Unit_BU__c`/
+`Department_ID_DID__c` are now tried first; InvoiceLine's own bu/did
+(the previous sole source) is the fallback, used only where Product2Id
+doesn't resolve or Product2's fields come back null. `bu` and `did` fall
+back independently of each other, not as an all-or-nothing pair.
+
+CreditMemoLine and DebitMemoLine both carry their own `Product2Id`
+directly, letting Product2 resolution skip `CreditMemoLineInvoiceLine`
+(the junction table with an unconfirmed row count) or the nullable
+`ReferenceRecordId` hop entirely — the specific case Dakota called out
+as the motivation: "especially if any of these junction tables are
+empty."
+
+**A real bug was found and fixed during this work**: the initial
+CreditMemoLine/DebitMemoLine direct-Product2Id merge only *enriched*
+rows that already existed in the resolution lookup from some other path
+— a left-merge can only enrich existing rows, it can't create new ones.
+That silently dropped exactly the case this feature was built for: a
+CreditMemo with NO match in *either* `CreditMemoLineInvoiceLine` *or*
+`CreditMemoInvApplication`. Confirmed directly by testing that exact
+scenario before fixing it. Fixed by adding a second pass that appends a
+standalone row for any Product2Id that never got a row through any other
+path. Regression test:
+`test_credit_memo_line_provides_product2id_when_both_junction_paths_empty`.
+
+`product2`'s dataset_id is confirmed real (`29351664-7f3c-4266-8937-018cc5a7dd44`).
+
+New test coverage: `TestDirectProduct2IdWithoutInvoiceLine`,
+`TestResolveProduct2BuDid`, `TestApplyProduct2Priority` — all previously
+referenced in code comments but never actually written.
+
+The fan-out caveat (an Invoice with multiple InvoiceLines spanning more
+than one bu/did — header-level resolution takes the first match) was
+explicitly confirmed acceptable by Dakota ("just pull everything in...
+it's better to have one row for everything") — documentation updated
+accordingly rather than left as an open risk.
+
+## Journal line field mapping fix
+
+`journal_line_ref` now sources from `TransactionJournal.Name` (was
+`UsageType`, marked tentative). `journal_line_desc` sourced from
+`TransactionJournal.TransactionType` — already coded this way, now
+confirmed correct rather than tentative. Both confirmed directly by
+Dakota. New tests:
+`test_journal_line_reference_sources_from_transaction_journal_name`,
+`test_journal_line_description_sources_from_transaction_type`.
+
+## Reference docs
+
+- `docs/gl_journal_source_join_validation.sql` — SQL mirror of
+  `gl_source_join.py`, updated for all of the above (new CTE 1b for
+  Product2, three new TransactionType CTEs, updated fan-out caveat
+  language, updated readiness-check queries).
+- `docs/ddl_reference/salesforce_general_ledger_schema.md` — full
+  transcription of all 15 tables from Dakota's DDL spreadsheet (previously
+  only had one table transcribed).
+- `e2e_demo/xlsx_work/gl_jrnl_file_layout_005_updated.xlsx` — mapping
+  sheet updated for the journal line field mapping fix and Product2
+  priority.
+
+---
+
+# Major rewrite: Product2 as the SOLE bu/did source (supersedes the section above)
+
+The section above described Product2 as *preferred*, with InvoiceLine as
+a fallback. That two-tier design was replaced entirely, per Dakota:
+"Product2 should not have a null or blank did/bu... it's okay to remove
+the invoice line resolution." InvoiceLine's own
+`Business_Unit_BU__c`/`Department_ID_DID__c`/`Name` fields are no longer
+read for bu/did purposes at all — `apply_product2_priority()`'s
+`combine_first` fallback is gone.
+
+## Full TransactionType coverage — all 15, not 7
+
+The `TransactionType` picklist has 15 confirmed values (per Dakota's
+screenshots of the field's full `picklistValues`). All 15 now have a
+resolution path, up from the original 7:
+
+`InvoiceLine`, `InvoiceLineTax`, `DebitMemoLine`, `Payment`, `CreditMemo`,
+`RefundLinePayment`, `Refund` (original 7) — plus new: `Invoice`,
+`CreditMemoLine`, `CreditMemoLineTax`, `PaymentLineInvoice`,
+`PaymentLineInvoiceLine`, `CreditMemoInvApplication`,
+`CreditMemoLineInvoiceLine`, `DebitMemoLineTax`.
+
+Two new tables added: `credit_memo_line_tax` (real dataset_id, was
+present in the very first `ingest_revcloud.yml` screenshot, just never
+wired up) and `debit_memo_line_tax` (PLACEHOLDER — no corresponding table
+exists in Salesforce yet, per Dakota; built anyway, "I'll still need to
+have the mapping in case it goes live").
+
+## Function renames (reflecting the simplified role)
+
+- `resolve_bu_did()` → **`resolve_product2_id()`** — now resolves ONLY
+  `Product2Id` per TransactionType; no longer outputs `bu`/`did`/
+  `InvoiceLineName` at all.
+- `resolve_product2_bu_did()` → **`resolve_product2_fields()`** — now
+  also resolves `product2_name` (for the slingshot/databolt check, moved
+  off `InvoiceLine.Name` entirely per Dakota: "we shouldn't need invoice
+  line name anymore for the name check").
+- `apply_product2_priority()` → **`apply_product2_bu_did()`** — no more
+  priority merge, just a direct assignment (`tj["bu"] = tj["product2_bu"]`).
+
+## New: `validate_required_tables_present()`
+
+Per Dakota: "If the transaction [journal], product2, general ledger
+account tables, or any table under a distinct list from transaction type
+are empty it should fail. That would mean a data issue is present."
+
+- `transaction_journal`, `product2`, `general_ledger_account` are
+  unconditionally mandatory — empty means raise, always.
+- Every other table's requirement depends on which `TransactionType`
+  values are actually present in a given run's data — and, critically,
+  **a type only fails if EVERY one of its possible resolution paths is
+  dead**, not if just one of several fallbacks is empty. Confirmed
+  directly with Dakota: `PaymentLineInvoiceLine` has been 0 rows this
+  whole project — that's known, expected state, not a data issue, since
+  `Payment`'s header-level path resolves fine on its own. Getting this
+  OR-path design wrong (requiring every table in every path) would have
+  meant failing on literally every real run.
+
+`REQUIRED_TABLES_BY_TRANSACTION_TYPE` is the single source of truth for
+this — used by both the validation function and as living documentation
+of exactly which tables back each type.
+
+## Real bugs found and fixed during this rewrite
+
+1. **`s3_utils.py` — empty/0-byte JSONL files broke downstream joins.**
+   `pd.read_json("", lines=True)` returns a DataFrame with **zero
+   columns**, not just zero rows — a different, silently-broken shape
+   than "no S3 objects found" (which the code already handled). Any
+   `df["SomeColumn"]` access on such a frame raised `KeyError`. Confirmed
+   directly by testing the exact scenario before fixing. Fixed in
+   `read_jsonl_prefix_from_s3()` — reshapes to `expected_columns` when
+   every file under a prefix is empty, not just when there are no files
+   at all. 4 new regression tests.
+
+2. **`Payment`'s own resolution was incorrectly gated on the `Payment`
+   table.** `TransactionType="Payment"`'s `ReferenceTransactionRecordId`
+   already IS the `PaymentId` directly — it never needed confirming
+   against a separately-loaded `Payment` table. That confirmation hop was
+   only ever meant for `RefundLinePayment`/`Refund` (per Dakota: "keep
+   payment just to make sure there's nothing lost in the joins"). Caught
+   via a real end-to-end run against fixture data (unit tests happened to
+   include a matching `Payment` row and missed it) — S3's scenario
+   pointed at a `PaymentId` that genuinely wasn't in `payment.jsonl`, and
+   the resolution silently fell to the `10901` default instead of the
+   correct `bu`/`did`. Fixed; regression test added.
+
+3. **`CreditMemo`'s "line-level via `CreditMemoLineInvoiceLine`" path was
+   structurally dead code.** It derived from the same `CreditMemoLine`
+   table, keyed by the same `CreditMemoId`, as the "direct" candidate,
+   which is always tried first. Since the dedup keeps the first candidate
+   regardless of whether its value is null, the junction-table path could
+   never actually change the result — not even in the one case (a null
+   `CreditMemoLine.Product2Id` with a real answer reachable via the
+   junction) where it would have mattered. Confirmed by constructing that
+   exact scenario directly. This was a real, working candidate *before*
+   the Product2 rewrite (it existed to reach `InvoiceLine`'s own bu/did,
+   which the pre-rewrite "direct" candidate couldn't do) — the rewrite
+   silently made it redundant. Removed, along with the now-inaccurate
+   `REQUIRED_TABLES_BY_TRANSACTION_TYPE` entry that claimed the path was
+   viable. `CreditMemo` now resolves via 2 paths (direct, header), not 3.
+
+4. **The `IL5` "trap" fixture's `99999` marker went silently inert.**
+   Once `InvoiceLine.Business_Unit_BU__c` stopped being read at all, the
+   trap InvoiceLine's `99999` value could never surface through the
+   pipeline regardless of whether the line-level-vs-header-level priority
+   logic was still correct — the "`99999` must never appear" check would
+   have started passing trivially, not because the logic worked, but
+   because `99999` had no path to the output anymore. Fixed by giving the
+   trap's `Product2` record (`PROD05AAA`) a real `99999`/`99999` value,
+   restoring the trap's actual detection power.
+
+## Dead code / dead tests removed (per Dakota: "using only what we need")
+
+- `DATASET_IDS["invoice"]`/`["credit_memo"]` (+ their `EXPECTED_COLUMNS`
+  entries) — leftovers from the deleted `build_reference_to_account_lookup()`,
+  confirmed unused anywhere (not the GL pipeline, not OFAC) via a direct
+  cross-reference of every `load()` call against every config key.
+- The internal `.empty` guards inside `il_product2()`/`cml_product2()` —
+  proven structurally unreachable: `invoice_line`/`credit_memo_line`
+  always arrive with the correct column shape via the `EXPECTED_COLUMNS`
+  fallback even when empty (0 rows), so selecting columns from them never
+  raises regardless of row count. Confirmed empirically before removing.
+- `test_account_no_longer_loaded_by_build_source_dataframe` — added zero
+  coverage (the behavior was already exercised elsewhere) and tested an
+  internal implementation detail (which dataset_ids got requested) via
+  monkeypatching, not any observable output.
+- `test_no_logging_when_log_is_none` — fully redundant; every other
+  orchestration test already implicitly covers `log=None` by never
+  passing `log` at all.
+- Two separate logging tests consolidated into one, checking the `if
+  log:` branch fires without pinning every message's exact wording
+  (implementation detail, not meaningful behavior).
+
+Result: **222 statements, 99% coverage** (up from 229 statements / 94%
+before this cleanup) — coverage went up while the statement count went
+*down*, since the improvement came from deleting unreachable code, not
+padding tests around it. The one remaining uncovered block is the
+`if __name__ == "__main__":` standalone entry point, which requires real
+boto3/S3 credentials and is intentionally left untested by unit tests.
+
+## Test suite state
+
+**334 passing, 2 intentional failures** (`refund_line_payment` and
+`debit_memo_line_tax` dataset_id placeholders — same "fails on purpose
+until the real value lands" pattern used throughout this project).
+
+## Docs updated to match (this pass)
+
+- `docs/gl_journal_source_join_validation.sql` — full rewrite: Product2
+  as sole source, all 15 TransactionType CTEs, `credit_memo_via_line`
+  removed, new CTE 7 mirroring `validate_required_tables_present()`.
+- `e2e_demo/xlsx_work/build_mapping_sheet.py` /
+  `gl_jrnl_file_layout_005_updated.xlsx` — `TransactionType to BU-DID`
+  sheet fully rebuilt (single Product2Id-path column, all 15 types, no
+  more "7 unhandled" section); `Mapping - Source to File` sheet's bu/did
+  rows updated to drop "PREFERRED/fallback" language.
+- `docs/ddl_reference/salesforce_general_ledger_schema.md` — coverage
+  table updated to all-15-confirmed, stale `resolve_bu_did()` references
+  fixed, CreditMemo's removed path noted.
+- `e2e_demo/TABLE_FIXTURES_README.md` — scope section corrected (Product2/
+  Payment/Refund ARE included, contradicting an earlier claim), new
+  `product2.jsonl` section documenting the trap fix, three more real bugs
+  documented.
+- `e2e_demo/generate_new_table_fixtures.py`,
+  `generate_product2_fixtures.py`, `generate_table_fixtures.py` — stray
+  `resolve_bu_did()` references in comments corrected;
+  `generate_product2_fixtures.py`'s trap product (`PROD05AAA`) given a
+  real `99999`/`99999` record instead of being omitted (see bug #4 above).
+

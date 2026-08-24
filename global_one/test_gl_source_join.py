@@ -14,11 +14,16 @@ Covers:
     them, not just unused by it — salesforce_ofac.py and
     salesforce_ofac_billing_preview.py have their own separate, unrelated
     Account/BillingAccount join and never called either function)
-  - apply_did_overrides(): bu default, slingshot/databolt did overrides, and
-    the 10040049 -> 16605 override (highest priority)
+  - apply_did_overrides(): bu default, slingshot/databolt did overrides
+    (via Product2.Name), and the 10040049 -> 16605 override (highest priority)
   - resolve_date_window(): month-to-date default vs. explicit start/end
-  - resolve_bu_did(): per-TransactionType bu/department_id resolution,
-    including the line-level vs. header-level fallback priority
+  - resolve_product2_id(): per-TransactionType Product2Id resolution, all
+    15 confirmed TransactionType values, including the line-level vs.
+    header-level fallback priority
+  - resolve_product2_fields() / apply_product2_bu_did(): Product2.Id ->
+    bu/did/Name, then a direct assignment (no InvoiceLine fallback)
+  - validate_required_tables_present(): mandatory tables + per-type
+    OR-path liveness checks
   - DATASET_IDS / EXPECTED_COLUMNS sanity checks
   - build_source_dataframe(): full orchestration, mocked S3 reads
 """
@@ -32,14 +37,19 @@ import pytest
 
 import src.salesforce.resources.scripts.helpers.gl_source_join as glsj
 from src.salesforce.resources.scripts.helpers.gl_source_join import (
-    resolve_bu_did,
+    resolve_product2_id,
     resolve_amount,
     resolve_gl_accounting_number,
+    resolve_product2_fields,
+    apply_product2_bu_did,
     apply_did_overrides,
     resolve_date_window,
+    validate_required_tables_present,
     build_source_dataframe,
     DATASET_IDS,
     EXPECTED_COLUMNS,
+    REQUIRED_TABLES_BY_TRANSACTION_TYPE,
+    MANDATORY_TABLES,
 )
 
 
@@ -192,7 +202,7 @@ class TestResolveGlAccountingNumber:
 class TestApplyDidOverrides:
     def _base_df(self, **overrides):
         row = {
-            "bu": "US001", "did": "10500", "InvoiceLineName": "Widget Plan",
+            "bu": "US001", "did": "10500", "product2_name": "Widget Plan",
             "gl_accounting_number_c": "10099999",
         }
         row.update(overrides)
@@ -236,7 +246,7 @@ class TestApplyDidOverrides:
         # re-infers an all-null object column as float64), rather than a
         # targeted .loc assignment on only the blank cells.
         df = pd.DataFrame([{
-            "bu": None, "did": None, "InvoiceLineName": "Slingshot Plan",
+            "bu": None, "did": None, "product2_name": "Slingshot Plan",
             "gl_accounting_number_c": None,
         }])
         result = apply_did_overrides(df)  # must not raise
@@ -244,32 +254,32 @@ class TestApplyDidOverrides:
         assert result.iloc[0]["did"] == "16637"
 
     def test_slingshot_in_name_overrides_did(self):
-        df = self._base_df(InvoiceLineName="Slingshot Enterprise Plan")
+        df = self._base_df(product2_name="Slingshot Enterprise Plan")
         result = apply_did_overrides(df)
         assert result.iloc[0]["did"] == "16637"
 
     def test_slingshot_match_is_case_insensitive(self):
-        df = self._base_df(InvoiceLineName="SLINGSHOT basic")
+        df = self._base_df(product2_name="SLINGSHOT basic")
         result = apply_did_overrides(df)
         assert result.iloc[0]["did"] == "16637"
 
     def test_databolt_in_name_overrides_did(self):
-        df = self._base_df(InvoiceLineName="DataBolt Pro")
+        df = self._base_df(product2_name="DataBolt Pro")
         result = apply_did_overrides(df)
         assert result.iloc[0]["did"] == "16635"
 
     def test_databolt_match_is_case_insensitive(self):
-        df = self._base_df(InvoiceLineName="databolt starter")
+        df = self._base_df(product2_name="databolt starter")
         result = apply_did_overrides(df)
         assert result.iloc[0]["did"] == "16635"
 
     def test_name_without_either_keyword_leaves_did_unchanged(self):
-        df = self._base_df(InvoiceLineName="Something Else Entirely")
+        df = self._base_df(product2_name="Something Else Entirely")
         result = apply_did_overrides(df)
         assert result.iloc[0]["did"] == "10500"
 
     def test_null_name_does_not_raise_and_leaves_did_unchanged(self):
-        df = self._base_df(InvoiceLineName=None)
+        df = self._base_df(product2_name=None)
         result = apply_did_overrides(df)
         assert result.iloc[0]["did"] == "10500"
 
@@ -280,12 +290,12 @@ class TestApplyDidOverrides:
 
     def test_gl_account_10040049_beats_slingshot_override(self):
         # highest priority per Dakota: "should supersede whatever the DID is"
-        df = self._base_df(gl_accounting_number_c="10040049", InvoiceLineName="Slingshot Plan")
+        df = self._base_df(gl_accounting_number_c="10040049", product2_name="Slingshot Plan")
         result = apply_did_overrides(df)
         assert result.iloc[0]["did"] == "16605"
 
     def test_gl_account_10040049_beats_databolt_override(self):
-        df = self._base_df(gl_accounting_number_c="10040049", InvoiceLineName="DataBolt Plan")
+        df = self._base_df(gl_accounting_number_c="10040049", product2_name="DataBolt Plan")
         result = apply_did_overrides(df)
         assert result.iloc[0]["did"] == "16605"
 
@@ -323,9 +333,9 @@ class TestApplyDidOverrides:
 
     def test_multiple_rows_overridden_independently(self):
         df = pd.DataFrame([
-            {"bu": None, "did": "1", "InvoiceLineName": "Slingshot", "gl_accounting_number_c": "111"},
-            {"bu": "US001", "did": "2", "InvoiceLineName": "DataBolt", "gl_accounting_number_c": "222"},
-            {"bu": "US002", "did": "3", "InvoiceLineName": "Plain Plan", "gl_accounting_number_c": "10040049"},
+            {"bu": None, "did": "1", "product2_name": "Slingshot", "gl_accounting_number_c": "111"},
+            {"bu": "US001", "did": "2", "product2_name": "DataBolt", "gl_accounting_number_c": "222"},
+            {"bu": "US002", "did": "3", "product2_name": "Plain Plan", "gl_accounting_number_c": "10040049"},
         ])
         result = apply_did_overrides(df)
         assert result.iloc[0]["bu"] == "10901"
@@ -378,180 +388,497 @@ class TestResolveDateWindow:
 
 
 # ---------------------------------------------------------------------------
-# resolve_bu_did()
+# resolve_product2_id()
 # ---------------------------------------------------------------------------
 
-class TestResolveBuDid:
-    """
-    All fixtures include InvoiceId on invoice_line (needed for the
-    header-level fallback paths) and empty frames for payment_line_invoice /
-    credit_memo_inv_application unless a test specifically exercises them.
-    """
-
+class TestResolveProduct2Id:
     def _empties(self):
         return dict(
             ilt=pd.DataFrame([], columns=["Id", "InvoiceLineId"]),
-            pli_line=pd.DataFrame([], columns=["PaymentId", "InvoiceLineId"]),
-            pli_header=pd.DataFrame([], columns=["PaymentId", "InvoiceId"]),
-            cml=pd.DataFrame([], columns=["Id", "CreditMemoId"]),
-            cmli=pd.DataFrame([], columns=["CreditMemoLineId", "InvoiceLineId"]),
-            cmia=pd.DataFrame([], columns=["CreditMemoId", "InvoiceId"]),
+            pli_line=pd.DataFrame([], columns=["Id", "PaymentId", "InvoiceLineId"]),
+            pli_header=pd.DataFrame([], columns=["Id", "PaymentId", "InvoiceId"]),
+            cml=pd.DataFrame([], columns=["Id", "CreditMemoId", "Product2Id"]),
+            cmli=pd.DataFrame([], columns=["Id", "CreditMemoLineId", "InvoiceLineId"]),
+            cmia=pd.DataFrame([], columns=["Id", "CreditMemoId", "InvoiceId"]),
+            dml=pd.DataFrame([], columns=["Id", "ReferenceRecordId", "Product2Id"]),
+            payment=pd.DataFrame([], columns=["Id"]),
+            refund=pd.DataFrame([], columns=["Id"]),
+            rlp=pd.DataFrame([], columns=["Id", "RefundId", "PaymentId"]),
+            cmlt=pd.DataFrame([], columns=["Id", "CreditMemoLineId"]),
+            dmlt=pd.DataFrame([], columns=["Id", "DebitMemoLineId"]),
         )
 
-    def test_resolves_via_invoice_line_directly(self):
+    def _call(self, tj, invoice_line, e, **overrides):
+        args = dict(
+            invoice_line_tax=e["ilt"], payment_line_invoice_line=e["pli_line"],
+            payment_line_invoice=e["pli_header"], credit_memo_line=e["cml"],
+            credit_memo_line_invoice_line=e["cmli"], credit_memo_inv_application=e["cmia"],
+            debit_memo_line=e["dml"], payment=e["payment"], refund=e["refund"],
+            refund_line_payment=e["rlp"], credit_memo_line_tax=e["cmlt"],
+            debit_memo_line_tax=e["dmlt"],
+        )
+        args.update(overrides)
+        return resolve_product2_id(tj, invoice_line, **args)
+
+    def test_invoice_line_direct(self):
         tj = pd.DataFrame([{"ReferenceTransactionRecordId": "IL1", "TransactionType": "InvoiceLine"}])
-        invoice_line = pd.DataFrame([{
-            "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1",
-            "Business_Unit_BU__c": "US001", "Department_ID_DID__c": "10500",
-        }])
-        e = self._empties()
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}])
+        result = self._call(tj, invoice_line, self._empties())
+        assert result.iloc[0]["Product2Id"] == "PROD1"
 
-        result = resolve_bu_did(tj, invoice_line, e["ilt"], e["pli_line"], e["pli_header"],
-                                 e["cml"], e["cmli"], e["cmia"])
-        assert result.iloc[0]["bu"] == "US001"
-        assert result.iloc[0]["did"] == "10500"
-
-    def test_resolves_via_invoice_line_tax_indirectly(self):
+    def test_invoice_line_tax_one_hop(self):
         tj = pd.DataFrame([{"ReferenceTransactionRecordId": "ILT1", "TransactionType": "InvoiceLineTax"}])
-        invoice_line = pd.DataFrame([{
-            "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD2",
-            "Business_Unit_BU__c": "EU002", "Department_ID_DID__c": "20999",
-        }])
-        invoice_line_tax = pd.DataFrame([{"Id": "ILT1", "InvoiceLineId": "IL1"}])
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}])
         e = self._empties()
+        e["ilt"] = pd.DataFrame([{"Id": "ILT1", "InvoiceLineId": "IL1"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD1"
 
-        result = resolve_bu_did(tj, invoice_line, invoice_line_tax, e["pli_line"], e["pli_header"],
-                                 e["cml"], e["cmli"], e["cmia"])
-        assert result.iloc[0]["bu"] == "EU002"
-        assert result.iloc[0]["did"] == "20999"
+    def test_debit_memo_line_direct(self):
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "DML1", "TransactionType": "DebitMemoLine"}])
+        invoice_line = pd.DataFrame([], columns=["Id", "InvoiceId", "Product2Id"])
+        e = self._empties()
+        e["dml"] = pd.DataFrame([{"Id": "DML1", "ReferenceRecordId": "IL1", "Product2Id": "PROD1"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD1"
 
-    def test_resolves_payment_via_line_level_when_present(self):
+    def test_payment_header_level(self):
         tj = pd.DataFrame([{"ReferenceTransactionRecordId": "PAY1", "TransactionType": "Payment"}])
-        invoice_line = pd.DataFrame([{
-            "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD3",
-            "Business_Unit_BU__c": "US002", "Department_ID_DID__c": "30500",
-        }])
-        payment_line_invoice_line = pd.DataFrame([{"PaymentId": "PAY1", "InvoiceLineId": "IL1"}])
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}])
         e = self._empties()
+        e["payment"] = pd.DataFrame([{"Id": "PAY1"}])
+        e["pli_header"] = pd.DataFrame([{"Id": "PLI1", "PaymentId": "PAY1", "InvoiceId": "INV1"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD1"
 
-        result = resolve_bu_did(tj, invoice_line, e["ilt"], payment_line_invoice_line, e["pli_header"],
-                                 e["cml"], e["cmli"], e["cmia"])
-        assert result.iloc[0]["bu"] == "US002"
-        assert result.iloc[0]["did"] == "30500"
-
-    def test_resolves_payment_via_header_level_fallback(self):
-        # This is the path that actually works today — PaymentLineInvoiceLine
-        # is confirmed 0 rows in real data, PaymentLineInvoice has 837.
+    def test_payment_resolves_without_a_matching_row_in_payment_table(self):
+        # REGRESSION: caught via a real end-to-end run against fixture
+        # data, not a unit test — an earlier version of this code gated
+        # Payment's OWN resolution on the PaymentId also existing in the
+        # separately-loaded `payment` table (a leftover of copying the
+        # RefundLinePayment/Refund "confirm via Payment" pattern where it
+        # didn't belong). For TransactionType="Payment" specifically,
+        # ReferenceTransactionRecordId already IS the PaymentId directly —
+        # payment_line_invoice_line/payment_line_invoice are the actual
+        # source of truth for which PaymentIds exist, same as before this
+        # whole Product2 rewrite. `payment` here is deliberately EMPTY.
         tj = pd.DataFrame([{"ReferenceTransactionRecordId": "PAY1", "TransactionType": "Payment"}])
-        invoice_line = pd.DataFrame([{
-            "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD3",
-            "Business_Unit_BU__c": "US002", "Department_ID_DID__c": "30500",
-        }])
-        payment_line_invoice = pd.DataFrame([{"PaymentId": "PAY1", "InvoiceId": "INV1"}])
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}])
         e = self._empties()
+        e["pli_header"] = pd.DataFrame([{"Id": "PLI1", "PaymentId": "PAY1", "InvoiceId": "INV1"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD1"
 
-        result = resolve_bu_did(tj, invoice_line, e["ilt"], e["pli_line"], payment_line_invoice,
-                                 e["cml"], e["cmli"], e["cmia"])
-        assert result.iloc[0]["bu"] == "US002"
-        assert result.iloc[0]["did"] == "30500"
-
-    def test_resolves_credit_memo_via_line_level_when_present(self):
-        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "CM1", "TransactionType": "CreditMemo"}])
-        invoice_line = pd.DataFrame([{
-            "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD4",
-            "Business_Unit_BU__c": "US003", "Department_ID_DID__c": "40500",
-        }])
-        credit_memo_line = pd.DataFrame([{"Id": "CML1", "CreditMemoId": "CM1"}])
-        credit_memo_line_invoice_line = pd.DataFrame([{"CreditMemoLineId": "CML1", "InvoiceLineId": "IL1"}])
-        e = self._empties()
-
-        result = resolve_bu_did(tj, invoice_line, e["ilt"], e["pli_line"], e["pli_header"],
-                                 credit_memo_line, credit_memo_line_invoice_line, e["cmia"])
-        assert result.iloc[0]["bu"] == "US003"
-        assert result.iloc[0]["did"] == "40500"
-
-    def test_resolves_credit_memo_via_header_level_fallback(self):
-        # This is the path that actually works today — CreditMemoLineInvoiceLine
-        # is confirmed 0 rows in real data, CreditMemoInvApplication has 42.
-        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "CM1", "TransactionType": "CreditMemo"}])
-        invoice_line = pd.DataFrame([{
-            "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD4",
-            "Business_Unit_BU__c": "US003", "Department_ID_DID__c": "40500",
-        }])
-        credit_memo_inv_application = pd.DataFrame([{"CreditMemoId": "CM1", "InvoiceId": "INV1"}])
-        e = self._empties()
-
-        result = resolve_bu_did(tj, invoice_line, e["ilt"], e["pli_line"], e["pli_header"],
-                                 e["cml"], e["cmli"], credit_memo_inv_application)
-        assert result.iloc[0]["bu"] == "US003"
-        assert result.iloc[0]["did"] == "40500"
-
-    def test_line_level_wins_over_header_level_when_both_present(self):
-        # If line-level data ever gets populated, it should take priority
-        # over the header-level fallback for the same header id.
+    def test_payment_line_level_wins_over_header(self):
         tj = pd.DataFrame([{"ReferenceTransactionRecordId": "PAY1", "TransactionType": "Payment"}])
         invoice_line = pd.DataFrame([
-            {"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1",
-             "Business_Unit_BU__c": "LINE_LEVEL_BU", "Department_ID_DID__c": "10500"},
-            {"Id": "IL2", "InvoiceId": "INV1", "Product2Id": "PROD2",
-             "Business_Unit_BU__c": "HEADER_LEVEL_BU", "Department_ID_DID__c": "20500"},
+            {"Id": "IL_LINE", "InvoiceId": "INV_LINE", "Product2Id": "PROD_LINE"},
+            {"Id": "IL_HEADER", "InvoiceId": "INV_HEADER", "Product2Id": "PROD_HEADER"},
         ])
-        payment_line_invoice_line = pd.DataFrame([{"PaymentId": "PAY1", "InvoiceLineId": "IL1"}])
-        payment_line_invoice = pd.DataFrame([{"PaymentId": "PAY1", "InvoiceId": "INV1"}])
         e = self._empties()
+        e["payment"] = pd.DataFrame([{"Id": "PAY1"}])
+        e["pli_line"] = pd.DataFrame([{"Id": "PLIL1", "PaymentId": "PAY1", "InvoiceLineId": "IL_LINE"}])
+        e["pli_header"] = pd.DataFrame([{"Id": "PLI1", "PaymentId": "PAY1", "InvoiceId": "INV_HEADER"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD_LINE"
 
-        result = resolve_bu_did(tj, invoice_line, e["ilt"], payment_line_invoice_line, payment_line_invoice,
-                                 e["cml"], e["cmli"], e["cmia"])
-        assert result.iloc[0]["bu"] == "LINE_LEVEL_BU"
+    def test_credit_memo_direct_via_credit_memo_line(self):
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "CM1", "TransactionType": "CreditMemo"}])
+        invoice_line = pd.DataFrame([], columns=["Id", "InvoiceId", "Product2Id"])
+        e = self._empties()
+        e["cml"] = pd.DataFrame([{"Id": "CML1", "CreditMemoId": "CM1", "Product2Id": "PROD_DIRECT"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD_DIRECT"
 
-    def test_payment_fan_out_takes_first_match(self):
-        # a payment header applied to an invoice with lines from different
-        # BUs — documents that this takes the first match rather than erroring
-        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "PAY1", "TransactionType": "Payment"}])
-        invoice_line = pd.DataFrame([
-            {"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1",
-             "Business_Unit_BU__c": "US001", "Department_ID_DID__c": "10500"},
-            {"Id": "IL2", "InvoiceId": "INV1", "Product2Id": "PROD2",
-             "Business_Unit_BU__c": "US002", "Department_ID_DID__c": "20500"},
+    def test_credit_memo_direct_wins_even_when_null_no_line_level_fallback(self):
+        # REGRESSION / documents a deliberate design decision: there is NO
+        # "line-level via CreditMemoLineInvoiceLine" fallback for
+        # TransactionType="CreditMemo" (removed -- see resolve_product2_id()'s
+        # comment for why it was confirmed structurally dead: it derived
+        # from the same CreditMemoLine table, keyed by the same
+        # CreditMemoId, as the direct candidate, which is always listed
+        # first -- so it could never win, even when it would have
+        # returned a better answer). This means if CreditMemoLine.Product2Id
+        # is null, the result stays null even though a junction-table path
+        # COULD in principle have found a real answer via InvoiceLine.
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "CM1", "TransactionType": "CreditMemo"}])
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD_VIA_JUNCTION"}])
+        e = self._empties()
+        e["cml"] = pd.DataFrame([{"Id": "CML1", "CreditMemoId": "CM1", "Product2Id": None}])
+        e["cmli"] = pd.DataFrame([{"Id": "CMLI1", "CreditMemoLineId": "CML1", "InvoiceLineId": "IL1"}])
+        result = self._call(tj, invoice_line, e)
+        assert pd.isna(result.iloc[0]["Product2Id"])
+
+    def test_credit_memo_header_level_fallback_when_credit_memo_line_absent_entirely(self):
+        # (b) — activates when CreditMemoLine has no matching row for this
+        # CreditMemoId at all (so the direct candidate produces NOTHING,
+        # not even a null-valued row) -- this is the scenario where the
+        # header-level fallback actually gets a chance to win.
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "CM1", "TransactionType": "CreditMemo"}])
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD_HEADER"}])
+        e = self._empties()
+        # credit_memo_line has NO row with CreditMemoId="CM1" -- direct
+        # candidate produces nothing for CM1 at all.
+        e["cmia"] = pd.DataFrame([{"CreditMemoId": "CM1", "InvoiceId": "INV1"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD_HEADER"
+
+    def test_credit_memo_line_provides_product2id_when_junction_paths_empty(self):
+        # REGRESSION carried forward from the earlier InvoiceLine-based
+        # design: a CreditMemo with NO match in either junction table
+        # still resolves via CreditMemoLine's own direct Product2Id.
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "CM1", "TransactionType": "CreditMemo"}])
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD_WRONG"}])
+        e = self._empties()
+        e["cml"] = pd.DataFrame([{"Id": "CML1", "CreditMemoId": "CM1", "Product2Id": "PROD_DIRECT"}])
+        # cmli and cmia both stay empty -- no junction match at all
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD_DIRECT"
+
+    def test_refund_line_payment_direct_entry(self):
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "RLP1", "TransactionType": "RefundLinePayment"}])
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}])
+        e = self._empties()
+        e["payment"] = pd.DataFrame([{"Id": "PAY1"}])
+        e["pli_header"] = pd.DataFrame([{"Id": "PLI1", "PaymentId": "PAY1", "InvoiceId": "INV1"}])
+        e["rlp"] = pd.DataFrame([{"Id": "RLP1", "RefundId": "REF1", "PaymentId": "PAY1"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD1"
+
+    def test_refund_via_refund_line_payment_hop(self):
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "REF1", "TransactionType": "Refund"}])
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}])
+        e = self._empties()
+        e["refund"] = pd.DataFrame([{"Id": "REF1"}])
+        e["payment"] = pd.DataFrame([{"Id": "PAY1"}])
+        e["pli_header"] = pd.DataFrame([{"Id": "PLI1", "PaymentId": "PAY1", "InvoiceId": "INV1"}])
+        e["rlp"] = pd.DataFrame([{"Id": "RLP1", "RefundId": "REF1", "PaymentId": "PAY1"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD1"
+
+    def test_refund_line_payment_via_line_level_when_present(self):
+        # Line-level path (payment_line_invoice_line) for
+        # RefundLinePayment/Refund's shared payment_chain() helper --
+        # otherwise only exercised via the header-level path in the two
+        # tests above.
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "RLP1", "TransactionType": "RefundLinePayment"}])
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD_LINE"}])
+        e = self._empties()
+        e["payment"] = pd.DataFrame([{"Id": "PAY1"}])
+        e["pli_line"] = pd.DataFrame([{"Id": "PLL1", "PaymentId": "PAY1", "InvoiceLineId": "IL1"}])
+        e["rlp"] = pd.DataFrame([{"Id": "RLP1", "RefundId": "REF1", "PaymentId": "PAY1"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD_LINE"
+
+    def test_refund_line_payment_returns_nothing_when_payment_table_empty(self):
+        # payment_chain()'s early-return guard -- RefundLinePayment/Refund
+        # can't resolve anything at all if the Payment table itself comes
+        # back empty (distinct from Payment's OWN resolution, which
+        # deliberately does NOT depend on this table at all -- see the
+        # regression test above near the Payment candidates).
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "RLP1", "TransactionType": "RefundLinePayment"}])
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}])
+        e = self._empties()
+        e["pli_header"] = pd.DataFrame([{"Id": "PLI1", "PaymentId": "PAY1", "InvoiceId": "INV1"}])
+        e["rlp"] = pd.DataFrame([{"Id": "RLP1", "RefundId": "REF1", "PaymentId": "PAY1"}])
+        # e["payment"] deliberately stays empty
+        result = self._call(tj, invoice_line, e)
+        assert pd.isna(result.iloc[0]["Product2Id"])
+
+    def test_invoice_direct_no_separate_invoice_table_needed(self):
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "INV1", "TransactionType": "Invoice"}])
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}])
+        result = self._call(tj, invoice_line, self._empties())
+        assert result.iloc[0]["Product2Id"] == "PROD1"
+
+    def test_credit_memo_line_standalone_type_direct_entry(self):
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "CML1", "TransactionType": "CreditMemoLine"}])
+        invoice_line = pd.DataFrame([], columns=["Id", "InvoiceId", "Product2Id"])
+        e = self._empties()
+        e["cml"] = pd.DataFrame([{"Id": "CML1", "CreditMemoId": "CM1", "Product2Id": "PROD1"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD1"
+
+    def test_credit_memo_line_tax(self):
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "CMLT1", "TransactionType": "CreditMemoLineTax"}])
+        invoice_line = pd.DataFrame([], columns=["Id", "InvoiceId", "Product2Id"])
+        e = self._empties()
+        e["cml"] = pd.DataFrame([{"Id": "CML1", "CreditMemoId": "CM1", "Product2Id": "PROD1"}])
+        e["cmlt"] = pd.DataFrame([{"Id": "CMLT1", "CreditMemoLineId": "CML1"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD1"
+
+    def test_payment_line_invoice_standalone_type(self):
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "PLI1", "TransactionType": "PaymentLineInvoice"}])
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}])
+        e = self._empties()
+        e["pli_header"] = pd.DataFrame([{"Id": "PLI1", "PaymentId": "PAY1", "InvoiceId": "INV1"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD1"
+
+    def test_payment_line_invoice_line_standalone_type(self):
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "PLIL1", "TransactionType": "PaymentLineInvoiceLine"}])
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}])
+        e = self._empties()
+        e["pli_line"] = pd.DataFrame([{"Id": "PLIL1", "PaymentId": "PAY1", "InvoiceLineId": "IL1"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD1"
+
+    def test_credit_memo_inv_application_standalone_type(self):
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "CMIA1", "TransactionType": "CreditMemoInvApplication"}])
+        invoice_line = pd.DataFrame([], columns=["Id", "InvoiceId", "Product2Id"])
+        e = self._empties()
+        e["cml"] = pd.DataFrame([{"Id": "CML1", "CreditMemoId": "CM1", "Product2Id": "PROD1"}])
+        e["cmia"] = pd.DataFrame([{"Id": "CMIA1", "CreditMemoId": "CM1", "InvoiceId": "INV1"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD1"
+
+    def test_credit_memo_line_invoice_line_standalone_type(self):
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "CMLI1", "TransactionType": "CreditMemoLineInvoiceLine"}])
+        invoice_line = pd.DataFrame([], columns=["Id", "InvoiceId", "Product2Id"])
+        e = self._empties()
+        e["cml"] = pd.DataFrame([{"Id": "CML1", "CreditMemoId": "CM1", "Product2Id": "PROD1"}])
+        e["cmli"] = pd.DataFrame([{"Id": "CMLI1", "CreditMemoLineId": "CML1", "InvoiceLineId": "IL1"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD1"
+
+    def test_debit_memo_line_tax_no_real_table_yet(self):
+        # Structurally complete per Dakota ("I'll still need to have the
+        # mapping in case it goes live"), even though no real table
+        # exists yet -- proves the chain is correct when data IS present.
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "DMLT1", "TransactionType": "DebitMemoLineTax"}])
+        invoice_line = pd.DataFrame([], columns=["Id", "InvoiceId", "Product2Id"])
+        e = self._empties()
+        e["dml"] = pd.DataFrame([{"Id": "DML1", "ReferenceRecordId": "IL1", "Product2Id": "PROD1"}])
+        e["dmlt"] = pd.DataFrame([{"Id": "DMLT1", "DebitMemoLineId": "DML1"}])
+        result = self._call(tj, invoice_line, e)
+        assert result.iloc[0]["Product2Id"] == "PROD1"
+
+    def test_unmatched_row_yields_null_product2id(self):
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "UNKNOWN", "TransactionType": "InvoiceLine"}])
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}])
+        result = self._call(tj, invoice_line, self._empties())
+        assert pd.isna(result.iloc[0]["Product2Id"])
+
+    def test_all_tables_empty_does_not_raise(self):
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "X1", "TransactionType": "InvoiceLine"}])
+        invoice_line = pd.DataFrame([], columns=["Id", "InvoiceId", "Product2Id"])
+        result = self._call(tj, invoice_line, self._empties())  # must not raise
+        assert pd.isna(result.iloc[0]["Product2Id"])
+
+    def test_output_has_no_bu_did_or_invoice_line_name_columns(self):
+        # An earlier version of this function (resolve_bu_did()) output
+        # "bu"/"did"/"InvoiceLineName" directly -- confirms that layer is
+        # fully gone, not just unused.
+        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "IL1", "TransactionType": "InvoiceLine"}])
+        invoice_line = pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}])
+        result = self._call(tj, invoice_line, self._empties())
+        assert "bu" not in result.columns
+        assert "did" not in result.columns
+        assert "InvoiceLineName" not in result.columns
+
+
+# ---------------------------------------------------------------------------
+# validate_required_tables_present()
+# ---------------------------------------------------------------------------
+
+class TestValidateRequiredTablesPresent:
+    def _full_tables(self):
+        """A dict with every table key non-empty (1 row each) -- baseline for tests to null out specific ones."""
+        keys = set(MANDATORY_TABLES)
+        for paths in REQUIRED_TABLES_BY_TRANSACTION_TYPE.values():
+            for path in paths:
+                keys.update(path)
+        return {k: pd.DataFrame([{"Id": "x"}]) for k in keys}
+
+    def test_all_mandatory_and_type_tables_present_does_not_raise(self):
+        tj = pd.DataFrame([{"TransactionType": "InvoiceLine"}])
+        validate_required_tables_present(tj, self._full_tables())  # must not raise
+
+    def test_empty_transaction_journal_raises(self):
+        tables = self._full_tables()
+        tables["transaction_journal"] = pd.DataFrame([], columns=["TransactionType"])
+        with pytest.raises(ValueError, match="transaction_journal"):
+            validate_required_tables_present(pd.DataFrame([], columns=["TransactionType"]), tables)
+
+    def test_empty_product2_raises(self):
+        tables = self._full_tables()
+        tables["product2"] = pd.DataFrame([], columns=["Id"])
+        tj = pd.DataFrame([{"TransactionType": "InvoiceLine"}])
+        with pytest.raises(ValueError, match="product2"):
+            validate_required_tables_present(tj, tables)
+
+    def test_empty_general_ledger_account_raises(self):
+        tables = self._full_tables()
+        tables["general_ledger_account"] = pd.DataFrame([], columns=["Id"])
+        tj = pd.DataFrame([{"TransactionType": "InvoiceLine"}])
+        with pytest.raises(ValueError, match="general_ledger_account"):
+            validate_required_tables_present(tj, tables)
+
+    def test_one_dead_or_path_does_not_raise_when_other_path_alive(self):
+        # Confirmed with Dakota directly: PaymentLineInvoiceLine has been
+        # 0 rows this whole project -- known, expected state, NOT a data
+        # issue, since Payment's header-level path resolves fine on its
+        # own. This is the exact scenario the OR-path design exists for.
+        tables = self._full_tables()
+        tables["payment_line_invoice_line"] = pd.DataFrame([], columns=["Id"])
+        tj = pd.DataFrame([{"TransactionType": "Payment"}])
+        validate_required_tables_present(tj, tables)  # must not raise
+
+    def test_all_paths_dead_for_a_present_type_raises(self):
+        tables = self._full_tables()
+        tables["payment_line_invoice_line"] = pd.DataFrame([], columns=["Id"])
+        tables["payment_line_invoice"] = pd.DataFrame([], columns=["Id"])
+        tj = pd.DataFrame([{"TransactionType": "Payment"}])
+        with pytest.raises(ValueError, match="Payment"):
+            validate_required_tables_present(tj, tables)
+
+    def test_dead_table_for_a_type_not_present_in_data_does_not_raise(self):
+        # A TransactionType's tables being empty only matters if that type
+        # actually appears in transaction_journal's data.
+        tables = self._full_tables()
+        tables["debit_memo_line"] = pd.DataFrame([], columns=["Id"])
+        tj = pd.DataFrame([{"TransactionType": "InvoiceLine"}])  # DebitMemoLine not present
+        validate_required_tables_present(tj, tables)  # must not raise
+
+    def test_debit_memo_line_tax_placeholder_state_does_not_raise_when_type_absent(self):
+        # DebitMemoLineTax's table doesn't exist in Salesforce yet, per
+        # Dakota -- always empty in practice. Fine, as long as no real
+        # TransactionJournal row actually has this TransactionType (which
+        # can't happen today, since there's no table to produce one).
+        tables = self._full_tables()
+        tables["debit_memo_line_tax"] = pd.DataFrame([], columns=["Id"])
+        tj = pd.DataFrame([{"TransactionType": "InvoiceLine"}])
+        validate_required_tables_present(tj, tables)  # must not raise
+
+    def test_multiple_types_present_checks_each_independently(self):
+        tables = self._full_tables()
+        tables["debit_memo_line"] = pd.DataFrame([], columns=["Id"])  # kills DebitMemoLine's only path
+        tj = pd.DataFrame([
+            {"TransactionType": "InvoiceLine"},  # fine
+            {"TransactionType": "DebitMemoLine"},  # dead
         ])
-        payment_line_invoice = pd.DataFrame([{"PaymentId": "PAY1", "InvoiceId": "INV1"}])
-        e = self._empties()
+        with pytest.raises(ValueError, match="DebitMemoLine"):
+            validate_required_tables_present(tj, tables)
 
-        result = resolve_bu_did(tj, invoice_line, e["ilt"], e["pli_line"], payment_line_invoice,
-                                 e["cml"], e["cmli"], e["cmia"])
-        assert len(result) == 1  # one TJ row in, one row out — no accidental fan-out of tj itself
-        assert result.iloc[0]["bu"] == "US001"  # first match wins
+    def test_unhandled_transaction_type_not_in_map_is_ignored(self):
+        # Not this function's job -- a genuinely new, never-seen
+        # TransactionType is a different problem from "known type, tables
+        # empty."
+        tables = self._full_tables()
+        tj = pd.DataFrame([{"TransactionType": "SomeFutureNewType"}])
+        validate_required_tables_present(tj, tables)  # must not raise
 
-    def test_unresolvable_transaction_type_yields_null_bu_did(self):
-        # a TransactionType with no matching row anywhere in any source table
-        tj = pd.DataFrame([{"ReferenceTransactionRecordId": "UNKNOWN1", "TransactionType": "SomeOtherType"}])
-        empty_il = pd.DataFrame([], columns=["Id", "InvoiceId", "Product2Id",
-                                              "Business_Unit_BU__c", "Department_ID_DID__c"])
-        e = self._empties()
+    def test_null_transaction_type_values_ignored(self):
+        tables = self._full_tables()
+        tj = pd.DataFrame([{"TransactionType": None}])
+        validate_required_tables_present(tj, tables)  # must not raise
 
-        result = resolve_bu_did(tj, empty_il, e["ilt"], e["pli_line"], e["pli_header"],
-                                 e["cml"], e["cmli"], e["cmia"])
+    def test_transaction_journal_missing_transaction_type_column_entirely(self):
+        # Defensive guard: a transaction_journal with real rows but no
+        # TransactionType column at all (a malformed/older-shaped source)
+        # -- distinct from transaction_journal being empty (already
+        # covered by the mandatory-tables check above, which raises
+        # before this line is ever reached in the real call path).
+        tables = self._full_tables()
+        tj = pd.DataFrame([{"SomeOtherColumn": "x"}])
+        validate_required_tables_present(tj, tables)  # must not raise
+
+    def test_missing_table_key_in_loaded_tables_treated_as_empty(self):
+        tables = self._full_tables()
+        del tables["invoice_line"]
+        tj = pd.DataFrame([{"TransactionType": "InvoiceLine"}])
+        with pytest.raises(ValueError, match="InvoiceLine"):
+            validate_required_tables_present(tj, tables)
+
+
+# ---------------------------------------------------------------------------
+# resolve_product2_fields()
+# ---------------------------------------------------------------------------
+
+class TestResolveProduct2Fields:
+    def test_resolves_bu_did_name_from_product2id(self):
+        tj = pd.DataFrame([{"Product2Id": "PROD1"}])
+        product2 = pd.DataFrame([{
+            "Id": "PROD1", "Business_Unit_BU__c": "10902",
+            "Department_ID_DID__c": "20500", "Name": "Slingshot Plan",
+        }])
+        result = resolve_product2_fields(tj, product2)
+        assert result.iloc[0]["product2_bu"] == "10902"
+        assert result.iloc[0]["product2_did"] == "20500"
+        assert result.iloc[0]["product2_name"] == "Slingshot Plan"
+
+    def test_no_matching_product2_yields_null(self):
+        tj = pd.DataFrame([{"Product2Id": "PROD_UNKNOWN"}])
+        product2 = pd.DataFrame([{"Id": "PROD1", "Business_Unit_BU__c": "10902",
+                                   "Department_ID_DID__c": "20500", "Name": "x"}])
+        result = resolve_product2_fields(tj, product2)
+        assert pd.isna(result.iloc[0]["product2_bu"])
+        assert pd.isna(result.iloc[0]["product2_name"])
+
+    def test_null_product2_id_yields_null(self):
+        tj = pd.DataFrame([{"Product2Id": None}])
+        product2 = pd.DataFrame([{"Id": "PROD1", "Business_Unit_BU__c": "10902",
+                                   "Department_ID_DID__c": "20500", "Name": "x"}])
+        result = resolve_product2_fields(tj, product2)
+        assert pd.isna(result.iloc[0]["product2_bu"])
+
+    def test_empty_product2_table_yields_null_columns(self):
+        tj = pd.DataFrame([{"Product2Id": "PROD1"}])
+        product2 = pd.DataFrame([], columns=["Id", "Business_Unit_BU__c", "Department_ID_DID__c", "Name"])
+        result = resolve_product2_fields(tj, product2)
+        assert pd.isna(result.iloc[0]["product2_bu"])
+        assert pd.isna(result.iloc[0]["product2_did"])
+        assert pd.isna(result.iloc[0]["product2_name"])
+
+    def test_missing_product2id_column_on_tj_yields_null(self):
+        tj = pd.DataFrame([{"SomeOtherColumn": "x"}])
+        product2 = pd.DataFrame([{"Id": "PROD1", "Business_Unit_BU__c": "10902",
+                                   "Department_ID_DID__c": "20500", "Name": "x"}])
+        result = resolve_product2_fields(tj, product2)
+        assert pd.isna(result.iloc[0]["product2_bu"])
+
+    def test_duplicate_product2_ids_take_first(self):
+        tj = pd.DataFrame([{"Product2Id": "PROD1"}])
+        product2 = pd.DataFrame([
+            {"Id": "PROD1", "Business_Unit_BU__c": "FIRST", "Department_ID_DID__c": "FIRST_D", "Name": "First"},
+            {"Id": "PROD1", "Business_Unit_BU__c": "SECOND", "Department_ID_DID__c": "SECOND_D", "Name": "Second"},
+        ])
+        result = resolve_product2_fields(tj, product2)
+        assert result.iloc[0]["product2_bu"] == "FIRST"
+
+    def test_does_not_mutate_input_tj(self):
+        tj = pd.DataFrame([{"Product2Id": "PROD1"}])
+        product2 = pd.DataFrame([{"Id": "PROD1", "Business_Unit_BU__c": "10902",
+                                   "Department_ID_DID__c": "20500", "Name": "x"}])
+        resolve_product2_fields(tj, product2)
+        assert "product2_bu" not in tj.columns
+
+
+# ---------------------------------------------------------------------------
+# apply_product2_bu_did()
+# ---------------------------------------------------------------------------
+
+class TestApplyProduct2BuDid:
+    def test_assigns_bu_did_directly_from_product2(self):
+        tj = pd.DataFrame([{"product2_bu": "10902", "product2_did": "20500"}])
+        result = apply_product2_bu_did(tj)
+        assert result.iloc[0]["bu"] == "10902"
+        assert result.iloc[0]["did"] == "20500"
+
+    def test_null_product2_fields_yield_null_bu_did_no_fallback(self):
+        # No more InvoiceLine fallback, per Dakota -- a direct assignment,
+        # not a priority merge. apply_did_overrides()'s "10901" default
+        # is what catches this downstream, not this function.
+        tj = pd.DataFrame([{"product2_bu": None, "product2_did": None}])
+        result = apply_product2_bu_did(tj)
         assert pd.isna(result.iloc[0]["bu"])
         assert pd.isna(result.iloc[0]["did"])
 
-    def test_multiple_tj_rows_resolve_independently(self):
-        tj = pd.DataFrame([
-            {"ReferenceTransactionRecordId": "IL1", "TransactionType": "InvoiceLine"},
-            {"ReferenceTransactionRecordId": "IL2", "TransactionType": "InvoiceLine"},
-        ])
-        invoice_line = pd.DataFrame([
-            {"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1",
-             "Business_Unit_BU__c": "US001", "Department_ID_DID__c": "10500"},
-            {"Id": "IL2", "InvoiceId": "INV2", "Product2Id": "PROD2",
-             "Business_Unit_BU__c": "US002", "Department_ID_DID__c": "20500"},
-        ])
-        e = self._empties()
-
-        result = resolve_bu_did(tj, invoice_line, e["ilt"], e["pli_line"], e["pli_header"],
-                                 e["cml"], e["cmli"], e["cmia"])
-        assert len(result) == 2
-        assert result.iloc[0]["bu"] == "US001"
-        assert result.iloc[1]["bu"] == "US002"
+    def test_does_not_mutate_input(self):
+        tj = pd.DataFrame([{"product2_bu": "A", "product2_did": "B"}])
+        apply_product2_bu_did(tj)
+        assert "bu" not in tj.columns
 
 
 # ---------------------------------------------------------------------------
@@ -592,35 +919,62 @@ class TestDatasetConfig:
             "transaction_journal", "invoice_line", "invoice_line_tax",
             "payment_line_invoice_line", "payment_line_invoice", "credit_memo_line",
             "credit_memo_line_invoice_line", "credit_memo_inv_application",
-            "general_ledger_account",
+            "general_ledger_account", "debit_memo_line", "payment", "refund",
+            "refund_line_payment", "product2", "credit_memo_line_tax",
+            "debit_memo_line_tax",
         ]
         for table in used_tables:
             assert table in EXPECTED_COLUMNS, f"{table} is loaded but has no EXPECTED_COLUMNS entry"
             assert table in DATASET_IDS, f"{table} is loaded but has no DATASET_IDS entry"
 
-    def test_account_no_longer_loaded_by_build_source_dataframe(self, monkeypatch):
-        # "account" must stay defined (OFAC needs it) but the GL pipeline
-        # itself should never call read_table_by_dataset_id with its
-        # dataset_id anymore.
-        requested_dataset_ids = []
+    def test_credit_memo_line_tax_dataset_id_is_confirmed_real_value(self):
+        # Confirmed by Dakota — was present in the very first
+        # ingest_revcloud.yml screenshot, just never wired up until
+        # CreditMemoLineTax needed it as its own TransactionType.
+        assert DATASET_IDS["credit_memo_line_tax"] == "1fbd49b9-7417-484c-acd8-8abf7208b670"
 
-        def fake_read_table(s3_client, bucket, dataset_id, expected_columns=None,
-                             source_prefix="salesforce/reports"):
-            requested_dataset_ids.append(dataset_id)
-            return pd.DataFrame(columns=expected_columns or [])
-
-        monkeypatch.setattr(glsj, "read_table_by_dataset_id", fake_read_table)
-
-        build_source_dataframe(MagicMock(), "bucket", start_date="2000-01-01", end_date="2100-01-01")
-
-        assert DATASET_IDS["account"] not in requested_dataset_ids
-        assert DATASET_IDS["general_ledger_account"] in requested_dataset_ids
+    def test_debit_memo_line_tax_dataset_id_still_needs_real_value(self):
+        # PLACEHOLDER — per Dakota, no corresponding table exists in
+        # Salesforce for DebitMemoLineTax AT ALL yet (distinct from
+        # refund_line_payment above, which has a real table just not yet
+        # registered). This test fails on purpose until the table exists
+        # and a real dataset_id is confirmed — same pattern as
+        # refund_line_payment above. Delete this test once a real value is
+        # in, and add real-data resolution tests to
+        # TestResolveProduct2Id's DebitMemoLineTax coverage.
+        assert DATASET_IDS["debit_memo_line_tax"] != "00000000-0000-0000-0000-000000000002", (
+            "debit_memo_line_tax is still using a placeholder dataset_id "
+            "— no corresponding table exists in Salesforce yet, per Dakota"
+        )
 
     def test_general_ledger_account_dataset_id_is_confirmed_real_value(self):
         # Confirmed by Dakota — replaces the earlier placeholder
         # ("00000000-0000-0000-0000-000000000000") that a previous version
         # of this test intentionally failed on.
         assert DATASET_IDS["general_ledger_account"] == "78e7dd64-9999-42f1-a44a-38bf5157375e"
+
+    def test_debit_memo_line_dataset_id_is_confirmed_real_value(self):
+        assert DATASET_IDS["debit_memo_line"] == "70a38b7c-47b7-4664-8f7b-14c1e49d358e"
+
+    def test_refund_line_payment_dataset_id_still_needs_real_value(self):
+        # PLACEHOLDER — RefundLinePayment's dataset_id registration hasn't
+        # gone through yet, per Dakota. This test fails on purpose until
+        # it's filled in with a real value, so CI keeps this visible rather
+        # than silently shipping a fake dataset_id — same pattern as the
+        # earlier general_ledger_account placeholder. Delete this test once
+        # a real value is in (see test_general_ledger_account_dataset_id_is_confirmed_real_value
+        # above for what that looks like), and un-skip/rewrite the Refund/
+        # RefundLinePayment resolution tests in TestResolveBuDid that
+        # currently only exercise the empty-table (unregistered) state.
+        assert DATASET_IDS["refund_line_payment"] != "00000000-0000-0000-0000-000000000000", (
+            "refund_line_payment is still using a placeholder dataset_id "
+            "— fill in the real value once registration completes"
+        )
+
+    def test_product2_dataset_id_is_confirmed_real_value(self):
+        # Confirmed by Dakota — replaces the earlier placeholder
+        # ("00000000-0000-0000-0000-000000000001").
+        assert DATASET_IDS["product2"] == "29351664-7f3c-4266-8937-018cc5a7dd44"
 
     def test_dataset_ids_keys_are_snake_case(self):
         for key in DATASET_IDS:
@@ -655,6 +1009,10 @@ class TestBuildSourceDataframeOrchestration:
     # make every fixture using a hardcoded date (e.g. "2026-08-01") flaky.
     WIDE_WINDOW = dict(start_date="2000-01-01", end_date="2100-01-01")
 
+    def _product2(self, product2_id="PROD1", bu="US001", did="10500", name="Widget Subscription"):
+        return pd.DataFrame([{"Id": product2_id, "Business_Unit_BU__c": bu,
+                               "Department_ID_DID__c": did, "Name": name}])
+
     def test_end_to_end_with_invoice_line_transaction(self, monkeypatch):
         table_data = {
             "transaction_journal": pd.DataFrame([{
@@ -664,12 +1022,8 @@ class TestBuildSourceDataframeOrchestration:
                 "Credit": None, "Debit": 100.0,
                 "DebitGeneralLedgerAccountId": "GLA1", "CreditGeneralLedgerAccountId": None,
             }]),
-            "invoice_line": pd.DataFrame([{
-                "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1",
-                "Business_Unit_BU__c": "US001", "Department_ID_DID__c": "10500",
-                "Name": "Widget Subscription",
-            }]),
-            "invoice": pd.DataFrame([{"Id": "INV1", "BillingAccountId": "ACC1"}]),
+            "invoice_line": pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}]),
+            "product2": self._product2(bu="US001", did="10500", name="Widget Subscription"),
             "general_ledger_account": pd.DataFrame([{"Id": "GLA1", "GL_Accounting_Number__c": "20012345"}]),
         }
         self._patch_read_table(monkeypatch, table_data)
@@ -693,12 +1047,10 @@ class TestBuildSourceDataframeOrchestration:
                 "Credit": 50.0, "Debit": None,
                 "DebitGeneralLedgerAccountId": None, "CreditGeneralLedgerAccountId": "GLA2",
             }]),
-            "invoice_line": pd.DataFrame([{
-                "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1",
-                "Business_Unit_BU__c": "US002", "Department_ID_DID__c": "20500",
-                "Name": "Support Plan",
-            }]),
-            "payment_line_invoice": pd.DataFrame([{"PaymentId": "PAY1", "InvoiceId": "INV1"}]),
+            "invoice_line": pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}]),
+            "payment": pd.DataFrame([{"Id": "PAY1"}]),
+            "payment_line_invoice": pd.DataFrame([{"Id": "PLI1", "PaymentId": "PAY1", "InvoiceId": "INV1"}]),
+            "product2": self._product2(bu="US002", did="20500", name="Support Plan"),
             "general_ledger_account": pd.DataFrame([{"Id": "GLA2", "GL_Accounting_Number__c": "20099999"}]),
         }
         self._patch_read_table(monkeypatch, table_data)
@@ -710,7 +1062,7 @@ class TestBuildSourceDataframeOrchestration:
         assert row["GeneralLedgerAccount.GL_Accounting_Number__c"] == "20099999"
         assert row["TransactionJournal.CreditDebit"] == -50.0  # credit -> negative
 
-    def test_end_to_end_with_credit_memo_transaction_via_header_fallback(self, monkeypatch):
+    def test_end_to_end_with_credit_memo_transaction_direct_product2(self, monkeypatch):
         table_data = {
             "transaction_journal": pd.DataFrame([{
                 "Name": "Credit Batch", "UsageResourceId": None,
@@ -719,12 +1071,8 @@ class TestBuildSourceDataframeOrchestration:
                 "Credit": 25.0, "Debit": None,
                 "DebitGeneralLedgerAccountId": None, "CreditGeneralLedgerAccountId": "GLA3",
             }]),
-            "invoice_line": pd.DataFrame([{
-                "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1",
-                "Business_Unit_BU__c": "US003", "Department_ID_DID__c": "40500",
-                "Name": "Enterprise Plan",
-            }]),
-            "credit_memo_inv_application": pd.DataFrame([{"CreditMemoId": "CM1", "InvoiceId": "INV1"}]),
+            "credit_memo_line": pd.DataFrame([{"Id": "CML1", "CreditMemoId": "CM1", "Product2Id": "PROD1"}]),
+            "product2": self._product2(bu="US003", did="40500", name="Enterprise Plan"),
             "general_ledger_account": pd.DataFrame([{"Id": "GLA3", "GL_Accounting_Number__c": "20077777"}]),
         }
         self._patch_read_table(monkeypatch, table_data)
@@ -738,7 +1086,11 @@ class TestBuildSourceDataframeOrchestration:
 
     def test_end_to_end_bu_defaults_to_10901_when_unresolvable(self, monkeypatch):
         # per Dakota: "For the most part, all BUs should be 10901 as the
-        # default value, or pulled from invoice line like it currently does"
+        # default value" -- this row's ReferenceTransactionRecordId
+        # doesn't match anything in invoice_line, so Product2Id (and thus
+        # bu) never resolves, but invoice_line itself IS non-empty (so
+        # InvoiceLine's resolution path is technically "alive" — this is
+        # a per-row miss, not a whole-table-empty data issue).
         table_data = {
             "transaction_journal": pd.DataFrame([{
                 "Name": "Orphan", "UsageResourceId": None,
@@ -747,6 +1099,9 @@ class TestBuildSourceDataframeOrchestration:
                 "Credit": None, "Debit": 10.0,
                 "DebitGeneralLedgerAccountId": None, "CreditGeneralLedgerAccountId": None,
             }]),
+            "invoice_line": pd.DataFrame([{"Id": "IL_OTHER", "InvoiceId": "INV1", "Product2Id": "PROD1"}]),
+            "product2": self._product2(),
+            "general_ledger_account": pd.DataFrame([{"Id": "GLA_X", "GL_Accounting_Number__c": "1"}]),
         }
         self._patch_read_table(monkeypatch, table_data)
 
@@ -755,7 +1110,7 @@ class TestBuildSourceDataframeOrchestration:
         assert result.iloc[0]["InvoiceLine.Business_Unit"] == "10901"
 
     def test_end_to_end_did_override_by_gl_account_beats_product_name_override(self, monkeypatch):
-        # 10040049 -> 16605 must win even when the InvoiceLine name would
+        # 10040049 -> 16605 must win even when Product2.Name would
         # otherwise trigger the slingshot override — highest priority per
         # Dakota ("should supersede whatever the DID is").
         table_data = {
@@ -766,11 +1121,8 @@ class TestBuildSourceDataframeOrchestration:
                 "Credit": None, "Debit": 1.0,
                 "DebitGeneralLedgerAccountId": "GLA_SPECIAL", "CreditGeneralLedgerAccountId": None,
             }]),
-            "invoice_line": pd.DataFrame([{
-                "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1",
-                "Business_Unit_BU__c": "US001", "Department_ID_DID__c": "10500",
-                "Name": "Slingshot Pro Subscription",
-            }]),
+            "invoice_line": pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}]),
+            "product2": self._product2(bu="US001", did="10500", name="Slingshot Pro Subscription"),
             "general_ledger_account": pd.DataFrame(
                 [{"Id": "GLA_SPECIAL", "GL_Accounting_Number__c": "10040049"}]
             ),
@@ -781,35 +1133,79 @@ class TestBuildSourceDataframeOrchestration:
 
         assert result.iloc[0]["InvoiceLine.Department_Id"] == "16605"
 
-    def test_missing_tables_still_produce_output_with_nulls(self, monkeypatch):
-        # Only transaction_journal provided — everything else empty. bu
-        # falls back to the "10901" default (apply_did_overrides()); did
-        # and the gl accounting number stay null since nothing overrides
-        # them here.
+    def test_missing_gl_account_match_leaves_gl_number_null_without_failing(self, monkeypatch):
+        # general_ledger_account is non-empty (mandatory table satisfied)
+        # but doesn't contain THIS row's specific GLA id -- a per-row
+        # miss, not a whole-table-empty data issue, so this must not raise.
         table_data = {
             "transaction_journal": pd.DataFrame([{
-                "Name": "Orphan", "UsageResourceId": None,
-                "ReferenceTransactionRecordId": "UNKNOWN1", "TransactionType": "InvoiceLine",
+                "Name": "Orphan GL", "UsageResourceId": None,
+                "ReferenceTransactionRecordId": "IL1", "TransactionType": "InvoiceLine",
                 "ActivityDate": "2026-08-03", "UsageType": None,
                 "Credit": None, "Debit": 10.0,
+                "DebitGeneralLedgerAccountId": "GLA_UNKNOWN", "CreditGeneralLedgerAccountId": None,
             }]),
+            "invoice_line": pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}]),
+            "product2": self._product2(),
+            "general_ledger_account": pd.DataFrame([{"Id": "GLA_OTHER", "GL_Accounting_Number__c": "1"}]),
         }
         self._patch_read_table(monkeypatch, table_data)
 
         result = build_source_dataframe(MagicMock(), "bucket", **self.WIDE_WINDOW)
 
         assert len(result) == 1
-        row = result.iloc[0]
-        assert row["InvoiceLine.Business_Unit"] == "10901"
-        assert pd.isna(row["InvoiceLine.Department_Id"])
-        assert pd.isna(row["GeneralLedgerAccount.GL_Accounting_Number__c"])
-        assert row["TransactionJournal.CreditDebit"] == 10.0  # amount still resolves independent of bu/account
+        assert pd.isna(result.iloc[0]["GeneralLedgerAccount.GL_Accounting_Number__c"])
+        assert result.iloc[0]["TransactionJournal.CreditDebit"] == 10.0  # amount still resolves independently
 
-    def test_empty_transaction_journal_produces_empty_result(self, monkeypatch):
+    def test_empty_transaction_journal_raises(self, monkeypatch):
+        # transaction_journal is unconditionally mandatory, per Dakota —
+        # an earlier version of this test expected an empty (not raised)
+        # result; that's no longer the correct behavior.
         self._patch_read_table(monkeypatch, {})
-        result = build_source_dataframe(MagicMock(), "bucket", **self.WIDE_WINDOW)
-        assert len(result) == 0
-        assert "InvoiceLine.Business_Unit" in result.columns
+        with pytest.raises(ValueError, match="transaction_journal"):
+            build_source_dataframe(MagicMock(), "bucket", **self.WIDE_WINDOW)
+
+    def test_empty_product2_raises_even_with_valid_transaction_journal(self, monkeypatch):
+        table_data = {
+            "transaction_journal": pd.DataFrame([{
+                "Name": "X", "UsageResourceId": None,
+                "ReferenceTransactionRecordId": "IL1", "TransactionType": "InvoiceLine",
+                "ActivityDate": "2026-08-01", "UsageType": None,
+                "Credit": None, "Debit": 5.0,
+                "DebitGeneralLedgerAccountId": None, "CreditGeneralLedgerAccountId": None,
+            }]),
+            "invoice_line": pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}]),
+            "general_ledger_account": pd.DataFrame([{"Id": "GLA1", "GL_Accounting_Number__c": "1"}]),
+            # product2 deliberately omitted -- comes back empty
+        }
+        self._patch_read_table(monkeypatch, table_data)
+        with pytest.raises(ValueError, match="product2"):
+            build_source_dataframe(MagicMock(), "bucket", **self.WIDE_WINDOW)
+
+    def test_present_transaction_type_with_no_viable_path_raises(self, monkeypatch):
+        # A Payment TransactionType row present, but BOTH
+        # payment_line_invoice_line AND payment_line_invoice are empty --
+        # no viable resolution path at all for Payment. Confirmed with
+        # Dakota this SHOULD raise (distinct from just one of the two
+        # being empty, which should NOT raise — see
+        # TestValidateRequiredTablesPresent for the unit-level version of
+        # this same distinction).
+        table_data = {
+            "transaction_journal": pd.DataFrame([{
+                "Name": "X", "UsageResourceId": None,
+                "ReferenceTransactionRecordId": "PAY1", "TransactionType": "Payment",
+                "ActivityDate": "2026-08-01", "UsageType": None,
+                "Credit": None, "Debit": 5.0,
+                "DebitGeneralLedgerAccountId": None, "CreditGeneralLedgerAccountId": None,
+            }]),
+            "invoice_line": pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}]),
+            "product2": self._product2(),
+            "general_ledger_account": pd.DataFrame([{"Id": "GLA1", "GL_Accounting_Number__c": "1"}]),
+            # payment_line_invoice_line and payment_line_invoice both omitted
+        }
+        self._patch_read_table(monkeypatch, table_data)
+        with pytest.raises(ValueError, match="Payment"):
+            build_source_dataframe(MagicMock(), "bucket", **self.WIDE_WINDOW)
 
     def test_result_has_expected_final_columns(self, monkeypatch):
         table_data = {
@@ -818,11 +1214,11 @@ class TestBuildSourceDataframeOrchestration:
                 "ReferenceTransactionRecordId": "IL1", "TransactionType": "InvoiceLine",
                 "ActivityDate": "2026-08-01", "UsageType": "Storage",
                 "Credit": None, "Debit": 5.0,
+                "DebitGeneralLedgerAccountId": None, "CreditGeneralLedgerAccountId": None,
             }]),
-            "invoice_line": pd.DataFrame([{
-                "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1",
-                "Business_Unit_BU__c": "US001", "Department_ID_DID__c": "10500",
-            }]),
+            "invoice_line": pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}]),
+            "product2": self._product2(),
+            "general_ledger_account": pd.DataFrame([{"Id": "GLA1", "GL_Accounting_Number__c": "1"}]),
         }
         self._patch_read_table(monkeypatch, table_data)
 
@@ -841,35 +1237,49 @@ class TestBuildSourceDataframeOrchestration:
             "transaction_journal": pd.DataFrame([
                 {"Name": "A", "UsageResourceId": None, "ReferenceTransactionRecordId": "IL1",
                  "TransactionType": "InvoiceLine", "ActivityDate": "2026-08-01",
-                 "UsageType": "Storage", "Credit": None, "Debit": 1.0},
+                 "UsageType": "Storage", "Credit": None, "Debit": 1.0,
+                 "DebitGeneralLedgerAccountId": None, "CreditGeneralLedgerAccountId": None},
                 {"Name": "B", "UsageResourceId": None, "ReferenceTransactionRecordId": "IL2",
                  "TransactionType": "InvoiceLine", "ActivityDate": "2026-08-02",
-                 "UsageType": "Compute", "Credit": None, "Debit": 2.0},
+                 "UsageType": "Compute", "Credit": None, "Debit": 2.0,
+                 "DebitGeneralLedgerAccountId": None, "CreditGeneralLedgerAccountId": None},
             ]),
             "invoice_line": pd.DataFrame([
-                {"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1",
-                 "Business_Unit_BU__c": "US001", "Department_ID_DID__c": "10500"},
-                {"Id": "IL2", "InvoiceId": "INV2", "Product2Id": "PROD2",
-                 "Business_Unit_BU__c": "US002", "Department_ID_DID__c": "20500"},
+                {"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"},
+                {"Id": "IL2", "InvoiceId": "INV2", "Product2Id": "PROD2"},
             ]),
+            "product2": pd.DataFrame([
+                {"Id": "PROD1", "Business_Unit_BU__c": "US001", "Department_ID_DID__c": "10500", "Name": "A"},
+                {"Id": "PROD2", "Business_Unit_BU__c": "US002", "Department_ID_DID__c": "20500", "Name": "B"},
+            ]),
+            "general_ledger_account": pd.DataFrame([{"Id": "GLA1", "GL_Accounting_Number__c": "1"}]),
         }
         self._patch_read_table(monkeypatch, table_data)
 
         result = build_source_dataframe(MagicMock(), "bucket", **self.WIDE_WINDOW)
         assert len(result) == 2
 
-    def test_logging_calls_made_when_log_provided(self, monkeypatch):
+    def test_logging_fires_when_log_provided(self, monkeypatch):
+        # Covers the `if log:` branches -- otherwise never executed by any
+        # other test in this class, since every other test omits log
+        # entirely (log=None is already covered a dozen times over by
+        # every test that doesn't touch this parameter, so a dedicated
+        # "no logging when log is None" test would be redundant -- not
+        # included here on purpose). Checks the branch actually fires and
+        # includes a couple of representative messages, without pinning
+        # every log line's exact wording -- that's an implementation
+        # detail more than a behavior worth locking down line-by-line.
         table_data = {
             "transaction_journal": pd.DataFrame([{
                 "Name": "X", "UsageResourceId": None,
                 "ReferenceTransactionRecordId": "IL1", "TransactionType": "InvoiceLine",
                 "ActivityDate": "2026-08-01", "UsageType": "Storage",
                 "Credit": None, "Debit": 5.0,
+                "DebitGeneralLedgerAccountId": None, "CreditGeneralLedgerAccountId": None,
             }]),
-            "invoice_line": pd.DataFrame([{
-                "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1",
-                "Business_Unit_BU__c": "US001", "Department_ID_DID__c": "10500",
-            }]),
+            "invoice_line": pd.DataFrame([{"Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1"}]),
+            "product2": self._product2(),
+            "general_ledger_account": pd.DataFrame([{"Id": "GLA1", "GL_Accounting_Number__c": "1"}]),
         }
         self._patch_read_table(monkeypatch, table_data)
         fake_log = MagicMock()
@@ -877,46 +1287,9 @@ class TestBuildSourceDataframeOrchestration:
         build_source_dataframe(MagicMock(), "bucket", log=fake_log, **self.WIDE_WINDOW)
 
         assert fake_log.info.called
-        # spot check a couple of expected log messages happened
-        messages = [call.args[0] for call in fake_log.info.call_args_list]
-        assert any("resolving business_unit" in m for m in messages)
-        assert any("resolving gl accounting numbers" in m for m in messages)
-        assert any("applying bu default and did overrides" in m for m in messages)
-
-    def test_logging_includes_per_table_read_messages(self, monkeypatch):
-        table_data = {
-            "transaction_journal": pd.DataFrame([{
-                "Name": "X", "UsageResourceId": None,
-                "ReferenceTransactionRecordId": "IL1", "TransactionType": "InvoiceLine",
-                "ActivityDate": "2026-08-01", "UsageType": "Storage",
-                "Credit": None, "Debit": 5.0,
-            }]),
-        }
-        self._patch_read_table(monkeypatch, table_data)
-        fake_log = MagicMock()
-
-        build_source_dataframe(MagicMock(), "bucket", log=fake_log, **self.WIDE_WINDOW)
-
         messages = [call.args[0] for call in fake_log.info.call_args_list]
         assert any("reading transaction_journal" in m for m in messages)
-
-    def test_no_logging_when_log_is_none(self, monkeypatch):
-        table_data = {
-            "transaction_journal": pd.DataFrame([{
-                "Name": "X", "UsageResourceId": None,
-                "ReferenceTransactionRecordId": "IL1", "TransactionType": "InvoiceLine",
-                "ActivityDate": "2026-08-01", "UsageType": "Storage",
-                "Credit": None, "Debit": 5.0,
-            }]),
-            "invoice_line": pd.DataFrame([{
-                "Id": "IL1", "InvoiceId": "INV1", "Product2Id": "PROD1",
-                "Business_Unit_BU__c": "US001", "Department_ID_DID__c": "10500",
-            }]),
-        }
-        self._patch_read_table(monkeypatch, table_data)
-        # should not raise even without a logger
-        result = build_source_dataframe(MagicMock(), "bucket", log=None, **self.WIDE_WINDOW)
-        assert len(result) == 1
+        assert any("resolving product2id" in m for m in messages)
 
     def test_passes_through_source_prefix(self, monkeypatch):
         captured_args = {}
@@ -928,6 +1301,12 @@ class TestBuildSourceDataframeOrchestration:
 
         monkeypatch.setattr(glsj, "read_table_by_dataset_id", fake_read_table)
 
-        build_source_dataframe(MagicMock(), "bucket", source_prefix="custom/reports/path")
+        # No table data provided at all -- transaction_journal (loaded
+        # first, before validation runs) still captures source_prefix,
+        # even though the call ultimately raises on the mandatory-table
+        # check right after.
+        with pytest.raises(ValueError):
+            build_source_dataframe(MagicMock(), "bucket", source_prefix="custom/reports/path")
 
         assert captured_args["source_prefix"] == "custom/reports/path"
+

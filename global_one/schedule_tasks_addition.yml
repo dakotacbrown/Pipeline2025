@@ -1,0 +1,79 @@
+      # ===========================================================
+      # STEP 1: CHECK_SCHEDULE_WINDOW — a normal spark_python_task.
+      # This just runs a script that decides yes/no and records the
+      # answer as a "task value" (a small piece of data one task can
+      # publish for other tasks in the same run to read). It doesn't
+      # skip anything itself — it just reports.
+      # ===========================================================
+      tasks:
+        - task_key: CHECK_SCHEDULE_WINDOW
+          job_cluster_key: default
+          spark_python_task:
+            python_file: ${var.env_bundle_root_path}/${var.vendor}/resources/scripts/check_schedule_window.py
+            parameters:
+              - "{{ job.parameters.start_date }}"
+              - "{{ job.parameters.end_date }}"
+          libraries:
+            - requirements: ${var.env_bundle_root_path}/common/requirements.txt
+
+        # ===========================================================
+        # STEP 2: EVALUATE_SCHEDULE_WINDOW — a condition_task. This is
+        # the Databricks-native "if" block. It doesn't run any code —
+        # it just compares two values and produces one of two outcomes:
+        # the literal string "true" or "false". Nothing else can go in
+        # a condition_task besides op/left/right.
+        #
+        #   left:  reads the task value CHECK_SCHEDULE_WINDOW just set,
+        #          via {{tasks.<task_key>.values.<key_name>}} — the
+        #          <key_name> here ("in_run_window") must match exactly
+        #          what check_schedule_window.py calls
+        #          dbutils.jobs.taskValues.set(key=..., value=...) with.
+        #   right: the literal string "true" (not a YAML boolean) — the
+        #          comparison is string equality against the rendered
+        #          Jinja template, so this has to match the exact string
+        #          the Python script sets.
+        # ===========================================================
+        - task_key: EVALUATE_SCHEDULE_WINDOW
+          depends_on:
+            - task_key: CHECK_SCHEDULE_WINDOW
+          condition_task:
+            op: EQUAL_TO
+            left: "{{tasks.CHECK_SCHEDULE_WINDOW.values.in_run_window}}"
+            right: "true"
+
+        # ===========================================================
+        # STEP 3: Your existing INGEST_SALESFORCE task, with ONE
+        # addition — a depends_on entry pointing at
+        # EVALUATE_SCHEDULE_WINDOW with outcome: "true". This is the
+        # part that's different from a normal task dependency:
+        #
+        #   - A normal depends_on (no "outcome" key) waits for the
+        #     upstream task to finish successfully.
+        #   - This depends_on with "outcome: \"true\"" waits for the
+        #     CONDITION task specifically to have evaluated to true.
+        #     If EVALUATE_SCHEDULE_WINDOW resolves to "false" instead,
+        #     Databricks marks INGEST_SALESFORCE (and everything that
+        #     depends on IT, like SALESFORCE_GLOBAL_ONE below) as
+        #     "Excluded" — skipped, not failed. The job run still shows
+        #     as completed successfully; it just didn't do anything
+        #     past this point.
+        # ===========================================================
+        - task_key: INGEST_SALESFORCE
+          depends_on:
+            - task_key: EVALUATE_SCHEDULE_WINDOW
+              outcome: "true"
+          for_each_task:
+            inputs: >
+              [
+                ... # unchanged — existing table/dataset_id list stays as-is
+              ]
+            concurrency: 3
+            task:
+              task_key: SALESFORCE_DAILY_ITERATION
+              # ... unchanged
+
+        # SALESFORCE_GLOBAL_ONE needs NO changes at all — it already
+        # depends on INGEST_SALESFORCE, and Databricks automatically
+        # cascades the exclusion: if INGEST_SALESFORCE is Excluded,
+        # anything depending on it is Excluded too, with no extra
+        # wiring needed on this task.
